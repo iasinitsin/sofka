@@ -33,6 +33,101 @@ pub fn write(path: &Path, contents: &str) -> Result<(), String> {
     write_with(path, contents, temp_path)
 }
 
+/// Replace an existing file that may hold secrets, such as a kubeconfig, in
+/// one step. A symlink stays a symlink: the file it points to is replaced.
+/// The replacement takes that file's permissions and, on Unix, its owner and
+/// group, and on Linux its extended attributes, such as an ACL or a security
+/// label, before any byte is written. The file is untouched when a new one
+/// cannot carry all of that: `PermissionDenied` for a file someone else owns,
+/// `Unsupported` for attributes it cannot copy, and on systems where it
+/// cannot see them.
+pub fn replace(path: &Path, contents: &str) -> std::io::Result<()> {
+    if !cfg!(target_os = "linux") {
+        return Err(std::io::ErrorKind::Unsupported.into());
+    }
+    let target = std::fs::canonicalize(path)?;
+    let meta = std::fs::metadata(&target)?;
+    let (file, temp) = create_temp(&target, &mut temp_path)?;
+    let replaced = keep_metadata(&file, &target, &meta)
+        .and_then(|()| write_then_rename(file, &temp, &target, contents));
+    if replaced.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    replaced
+}
+
+/// Copy every extended attribute of `from`, such as its ACL and security
+/// label, to `to`.
+#[cfg(target_os = "linux")]
+fn copy_extended_attributes(from: &Path, to: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    // Ask for a size, then fill a buffer of it. The list can change in
+    // between, which the second call reports as an error.
+    let read = |fill: &dyn Fn(*mut libc::c_char, usize) -> isize| -> std::io::Result<Vec<u8>> {
+        let size = fill(std::ptr::null_mut(), 0);
+        let size = usize::try_from(size).map_err(|_| std::io::Error::last_os_error())?;
+        let mut buffer = vec![0u8; size];
+        let size = fill(buffer.as_mut_ptr().cast(), buffer.len());
+        let size = usize::try_from(size).map_err(|_| std::io::Error::last_os_error())?;
+        buffer.truncate(size);
+        Ok(buffer)
+    };
+    // SAFETY: `path` is a valid C string and the buffer is `len` bytes.
+    let names = match read(&|buffer, len| unsafe { libc::listxattr(path.as_ptr(), buffer, len) }) {
+        Ok(names) => names,
+        // A file system without extended attributes has none to copy.
+        Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for name in names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let name = std::ffi::CString::new(name)?;
+        // SAFETY: valid C strings, and the buffer is `len` bytes.
+        let value = read(&|buffer, len| unsafe {
+            libc::getxattr(path.as_ptr(), name.as_ptr(), buffer.cast(), len)
+        })?;
+        // SAFETY: an open descriptor, a valid C string, and `value` as is.
+        let set = unsafe {
+            libc::fsetxattr(
+                to.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        if set != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Give the new `file` the mode, owner, group, and extended attributes of
+/// `original`.
+fn keep_metadata(
+    file: &std::fs::File,
+    original: &Path,
+    meta: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    file.set_permissions(meta.permissions())?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        std::os::unix::fs::fchown(file, Some(meta.uid()), Some(meta.gid()))?;
+        copy_extended_attributes(original, file)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Unsupported, error))?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = original;
+    Ok(())
+}
+
 /// [`write`], with the temp-name sequence injectable so the collision path can
 /// be driven from a test — the real names mix in a clock reading and cannot be
 /// predicted from outside.
@@ -269,6 +364,87 @@ mod tests {
             "cleanup deleted a temp file this write never created"
         );
         assert!(!ours.exists(), "our own temp file was left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replace_keeps_mode_owner_and_symlink() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = scratch("replace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("kubeconfig");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&target).unwrap();
+        let link = dir.join("config");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        replace(&link, "new").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!(after.permissions().mode() & 0o777, 0o640);
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "temp file left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replace_keeps_extended_attributes() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = scratch("xattr");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kubeconfig");
+        std::fs::write(&path, "old").unwrap();
+        let attribute = |path: &Path| {
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let mut value = [0u8; 8];
+            // SAFETY: valid C strings and an 8-byte buffer.
+            let len = unsafe {
+                libc::getxattr(
+                    name.as_ptr(),
+                    c"user.sofka-test".as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            };
+            usize::try_from(len).ok().map(|len| value[..len].to_vec())
+        };
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid C strings and a 1-byte value buffer.
+        let set = unsafe {
+            libc::setxattr(
+                name.as_ptr(),
+                c"user.sofka-test".as_ptr(),
+                b"1".as_ptr().cast(),
+                1,
+                0,
+            )
+        };
+        if set != 0 {
+            // The scratch file system takes no user attributes.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        replace(&path, "new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(attribute(&path), Some(b"1".to_vec()));
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temp file left behind"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

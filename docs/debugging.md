@@ -504,10 +504,40 @@ client certificate and is not needed for a Teleport CA server certificate.
 ## OIDC token refresh
 
 Sofka supports token refresh for kubeconfig `auth-provider` entries with
-`name: oidc`. It uses the cached `id-token` while it is valid and attempts to
-refresh it near expiry. The provider configuration must include an `id-token`.
-Refresh also requires `idp-issuer-url`, `client-id`, `client-secret`, and
-`refresh-token`. These requirements come from kube-client 4.2.0.
+`name: oidc`. It uses the cached `id-token` while it is valid and refreshes it
+10 seconds before expiry. Refresh requires `idp-issuer-url`, `client-id`, and
+`refresh-token`. `client-secret` is optional for public clients.
+
+Identity providers such as Dex rotate the refresh token on every use. Sofka
+therefore shares it with kubectl the way client-go does:
+
+- Before a refresh, and after the API server answers `401 Unauthorized`, sofka
+  reads the user entry from the kubeconfig again. It uses a token that kubectl
+  or a new login saved there.
+- After a refresh, sofka writes the new `id-token` and `refresh-token` to every
+  kubeconfig entry that still holds the old refresh token. It holds the
+  `<kubeconfig>.lock` file that kubectl uses, and the target's lock too when the
+  kubeconfig is a symlink. On Linux it replaces the file in one step with a
+  copy that keeps its owner, group, permissions, and extended attributes, such
+  as an ACL or SELinux label. When a copy cannot keep all of that, for example
+  because another user owns the file, and on other systems, it writes in
+  place, as kubectl does. Like kubectl, the rewrite drops YAML comments.
+- Sofka reads and writes only entries that still name the same `idp-issuer-url`
+  and `client-id`, so a user entry reused for another provider never has its
+  token sent to this one.
+- An entry that holds another refresh token by then was changed by a newer
+  login. Sofka leaves it alone and uses the newer token from the next request
+  on. If the file cannot be written, sofka tries again on later requests.
+
+Without this, a refresh in one client spends the token the other one holds,
+and the identity provider answers `Refresh token is invalid or has already
+been claimed by another client`. If the provider refuses the token anyway,
+sofka shows that error and stops sending the token. Log in again; sofka uses
+the new token as soon as the login saves it to the kubeconfig.
+
+When the entry is not in a kubeconfig file, or has no refresh token, kube-client
+4.2.0 handles the provider. It keeps refreshed tokens in memory only and
+requires `id-token` and `client-secret`.
 
 The identity provider uses a separate HTTPS connection with system trust.
 The Kubernetes API server CA exception does not apply to that connection.
