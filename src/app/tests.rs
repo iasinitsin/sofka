@@ -29764,16 +29764,8 @@ async fn refresh_key_reads_pods_with_oidc_and_a_configured_ca_server_certificate
     read_pods_through_a_configured_ca_server_certificate(true).await;
 }
 
-fn oidc_test_token(expiry: i64) -> String {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-
-    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
-    let payload = URL_SAFE_NO_PAD.encode(json!({"exp": expiry}).to_string());
-    format!("{header}.{payload}.test-signature")
-}
-
 async fn read_pods_through_a_configured_ca_server_certificate(oidc: bool) {
-    let token = oidc_test_token(4_070_908_800);
+    let token = crate::k8s::oidc::test_token(4_070_908_800);
     let provider = oidc.then(|| {
         serde_json::from_value(json!({
             "name": "oidc",
@@ -29900,7 +29892,7 @@ async fn refresh_key_reports_oidc_refresh_failure_for_an_expired_token() {
             serde_json::from_value(json!({
                 "name": "oidc",
                 "config": {
-                    "id-token": oidc_test_token(1),
+                    "id-token": crate::k8s::oidc::test_token(1),
                     "idp-issuer-url": "https://issuer.invalid",
                     "client-id": "test-client",
                     "refresh-token": "test-refresh-token"

@@ -54,7 +54,7 @@ async fn refresh_key_uses_a_refreshed_oidc_token() {
         listener.local_addr().unwrap().port()
     );
     let token_endpoint = format!("{issuer}/token");
-    let refreshed_token = oidc_test_token(4_070_908_800);
+    let refreshed_token = crate::k8s::oidc::test_token(4_070_908_800);
     let returned_token = refreshed_token.clone();
     let server = tokio::spawn(async move {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
@@ -118,7 +118,7 @@ async fn refresh_key_uses_a_refreshed_oidc_token() {
         let provider = serde_json::from_value(json!({
             "name": "oidc",
             "config": {
-                "id-token": oidc_test_token(1),
+                "id-token": crate::k8s::oidc::test_token(1),
                 "idp-issuer-url": issuer,
                 "client-id": "test-client",
                 "client-secret": "test-secret",

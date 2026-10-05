@@ -29,6 +29,8 @@ use tower::{BoxError, Service, ServiceBuilder, ServiceExt, retry::RetryLayer, ut
 use tower_http::{ServiceExt as _, decompression::DecompressionLayer, trace::TraceLayer};
 use x509_parser::prelude::*;
 
+use crate::k8s::oidc::OidcLayer;
+
 type Builder = ClientBuilder<BoxService<Request<Body>, Response<Box<DynBody>>, BoxError>>;
 
 #[cfg(test)]
@@ -54,7 +56,15 @@ pub(crate) fn client_builder_with_certificate(
     }
     let roots = crate::server_tls::configured_roots(&config);
     // Resolve auth before the TLS identity, as kube-rs does.
-    let auth = config.auth_layer()?;
+    let oidc = crate::k8s::oidc::layer(&config);
+    let auth = Auth {
+        kube: if oidc.is_some() {
+            None
+        } else {
+            config.auth_layer()?
+        },
+        oidc,
+    };
     let mut tls = match config.rustls_client_config() {
         Ok(tls) => tls,
         Err(error) => v1_config(&config, allow_v1, error)?,
@@ -150,7 +160,13 @@ fn http_connector() -> HttpConnector {
     connector
 }
 
-fn connect(config: Config, tls: ClientConfig, auth: Option<AuthLayer>) -> Result<Builder> {
+/// Exactly one of these authenticates a client, or neither.
+struct Auth {
+    kube: Option<AuthLayer>,
+    oidc: Option<OidcLayer>,
+}
+
+fn connect(config: Config, tls: ClientConfig, auth: Auth) -> Result<Builder> {
     let connector = http_connector();
     match config.proxy_url.as_ref() {
         None => transport(connector, config, tls, auth),
@@ -283,12 +299,7 @@ fn https<H>(connector: H, config: &Config, tls: ClientConfig) -> Result<HttpsCon
     Ok(builder.enable_http1().wrap_connector(connector))
 }
 
-fn transport<H>(
-    connector: H,
-    config: Config,
-    tls: ClientConfig,
-    auth: Option<AuthLayer>,
-) -> Result<Builder>
+fn transport<H>(connector: H, config: Config, tls: ClientConfig, auth: Auth) -> Result<Builder>
 where
     H: 'static + Clone + Send + Sync + Service<Uri>,
     H::Response: 'static + Connection + Read + Write + Send + Unpin,
@@ -314,7 +325,8 @@ where
                 .default_retry
                 .then_some(RetryLayer::new(RetryPolicy::server_retry())),
         )
-        .option_layer(auth)
+        .option_layer(auth.kube)
+        .option_layer(auth.oidc)
         .layer(config.extra_headers_layer()?)
         .layer(TraceLayer::new_for_http())
         .map_err(BoxError::from)

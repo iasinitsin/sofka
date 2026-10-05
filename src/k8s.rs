@@ -28,6 +28,7 @@ use crate::store::{Msg, WatchFailure, row_key};
 pub mod completion;
 mod discovery;
 pub(crate) mod kubeconfig;
+pub(crate) mod oidc;
 mod proxy;
 mod table;
 
