@@ -341,6 +341,10 @@ A proxy that buffers responses, such as nginx with its default
 A view of a few objects, such as the owner that `shift-j` opens, then stays
 empty. When a streaming list sends no data within 3 seconds, sofka switches
 that cluster to a plain list followed by a watch, which such a proxy passes on.
+A plain list needs the `list` permission. Where you may only watch a resource,
+the refused list sends that view, and any later one that lists first, back to
+the streaming list, without the deadline. A server that rejects streaming lists
+outright keeps using plain lists.
 Changes to those objects still arrive late until the proxy stops buffering
 watch responses (`proxy_buffering off`).
 

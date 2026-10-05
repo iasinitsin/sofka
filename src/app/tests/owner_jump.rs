@@ -279,3 +279,104 @@ async fn an_expired_status_without_410_does_not_fall_back() {
     assert_eq!(row_names(&app), ["api"]);
     app.handle_key(press(KeyCode::Char('q'))).unwrap();
 }
+
+/// A slow but healthy server trips the streaming-list deadline too. Where the
+/// user may watch a resource but not list it, the plain list is refused, so
+/// the view goes back to the streaming list and still loads.
+#[tokio::test]
+async fn a_forbidden_list_after_a_slow_stream_returns_to_streaming() {
+    use futures_util::stream;
+    use hyper::body::{Bytes, Frame};
+    use std::convert::Infallible;
+
+    let (seen, mut requests) = mpsc::unbounded_channel();
+    let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+        let uri = request.uri().clone();
+        seen.send(uri.clone()).ok();
+        let query = uri.query().unwrap_or("").to_owned();
+        let watch = query.contains("watch=true");
+        let streaming = query.contains("sendInitialEvents=true");
+        async move {
+            let (status, body) = if watch && streaming {
+                // Slower than the fallback deadline, but it answers.
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let lines = [
+                    json!({"type": "ADDED", "object": {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "api", "namespace": "prod", "uid": "pod-1", "resourceVersion": "10"}}}),
+                    json!({"type": "BOOKMARK", "object": {"apiVersion": "v1", "kind": "Pod", "metadata": {"resourceVersion": "10", "annotations": {"k8s.io/initial-events-end": "true"}}}}),
+                ];
+                (200, lines.iter().map(|line| format!("{line}\n")).collect())
+            } else if watch {
+                (200, String::new())
+            } else {
+                (
+                    403,
+                    json!({"apiVersion": "v1", "kind": "Status", "status": "Failure", "reason": "Forbidden", "code": 403, "message": "pods is forbidden: cannot list resource \"pods\""}).to_string(),
+                )
+            };
+            let frames = stream::iter([Ok::<_, Infallible>(Frame::data(Bytes::from(body)))]);
+            let frames = if watch {
+                frames.chain(stream::pending()).boxed()
+            } else {
+                frames.boxed()
+            };
+            Ok::<_, Infallible>(
+                http::Response::builder()
+                    .status(status)
+                    .body(http_body_util::StreamBody::new(frames))
+                    .unwrap(),
+            )
+        }
+    });
+    let mut cluster = Cluster::fake();
+    cluster.client = kube::Client::new(service, "default");
+    let (mut app, mut rx) = test_app();
+    app.cluster = cluster;
+    app.switch_kind_ns("pods", Some("prod"));
+
+    async fn load(app: &mut App, rx: &mut Receiver<Msg>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = rx.recv().await.expect("watch channel closed");
+                assert!(
+                    !matches!(msg, Msg::WatchError { .. }),
+                    "the refused list was reported instead of returning to streaming"
+                );
+                let done =
+                    matches!(&msg, Msg::Synced { generation } if *generation == app.generation);
+                app.handle_msg(msg);
+                if done {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the view never loaded");
+    }
+    let count = |requests: &mut mpsc::UnboundedReceiver<http::Uri>| {
+        let (mut lists, mut streams) = (0, 0);
+        while let Ok(uri) = requests.try_recv() {
+            let query = uri.query().unwrap_or("");
+            if uri.path() != "/api/v1/namespaces/prod/pods" {
+                continue;
+            }
+            if !query.contains("watch=true") {
+                lists += 1;
+            } else if query.contains("sendInitialEvents=true") {
+                streams += 1;
+            }
+        }
+        (lists, streams)
+    };
+
+    load(&mut app, &mut rx).await;
+    assert_eq!(row_names(&app), ["api"]);
+    // The first stream timed out, the list was refused, and it streamed again.
+    assert_eq!(count(&mut requests), (1, 2));
+
+    // A later view lists first after that stall, and is refused the same way.
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    load(&mut app, &mut rx).await;
+    assert_eq!(row_names(&app), ["api"]);
+    assert_eq!(count(&mut requests), (1, 1));
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+}
