@@ -1211,17 +1211,44 @@ fn spawn_watch_task(
         // The server expired the watch, so a re-list follows. A streaming
         // re-list announces itself only with its first object.
         let mut relist_due = false;
-        while let Some(event) = stream.next().await {
-            if using_streaming
-                && initializing
-                && event.as_ref().is_err_and(streaming_lists_unsupported)
-            {
+        // A streaming list answers at once on a reachable API server. A proxy
+        // that buffers responses holds a small one back until the stream
+        // ends, which leaves a narrow view (one owner, one namespace) empty
+        // for minutes. A plain list is a complete response such a proxy
+        // passes on, so fall back to list+watch when nothing arrives.
+        let mut first_data = using_streaming.then(|| Instant::now() + STREAMING_FIRST_DATA_TIMEOUT);
+        loop {
+            // `None` when the streaming list sent nothing before the deadline.
+            let next = match first_data {
+                Some(deadline) => tokio::time::timeout_at(deadline.into(), stream.next())
+                    .await
+                    .ok(),
+                None => Some(stream.next().await),
+            };
+            let fallback = match &next {
+                None => Some("no data from the streaming list"),
+                Some(Some(Err(e)))
+                    if using_streaming && initializing && streaming_lists_unsupported(e) =>
+                {
+                    Some("streaming lists unsupported")
+                }
+                _ => None,
+            };
+            if let Some(reason) = fallback {
+                crate::log_info!("watch.streaming_fallback", kind = kind, reason = reason);
+                first_data = None;
                 streaming_lists.store(STREAMING_UNSUPPORTED, Ordering::Release);
                 using_streaming = false;
                 stream = watcher(api.clone(), cfg.clone())
                     .modify(|obj| obj.managed_fields_mut().clear())
                     .boxed();
                 continue;
+            }
+            let Some(Some(event)) = next else {
+                break;
+            };
+            if !matches!(event, Ok(watcher::Event::Init)) {
+                first_data = None;
             }
             // Initialisation events can repeat before each failed list request.
             // Reset the delay only after the watch makes progress.
@@ -1305,7 +1332,15 @@ fn spawn_watch_task(
                 // the sync dot already shows the re-list. No error flash.
                 Err(e) if watch_error_is_benign(&e) => {
                     crate::log_debug!("watch.desync", kind = kind, error = e);
-                    relist_due = true;
+                    // The watcher re-lists only on a 410. Another expired
+                    // status resumes the watch, which may stay silent.
+                    if matches!(&e, watcher::Error::WatchError(status) if status.code == 410) {
+                        relist_due = true;
+                        // The re-list may stall behind a buffering proxy too.
+                        if using_streaming {
+                            first_data = Some(Instant::now() + STREAMING_FIRST_DATA_TIMEOUT);
+                        }
+                    }
                     continue;
                 }
                 // A proxy or load balancer that caps request duration cuts
@@ -1349,6 +1384,13 @@ fn spawn_watch_task(
         }
     })
 }
+
+/// How long a streaming list may stay silent before the watch assumes a
+/// buffering proxy and switches to list+watch.
+#[cfg(not(test))]
+const STREAMING_FIRST_DATA_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const STREAMING_FIRST_DATA_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// How long a watch must stay connected for a cut to count as routine.
 const QUIET_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);

@@ -336,6 +336,14 @@ error, so no change is missed. `:info` counts it as a reconnect once the watch
 is running again. If the connection drops again within 30 seconds, or while
 sofka is still listing the resource, sofka shows the error.
 
+A proxy that buffers responses, such as nginx with its default
+`proxy_buffering on`, holds a small watch response back until the stream ends.
+A view of a few objects, such as the owner that `shift-j` opens, then stays
+empty. When a streaming list sends no data within 3 seconds, sofka switches
+that cluster to a plain list followed by a watch, which such a proxy passes on.
+Changes to those objects still arrive late until the proxy stops buffering
+watch responses (`proxy_buffering off`).
+
 The message clears when the watch recovers. A new connection is enough for a
 watch that resumes from its last resource version. A streaming list must finish
 its initial data transfer first. If more than one namespace has failed, the
