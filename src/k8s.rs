@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
@@ -928,7 +928,13 @@ impl Cluster {
         generation: u64,
         tx: Sender<Msg>,
     ) -> JoinHandle<()> {
-        let client = watch_status_client(self.client.clone(), generation, tx.clone());
+        let reconnecting = Arc::new(AtomicBool::new(false));
+        let client = watch_status_client(
+            self.client.clone(),
+            generation,
+            tx.clone(),
+            Arc::clone(&reconnecting),
+        );
         let api = watch_api(client, kind, namespace);
         let mut cfg = watcher::Config::default().any_semantic();
         if let Some(l) = labels {
@@ -943,6 +949,7 @@ impl Cluster {
             namespace.to_string(),
             cfg,
             Arc::clone(&self.streaming_lists),
+            reconnecting,
             generation,
             tx,
         )
@@ -1017,6 +1024,7 @@ impl Cluster {
             ns.to_string(),
             watcher::Config::default().any_semantic(),
             Arc::clone(&self.streaming_lists),
+            Arc::default(),
             1,
             tx,
         );
@@ -1125,11 +1133,19 @@ fn watch_api(client: Client, kind: &Kind, namespace: &str) -> Api<DynamicObject>
     }
 }
 
-fn watch_status_client(client: Client, generation: u64, tx: Sender<Msg>) -> Client {
+/// `reconnecting` is set when a synced watch was cut. The resumed watch
+/// counts as a reconnect once its request succeeds.
+fn watch_status_client(
+    client: Client,
+    generation: u64,
+    tx: Sender<Msg>,
+    reconnecting: Arc<AtomicBool>,
+) -> Client {
     let namespace = client.default_namespace().to_string();
     let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
         let client = client.clone();
         let tx = tx.clone();
+        let reconnecting = Arc::clone(&reconnecting);
         async move {
             let query = request.uri().query().unwrap_or_default();
             let params: HashMap<_, _> = form_urlencoded::parse(query.as_bytes()).collect();
@@ -1140,6 +1156,9 @@ fn watch_status_client(client: Client, generation: u64, tx: Sender<Msg>) -> Clie
             // lists must first reach InitDone before they report recovery.
             if resumed && response.status().is_success() {
                 let _ = tx.send(Msg::WatchRecovered { generation }).await;
+                if reconnecting.swap(false, Ordering::AcqRel) {
+                    let _ = tx.send(Msg::WatchReconnected { generation }).await;
+                }
             }
             Ok::<_, kube::Error>(response)
         }
@@ -1147,12 +1166,14 @@ fn watch_status_client(client: Client, generation: u64, tx: Sender<Msg>) -> Clie
     Client::new(service, namespace)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_watch_task(
     api: Api<DynamicObject>,
     kind: String,
     ns: String,
     cfg: watcher::Config,
     streaming_lists: Arc<AtomicU8>,
+    reconnecting: Arc<AtomicBool>,
     generation: u64,
     tx: Sender<Msg>,
 ) -> JoinHandle<()> {
@@ -1186,6 +1207,10 @@ fn spawn_watch_task(
 
         let mut backoff = watcher::DefaultBackoff::default();
         let mut failed = false;
+        let mut last_cut: Option<Instant> = None;
+        // The server expired the watch, so a re-list follows. A streaming
+        // re-list announces itself only with its first object.
+        let mut relist_due = false;
         while let Some(event) = stream.next().await {
             if using_streaming
                 && initializing
@@ -1258,6 +1283,9 @@ fn spawn_watch_task(
                 Ok(watcher::Event::InitDone) => {
                     initializing = false;
                     listing = false;
+                    relist_due = false;
+                    // A re-list after the cut already counts as a reconnect.
+                    reconnecting.store(false, Ordering::Release);
                     if using_streaming {
                         // Unsupported is sticky if two startup watches
                         // negotiate concurrently and only one endpoint
@@ -1277,6 +1305,25 @@ fn spawn_watch_task(
                 // the sync dot already shows the re-list. No error flash.
                 Err(e) if watch_error_is_benign(&e) => {
                     crate::log_debug!("watch.desync", kind = kind, error = e);
+                    relist_due = true;
+                    continue;
+                }
+                // A proxy or load balancer that caps request duration cuts
+                // long watches mid-stream. The watcher resumes from the last
+                // resource version, so nothing is missed: reconnect without an
+                // error, unless the connection keeps dropping. A cut during a
+                // list, the first or a re-list, leaves the rows incomplete
+                // and is still reported.
+                Err(e)
+                    if !listing
+                        && !relist_due
+                        && !failed
+                        && watch_stream_cut(&e)
+                        && last_cut.is_none_or(|at| at.elapsed() >= QUIET_RECONNECT_INTERVAL) =>
+                {
+                    last_cut = Some(Instant::now());
+                    crate::log_info!("watch.reconnect", kind = kind, error = e);
+                    reconnecting.store(true, Ordering::Release);
                     continue;
                 }
                 Err(e) => {
@@ -1301,6 +1348,18 @@ fn spawn_watch_task(
             }
         }
     })
+}
+
+/// How long a watch must stay connected for a cut to count as routine.
+const QUIET_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Whether an established watch lost its connection while reading events,
+/// as opposed to failing to start or the server reporting an error.
+fn watch_stream_cut(error: &watcher::Error) -> bool {
+    matches!(
+        error,
+        watcher::Error::WatchFailed(kube::Error::ReadEvents(_))
+    )
 }
 
 /// Higher wins when two API groups expose the same bare plural/kind (e.g.
