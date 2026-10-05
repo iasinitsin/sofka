@@ -439,6 +439,9 @@ pub struct Cluster {
 const STREAMING_UNKNOWN: u8 = 0;
 const STREAMING_SUPPORTED: u8 = 1;
 const STREAMING_UNSUPPORTED: u8 = 2;
+/// A streaming list sent nothing in time, as behind a proxy that buffers
+/// responses. Later watches start with a plain list, but may still stream.
+const STREAMING_STALLED: u8 = 3;
 #[cfg(not(test))]
 const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
@@ -1179,7 +1182,9 @@ fn spawn_watch_task(
     tx: Sender<Msg>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut using_streaming = streaming_lists.load(Ordering::Acquire) != STREAMING_UNSUPPORTED;
+        let streaming_state = streaming_lists.load(Ordering::Acquire);
+        let mut using_streaming =
+            !matches!(streaming_state, STREAMING_UNSUPPORTED | STREAMING_STALLED);
         let mut initializing = true;
         // Distinct from `initializing`, which drives the streaming-list
         // fallback and must keep its current lifetime: this tracks whether a
@@ -1218,6 +1223,12 @@ fn spawn_watch_task(
         // for minutes. A plain list is a complete response such a proxy
         // passes on, so fall back to list+watch when nothing arrives.
         let mut first_data = using_streaming.then(|| Instant::now() + STREAMING_FIRST_DATA_TIMEOUT);
+        // A slow server trips that deadline too. A plain list then needs the
+        // `list` permission, which a streaming list does not, so a refused
+        // list returns to the streaming list without a deadline. That holds
+        // for every watch that lists only because a stream stalled before.
+        let mut stalled = streaming_state == STREAMING_STALLED;
+        let mut list_forbidden = false;
         loop {
             // `None` when the streaming list sent nothing before the deadline.
             let next = match first_data {
@@ -1237,10 +1248,40 @@ fn spawn_watch_task(
             };
             if let Some(reason) = fallback {
                 crate::log_info!("watch.streaming_fallback", kind = kind, reason = reason);
+                stalled = next.is_none();
                 first_data = None;
-                streaming_lists.store(STREAMING_UNSUPPORTED, Ordering::Release);
+                if stalled {
+                    // A server that rejected streaming lists outright wins.
+                    let _ = streaming_lists.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |state| (state != STREAMING_UNSUPPORTED).then_some(STREAMING_STALLED),
+                    );
+                } else {
+                    streaming_lists.store(STREAMING_UNSUPPORTED, Ordering::Release);
+                }
                 using_streaming = false;
                 stream = watcher(api.clone(), cfg.clone())
+                    .modify(|obj| obj.managed_fields_mut().clear())
+                    .boxed();
+                continue;
+            }
+            if stalled
+                && matches!(
+                    &next,
+                    Some(Some(Err(watcher::Error::InitialListFailed(kube::Error::Api(status)))))
+                        if status.code == 403
+                )
+            {
+                crate::log_info!(
+                    "watch.streaming_restored",
+                    kind = kind,
+                    reason = "list forbidden"
+                );
+                stalled = false;
+                list_forbidden = true;
+                using_streaming = true;
+                stream = watcher(api.clone(), cfg.clone().streaming_lists())
                     .modify(|obj| obj.managed_fields_mut().clear())
                     .boxed();
                 continue;
@@ -1337,8 +1378,9 @@ fn spawn_watch_task(
                     // status resumes the watch, which may stay silent.
                     if matches!(&e, watcher::Error::WatchError(status) if status.code == 410) {
                         relist_due = true;
-                        // The re-list may stall behind a buffering proxy too.
-                        if using_streaming {
+                        // The re-list may stall behind a buffering proxy too,
+                        // unless a plain list is not allowed here.
+                        if using_streaming && !list_forbidden {
                             first_data = Some(Instant::now() + STREAMING_FIRST_DATA_TIMEOUT);
                         }
                     }
