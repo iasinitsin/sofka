@@ -14,6 +14,7 @@ mod label_filter;
 mod namespace_patterns;
 mod node_roles;
 mod oidc;
+mod owner_jump;
 mod plugin_form;
 mod popup_wrapping;
 mod proxy;
