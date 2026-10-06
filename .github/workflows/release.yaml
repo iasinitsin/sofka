@@ -98,6 +98,8 @@ jobs:
   # 6-hourly cron (which stays as the fallback). Needs TAP_GITHUB_TOKEN, a
   # fine-grained PAT scoped to homebrew-sofka with Actions read/write.
   homebrew-bump:
+    # The tap and its token belong to this repository, not to forks.
+    if: github.repository == 'nklmilojevic/sofka'
     needs: upload-assets
     runs-on: ubuntu-latest
     env:
@@ -111,6 +113,8 @@ jobs:
             -f tag="$RELEASE_TAG"
 
   crates-publish:
+    # Only this repository publishes the `sofka` crate.
+    if: github.repository == 'nklmilojevic/sofka'
     needs: upload-assets
     runs-on: ubuntu-latest
     environment: release
@@ -142,6 +146,8 @@ jobs:
   # github:nklmilojevic/sofka?ref=vX.Y.Z` is instant for anyone consuming
   # this tag afterward.
   nix-cache:
+    # The Cachix cache and its token belong to this repository.
+    if: github.repository == 'nklmilojevic/sofka'
     needs: validate
     strategy:
       fail-fast: false
