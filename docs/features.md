@@ -877,14 +877,24 @@ right - so a download or an upload is one keystroke rather than a hand-written
 Listings are read with `ls -A -l` over `kubectl exec`, so the pod's image needs
 a shell, `ls`, and `head`; transfers additionally need `tar`, as `kubectl cp` always
 does. An entry `ls` cannot stat still appears, with an unknown size and a
-warning, rather than blanking the whole directory. The helper-pod image and
-lifetime are configurable:
+warning, rather than blanking the whole directory. The helper-pod image,
+lifetime, and resources are configurable:
 
 ```toml
 [pvc_explore]
 image = "busybox:1.37"   # helper-pod image
 ttl = "30m"              # how long it lives before deleting itself
+cpu_request = "100m"
+cpu_limit = "100m"
+memory_request = "128Mi"
+memory_limit = "128Mi"
 ```
+
+The helper sets its limits explicitly and equal to its requests, so a namespace
+LimitRange cannot fill in a default limit that breaks its
+`maxLimitRequestRatio`. Raise the limits for faster listings of large
+directories, or change any value your namespace policy requires. An empty value
+leaves that field unset.
 
 Only a `Bound` filesystem claim can be browsed: an unbound one has no volume
 behind it, and a `volumeMode: Block` one has no filesystem. A listing is a
