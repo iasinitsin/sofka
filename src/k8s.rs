@@ -1251,12 +1251,7 @@ fn spawn_watch_task(
                 stalled = next.is_none();
                 first_data = None;
                 if stalled {
-                    // A server that rejected streaming lists outright wins.
-                    let _ = streaming_lists.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |state| (state != STREAMING_UNSUPPORTED).then_some(STREAMING_STALLED),
-                    );
+                    mark_stalled(&streaming_lists);
                 } else {
                     streaming_lists.store(STREAMING_UNSUPPORTED, Ordering::Release);
                 }
@@ -1434,6 +1429,19 @@ fn spawn_watch_task(
 const STREAMING_FIRST_DATA_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const STREAMING_FIRST_DATA_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Record that a streaming list stalled, unless the server rejected streaming
+/// lists outright, which wins.
+fn mark_stalled(streaming_lists: &AtomicU8) {
+    for state in [STREAMING_UNKNOWN, STREAMING_SUPPORTED] {
+        let _ = streaming_lists.compare_exchange(
+            state,
+            STREAMING_STALLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
 
 /// How long a watch must stay connected for a cut to count as routine.
 const QUIET_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
@@ -2170,6 +2178,20 @@ clusters:
         config.proxy_url = Some("socks5://127.0.0.1:9090".parse().unwrap());
 
         Client::try_from(config).expect("build client with a SOCKS5 proxy");
+    }
+
+    #[test]
+    fn a_stall_never_overrides_unsupported_streaming_lists() {
+        for (before, after) in [
+            (STREAMING_UNKNOWN, STREAMING_STALLED),
+            (STREAMING_SUPPORTED, STREAMING_STALLED),
+            (STREAMING_STALLED, STREAMING_STALLED),
+            (STREAMING_UNSUPPORTED, STREAMING_UNSUPPORTED),
+        ] {
+            let state = AtomicU8::new(before);
+            mark_stalled(&state);
+            assert_eq!(state.load(Ordering::Acquire), after, "from {before}");
+        }
     }
 
     #[test]
