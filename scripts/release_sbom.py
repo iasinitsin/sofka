@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 from urllib.parse import quote
@@ -162,7 +163,9 @@ def generate(messages, metadata, binary, target, version, revision):
             }]
         if package_id == root_id:
             record["primaryPackagePurpose"] = "APPLICATION"
-            record["downloadLocation"] = f"https://github.com/nklmilojevic/sofka/archive/{revision}.tar.gz"
+            # A fork's release revision exists only in the fork that built it.
+            repository = os.environ.get("GITHUB_REPOSITORY", "nklmilojevic/sofka")
+            record["downloadLocation"] = f"https://github.com/{repository}/archive/{revision}.tar.gz"
         else:
             relationships.append({"spdxElementId": ids[package_id], "relationshipType": "BUILD_DEPENDENCY_OF", "relatedSpdxElement": ids[root_id]})
         records.append(record)
