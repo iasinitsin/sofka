@@ -10,6 +10,25 @@ failed probes), and recent Warning events. No AI, no external service.
 `j`/`k` move, `⏎` goes to the resource behind a finding, `E` its events, `l` its
 logs, `r` gathers again. A finding you can drill into has a trailing `→`.
 
+Some kinds get their own analysis:
+
+- **Job**: the Failed or Complete condition and its reason, progress, failures
+  against `backoffLimit` (container restarts count under
+  `restartPolicy: OnFailure`), and failed pods.
+- **CronJob**: suspension, schedule, last scheduled and successful runs, runs
+  skipped by `concurrencyPolicy: Forbid`, its five newest Jobs (`⏎` opens one),
+  and the pods of the latest one.
+- **PersistentVolumeClaim**: why it is not bound (a missing class, no default
+  class, `WaitForFirstConsumer` with no pod, an unprovisioned volume), pending
+  resizes, a ReadWriteOnce claim used on several nodes, and the pods that mount
+  it.
+- **Node**: Ready state and since when, cordon, taints, pod capacity, and up to
+  ten unhealthy pods on the node.
+
+Reading StorageClasses needs cluster-scope `list`. Without it, a Pending claim's
+class is reported as unknown, never as missing. Likewise, Jobs or pods that
+could not be listed are reported as unknown, not as absent.
+
 For Nodes, memory, disk, and PID pressure are warnings when their conditions
 are `True`. `NetworkUnavailable=True` is also a warning. These conditions do
 not produce warnings when they are `False`. `Unknown` remains a warning, and
@@ -75,8 +94,22 @@ herdr's own `ui.toast` delivery (in-app, outer terminal, or system).
 
 ## Log controls
 
-Press `J` to switch between raw and indented JSON. Raw display is the default.
-The setting applies to buffered and new records and stays active for the session.
+Press `J` to cycle the JSON view: raw, record, and indented JSON. The setting
+applies to buffered and new records and stays active for the session. Set
+`json_view` in `[logs]` to `raw` (the default), `record`, or `pretty` to choose
+the view a session starts with. A per-cluster or per-context override takes
+effect when you switch to a context whose value differs; `J` presses are kept
+otherwise. Any other value is reported in `:config` and treated as `raw`.
+
+Record view shows each structured log record (zap, slog, logrus, pino) on one row:
+time, level, message, then the other fields as `key=value`. It reads the time from
+`time`, `ts`, `timestamp`, or `@timestamp`, the level from `level`, `lvl`, or
+`severity`, and the message from `msg` or `message`. Epoch times become RFC 3339.
+Values with control characters, and strings that read as another JSON type
+(`"true"`, `"3"`, `"{}"`), are shown as quoted JSON strings, so a record stays on
+one row. Records without a level or message field stay raw. The row color comes
+from the record's level.
+
 Only individual JSON objects and arrays are formatted. Other text stays unchanged.
 Source labels and timestamps stay with their record. Filters and severity selection
 use the original record and show all its formatted rows when it matches.
@@ -93,8 +126,25 @@ logs. This includes pods from different namespaces. Each line has a
 `[namespace/pod:container]` prefix. Only marked pods still present in the filtered
 table are included. With no marks, `l` opens logs for the current row.
 
-The pod set is fixed when the view opens, including when timestamps or time
-anchors change, or streaming resumes. New pods are not added automatically.
+The set of marked pods is fixed when the view opens. If a new pod with the same
+name replaces a marked pod, its stream ends with a `[sofka]` line instead of
+following the new pod. sofka confirms the pod before each log request, so RBAC
+must allow `get` or `list` on pods; without either, the stream ends with a
+`[sofka]` line. Workload and service logs watch the selector instead: a
+pod that a rollout or scale-up creates joins the view with a
+`[sofka] following new pod` line and is shown from its first line.
+Pods that already existed start from the configured tail. A pod whose labels
+stop matching the selector leaves the view with a `[sofka]` line. If RBAC
+allows listing pods but not watching them, the pods found at open keep
+streaming and a `[sofka]` line says new pods are not followed.
+
+A followed stream that ends reconnects from its last line without repeating
+it. That covers dropped connections, API server timeouts, and waking the
+machine from sleep. sofka reads the pod when a stream ends and adds a
+`[sofka]` line when the container restarted, the pod was recreated (read from
+its first line), or the stream stops because the pod was deleted or finished.
+Reconnects back off up to 15 seconds while a stream returns nothing new. A refused request, such as
+missing RBAC, is reported once and not retried.
 Lines with timestamps are sorted by time, even when timestamp text is hidden.
 Press `t` to show or hide timestamps without clearing the buffer or restarting
 the streams. A paused view keeps the same log line or marker in view, within
@@ -113,6 +163,7 @@ tail = 300         # initial lines fetched per stream (kubectl --tail)
 buffer = 5000      # max lines kept while following (oldest dropped)
 since = "1h"       # optional: only logs newer than this, within the tail limit
 fullscreen = false # open log views fullscreen (F toggles per session)
+json_view = "raw"  # raw, record, or pretty: the JSON view a session starts in
 ```
 
 Press `T` to enter a positive duration such as `90s`, `30m`, `24h`, or `2d`.
@@ -223,7 +274,7 @@ capture-and-review workflow.
 available from sofka 0.24.8. Run `sofka --version` and update older versions
 before collecting diagnostics for a bug report.
 
-`:info` shows the version and build, config sources, live context/cluster/API
+`:info` shows the version and build, the latest known release, config sources, live context/cluster/API
 server and Kubernetes revision, discovery and Metrics API status, watch error
 and reconnect counts, API request latency, the logging destination, and the
 state/log/snapshot/bundle directories. It also names the active skin and the
@@ -545,3 +596,27 @@ requires `id-token` and `client-secret`.
 
 The identity provider uses a separate HTTPS connection with system trust.
 The Kubernetes API server CA exception does not apply to that connection.
+
+## Exec plugins that ask for input
+
+Some exec credential plugins prompt on the terminal. The common case is
+`aws eks get-token` with a profile that assumes a role with `mfa_serial`: the
+AWS CLI asks for an MFA code when it has no cached role credentials.
+
+Sofka never lets a plugin prompt behind the TUI. Plugins run without a
+controlling terminal, so a prompt fails at once instead of hanging.
+
+- **At startup** the terminal is still free. Sofka runs the plugin attached to
+  it, you type the code as in a shell, and sofka connects.
+- **While running**, a context switch or watch that hits the prompt asks
+  whether to run the auth plugin now. `y` suspends the TUI and runs the plugin
+  on the terminal. Sofka then restarts the watch, keeping your view, or retries
+  the context switch with its destination. `n` keeps the error, which names the
+  command to run in another shell. The question comes once per connection, and only
+  over the table or the context picker.
+
+The plugin must cache what it obtains, as the AWS CLI does for assumed roles.
+Sofka discards the interactive run's output and connects with a normal run
+afterwards. Setting `interactiveMode: Never` on the kubeconfig `exec` entry
+turns the prompt off. Headless runs (`--check`, `--snapshot`) prompt at
+startup only when stdin is a terminal.

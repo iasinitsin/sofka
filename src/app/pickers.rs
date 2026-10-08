@@ -24,8 +24,12 @@ impl App {
 
     /// Fetch the namespace list off-thread; it arrives as `Msg::Namespaces` and
     /// refreshes `ns_list`, which backs both the switcher popup and `:<kind>
-    /// <ns>` palette completion.
-    pub(super) fn spawn_namespace_fetch(&self) {
+    /// <ns>` palette completion. An answer older than the last applied one is
+    /// dropped, so a slow earlier fetch can't overwrite a fresher list, but it
+    /// still lands when a later fetch fails.
+    pub(super) fn spawn_namespace_fetch(&mut self) {
+        self.ns_list_request += 1;
+        let request = self.ns_list_request;
         let client = self.cluster.client.clone();
         let kind = self.cluster.resolve("namespaces").map(|k| k.ar);
         let tx = self.tx.clone();
@@ -44,21 +48,12 @@ impl App {
                 let _ = tx
                     .send(Msg::Namespaces {
                         generation: genr,
+                        request,
                         list: names,
                     })
                     .await;
             }
         });
-    }
-
-    /// Warm the namespace cache when the command palette opens, so `:<kind>
-    /// <ns>` can offer completions without waiting for the switcher popup. A
-    /// no-op once real namespaces are cached (the `<all>` sentinel doesn't
-    /// count).
-    pub(super) fn ensure_namespace_cache(&mut self) {
-        if !self.ns_list.iter().any(|n| n != "<all>") {
-            self.spawn_namespace_fetch();
-        }
     }
 
     /// Namespaces for the switcher: `<all>` is always pinned first. When
@@ -915,7 +910,7 @@ impl App {
             let result = Cluster::connect_context(&name, allow_v1_client_cert, no_tls_resumption)
                 .await
                 .map(Box::new)
-                .map_err(|e| e.to_string());
+                .map_err(|e| crate::k8s::ConnectError::from(&e));
             let _ = tx
                 .send(Msg::ContextSwitched {
                     generation: genr,
@@ -942,6 +937,7 @@ impl App {
         self.remember_sort = resolved.config.remember_sort.unwrap_or(true);
         self.hide_header = resolved.config.hide_header;
         self.terminal_title = resolved.config.terminal_title.unwrap_or(true);
+        self.update_check = resolved.config.update_check.unwrap_or(true);
         self.plugins = resolved.config.plugins;
         self.bookmarks = resolved.config.bookmarks;
         self.workspaces = resolved.config.workspaces;
@@ -949,7 +945,7 @@ impl App {
         self.debug = resolved.config.debug;
         self.bundle_cfg = resolved.config.bundle;
         self.pvc_cfg = resolved.config.pvc_explore;
-        self.logs_cfg = resolved.config.logs;
+        self.apply_logs_config(resolved.config.logs);
         self.fleet_cfg = resolved.config.fleet;
         // Tracked debuggers belong to the previous cluster/context.
         self.launched_node_debuggers.clear();
@@ -962,6 +958,7 @@ impl App {
         plugin_warnings.extend(crate::config::workspace_warnings(&self.workspaces));
         plugin_warnings.extend(crate::config::guardrail_warnings(&self.guardrails));
         plugin_warnings.extend(crate::config::pvc_explore_warnings(&self.pvc_cfg));
+        plugin_warnings.extend(crate::config::logs_warnings(&self.logs_cfg));
         let (views, view_warnings) = crate::views::compile(&resolved.config.views);
         self.user_views = views;
         let (thresholds, threshold_warnings) =

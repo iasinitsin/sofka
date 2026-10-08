@@ -10,6 +10,73 @@ local paths, and plugin IDs and versions. Cluster queries use earlier CLI option
 and have a time limit. Generation does not need a cluster connection.
 See [shell setup instructions](shell-completion.md).
 
+## Import from k9s
+
+`sofka import k9s` converts a k9s setup into sofka configuration. It reads the
+k9s directory the way k9s does: `$K9S_CONFIG_DIR`, then `$XDG_CONFIG_HOME/k9s`,
+then the platform default (`~/.config/k9s` on Linux,
+`~/Library/Application Support/k9s` on macOS, `%LOCALAPPDATA%\k9s` on Windows).
+Use `--from DIR` to read another directory. `--dry-run` prints the files
+without writing them.
+
+| k9s                             | sofka                                    |
+| ------------------------------- | ---------------------------------------- |
+| `aliases.yaml`                  | `aliases`, or bookmarks for destinations |
+| `plugins.yaml`, `plugins/`      | `plugins`, merged by name                |
+| `hotkeys.yaml`                  | `bookmarks` with the same keys           |
+| `views.yaml`                    | `views` with `replace = true`            |
+| `config.yaml`                   | top-level settings, `logs`, `thresholds` |
+| `clusters/<cluster>/<context>/` | the matching `clusters/` override file   |
+
+From `config.yaml`, the import reads `readOnly`, `defaultView`, `ui.skin`,
+`ui.enableMouse`, `ui.headless`, `ui.defaultsToFullScreen`, `logger`, and the
+CPU and memory `thresholds`. An alias such as `web: pods default app=web`
+names a destination, so it becomes a bookmark.
+
+Global settings go to `conf.d/00-k9s.yaml`. Each k9s context with a read-only
+flag, skin, locked favorite namespaces, aliases, plugins, or hotkeys gets an
+override file. Contexts that only hold k9s state, such as the last namespace,
+get none. k9s rewrites unlocked favorites with recently used namespaces, so
+they are imported only with `lockFavorites: true`.
+k9s settings that still have their k9s default values are not imported.
+
+The import does not change your own files:
+
+- A setting your base config, or a drop-in that sorts before `00-k9s.yaml`,
+  already sets keeps your value, and the report lists it. Your bookmarks stay
+  next to the imported ones, including in contexts with their own hotkeys.
+- A file the importer did not write is never replaced. A context that already
+  has a sofka override file is reported instead.
+- Running the import again requires `--force`, also with `--dry-run`. It
+  replaces the files an earlier import wrote and removes those the new import
+  no longer produces. If a k9s file cannot be read, a re-import stops
+  without changing anything.
+- Every file is validated before any file is written. If sofka would reject
+  one, nothing is written.
+
+Plugin placeholders are rewritten to sofka names: `$RESOURCE_NAME` becomes
+`$RESOURCE`, `$RESOURCE_GROUP` becomes `$GROUP`, `$RESOURCE_VERSION` becomes
+`$VERSION`, and `${NAME}` or `$name` becomes `$NAME`. A plugin marked
+`dangerous` in k9s is hidden in read-only mode, so it imports as
+`mutating = true`; other plugins import as `mutating = false`. k9s
+`Shift-1` to `Shift-0` keys become the US-layout characters `!` to `)`.
+
+The report lists everything that was not imported, with the reason. These
+cannot be translated:
+
+- Plugins that read table cells (`$COL-<NAME>`), use inverted placeholders
+  (`$!NAME`), use `pipes`, or run only in the containers view (`$POD`).
+- Plugin inputs used inside a longer string. sofka passes an input as a whole
+  argument (`${input.NAME}`).
+- View columns whose JSONPath uses filters, wildcards, or slices.
+- k9s skins without a matching sofka skin, `shellPod`, `imageScans`, and
+  `portForwardAddress`.
+
+The importer checks the result with sofka's own config validation. It reports
+plugin and hotkey keys that a sofka built-in key takes first, with your own
+`[keys]` bindings applied. Rebind the built-in under [`[keys]`](keybindings.md)
+or change the imported key.
+
 ## Node drain options
 
 Press `D` on a node to set options for the current node or marked nodes. The form
@@ -131,6 +198,10 @@ include those conditions. Row filters can search the route paths.
 
 - **Connect** to the current kubeconfig context, including exec credential
   plugins (GKE, EKS, and friends).
+- **MFA prompts from exec plugins** - a plugin that asks for input, such as
+  `aws eks get-token` with an MFA profile, prompts on the terminal at startup.
+  Later, sofka offers to suspend and run it. See
+  [exec plugins that ask for input](debugging.md#exec-plugins-that-ask-for-input).
 - **Optional TLS session resumption workaround** through `--no-tls-resumption`
   for clusters that reject resumed connections with HTTP 401. The default is
   unchanged. See [TLS session resumption](debugging.md#tls-session-resumption-and-http-401).
@@ -194,7 +265,8 @@ include those conditions. Row filters can search the route paths.
   own after the machine wakes from sleep on macOS and Linux.
 - **Curated columns** for common kinds (pods, deployments, replicasets,
   statefulsets, daemonsets, services, nodes, namespaces, configmaps, secrets,
-  jobs, cronjobs, PVC/PV, ingresses, endpoints, CustomResourceDefinitions), with
+  jobs, cronjobs, PVC/PV, ingresses, endpoints, CustomResourceDefinitions,
+  Flux and flux-operator objects), with
   a NAME/AGE fallback for everything else. STATUS columns use a fixed width of
   26 characters, or 27 for Nodes, so status changes do not move adjacent
   columns. A configured column width takes priority. Column widths use the full filtered list so
@@ -391,7 +463,10 @@ include those conditions. Row filters can search the route paths.
   on unusual values. Nodes also get **%CPU and %MEM of allocatable**
   (`status.allocatable` - the pool the scheduler hands out), colored by the
   `utilization` thresholds and sortable, so "which node is full" is one glance
-  and one `S`. The container picker shows per-container CPU and memory, usage as
+  and one `S`. **%CPU/R and %MEM/R** show how much of allocatable the pods on
+  each node request, with limits in wide mode and opt-in columns for extended
+  resources such as GPUs. They come from the pods API and work without
+  metrics-server. See [Views](views.md#built-in-and-metric-columns). The container picker shows per-container CPU and memory, usage as
   a percent of request and of limit (`-` marks an unset one), and the pod QoS
   class. Memory quantities use Kubernetes units, including decimal `k`, `P`,
   and `E`, and binary `Pi` and `Ei`, in metrics and filters. Fractional bytes
@@ -419,7 +494,9 @@ include those conditions. Row filters can search the route paths.
   explanation of why the selection is unhealthy: rollout state, degraded
   conditions, blocking pods and their container failure reasons
   (ImagePullBackOff, CrashLoopBackOff, OOMKilled, unschedulable, failed probes),
-  and recent Warning events. No AI, no external service. `⏎`, `E`, or `l` jumps
+  and recent Warning events. Jobs, CronJobs, PersistentVolumeClaims, and Nodes
+  get their own checks (see [Explain unhealthy](debugging.md#explain-unhealthy-x)).
+  No AI, no external service. `⏎`, `E`, or `l` jumps
   from a finding to the pod, its events, or its logs. After opening evidence,
   `esc` returns to Explain before another `esc` returns to the table.
   Opening the view or pressing `r` reads the selected resource from the API
@@ -495,7 +572,13 @@ include those conditions. Row filters can search the route paths.
 - **Flux CD controls** (`t`) - a suspend/resume/reconcile-now menu built on
   native Kubernetes API patches, for Kustomizations, HelmReleases, HelmCharts, git/helm/oci
   repositories, buckets, image automation, and notification alerts and
-  receivers. No `flux` binary needed. Works with bulk multiselect. For
+  receivers. No `flux` binary needed. Works with bulk multiselect. The
+  flux-operator kinds (ResourceSet, ResourceSetInputProvider, FluxInstance) get
+  the same menu. They have no `spec.suspend`, so suspend sets the
+  `fluxcd.controlplane.io/reconcile` annotation to `disabled`. Resume sets it to
+  `enabled` and requests a reconcile, as `flux-operator resume` does. Their
+  SUSPENDED column reads that annotation. ResourceSetInputProvider and
+  FluxInstance also offer **Force reconcile**. For
   HelmRelease resources, **Force reconcile** requests a Helm install or upgrade
   even when the specification has not changed. It sets
   `reconcile.fluxcd.io/requestedAt` and `reconcile.fluxcd.io/forceAt` to the same
@@ -536,6 +619,14 @@ include those conditions. Row filters can search the route paths.
   its resources can be in another cluster. An absent inventory is reported as
   unavailable. Helm hooks and controller-created children are not added to this
   list. Navigation uses the normal resource view and its access error handling.
+  A flux-operator **ResourceSet** or **FluxInstance** is its own owner: `⏎` on
+  one opens this view, with no Source section. The view also lists the input
+  providers in the ResourceSet's `spec.inputsFrom`, for the ResourceSet and for
+  the objects it applied. `⏎` on a named provider opens it. An
+  object a ResourceSet applied finds its owner from the
+  `resourceset.fluxcd.controlplane.io/name` label. An object a FluxInstance
+  applied finds it from `fluxcd.controlplane.io/name`, as `flux-operator trace`
+  does.
 - **Argo CD view** (`:argocd` / `:argo`) - the state of the selected Application:
   sync and health, the project and destination, every source it deploys from with
   the revision actually deployed from that source, every object in
@@ -624,6 +715,23 @@ include those conditions. Row filters can search the route paths.
   DaemonSets after confirmation. With no marked rows, restart the current row.
   Guardrails apply to the full target set. A failed request does not stop requests
   for the other targets. The final error report retains all failed targets.
+- **Rollout history and rollback** (`:rollout-history`) - list the revisions of
+  the selected Deployment, StatefulSet, or DaemonSet, newest first, like
+  `kubectl rollout history`. Deployment revisions come from their ReplicaSets,
+  StatefulSet and DaemonSet revisions from their ControllerRevisions. Only
+  revisions whose owner reference carries the workload's UID are listed, and
+  the workload's table filter is not carried over. Each row shows the revision,
+  `deployed` or `superseded`, the images, and the `kubernetes.io/change-cause`
+  annotation. `⏎` reads the live workload and diffs its pod template against the
+  selected revision's. `r` rolls the workload back to that revision after
+  confirmation, like `kubectl rollout undo --to-revision`; the `deployed`
+  revision is refused without asking. Before patching, sofka reads the
+  workload first and refuses a paused Deployment, a template that already
+  matches, or a workload recreated since the history was opened; the patch
+  carries the read's resourceVersion, so a change in between fails. When Flux or
+  Argo CD manages the workload, the confirmation warns that the next sync
+  reverts the rollback. The `rollback` guardrail applies. Delete, edit, and
+  scale are refused in this view: revisions belong to their workload.
 - **Scale discovered resources** (`s`) - scale built-in or custom resources when
   API discovery lists a `scale` subresource with PATCH support. Changes use
   `/scale`, including when a CRD stores replicas at a custom path. Marked rows
@@ -665,7 +773,9 @@ include those conditions. Row filters can search the route paths.
   for the current kubelet log view. Lines with timestamps are sorted by time.
   Press `t` to show or hide timestamps without changing log order or restarting
   streams. If a container is waiting to start, sofka
-  retries until its logs are available. sofka parses ANSI color from the source app
+  retries until its logs are available. Followed streams reconnect from their
+  last line after a container restart, dropped connection, or sleep, and
+  workload and service logs add pods as a rollout creates them. sofka parses ANSI color from the source app
   and maps it onto the active skin instead of printing literal escapes. See
   [Log controls](debugging.md#log-controls).
 - **Log severity filter** (`Ctrl+Z` in logs) shows detected warning and error
@@ -675,8 +785,9 @@ include those conditions. Row filters can search the route paths.
   recognized severity, including stack trace continuation lines, can be hidden.
   Press `Ctrl+Z` again to show all retained lines. The filter resets when a new
   log view opens. Copy and save use the filtered lines.
-- **JSON log display** (`J` in logs) indents JSON objects and arrays. The setting
-  stays active for the session. Filters and application copy/save use raw records.
+- **JSON log display** (`J` in logs) cycles raw, record, and indented JSON. Record
+  view shows each structured log record on one row: time, level, message, then
+  `key=value` fields. The setting stays active for the session. Filters and application copy/save use raw records.
   See [Log controls](debugging.md#log-controls) for limits.
 - **Log markers** (`m` in logs) add visual separators at the buffer tail.
   Markers stay visible through filters, do not move a paused viewport, and are
@@ -716,6 +827,11 @@ include those conditions. Row filters can search the route paths.
   displayed resource with `kubectl edit`, so a table row that moved while the
   watch was filling cannot change the target. The document is read again when
   the editor closes.
+- **Edit decoded Secrets** - `e` in the decoded Secret view (`x`) opens the
+  values as plain-text `stringData` in `$EDITOR`. sofka compares the result,
+  base64-encodes it, and patches only the keys you changed, added, or removed,
+  after a confirmation that names them. Values that are not text are left
+  unchanged. See [Document views](keys.md#document-views-yaml-describe-diff-events).
 - **Managed fields in YAML** - `m` shows or hides `metadata.managedFields` in the
   YAML view. Fields are hidden when a document opens. Showing them reads the
   full resource from the API. Automatic refresh keeps the current choice.
@@ -953,6 +1069,14 @@ pod is rejected; browse through a pod that already mounts the claim instead.
   stays visible in the main header.
   Identifiers, paths, and counts only, never credentials, tokens, or Secret
   values. See [Runtime diagnostics](debugging.md#runtime-diagnostics).
+- **Update notifications** (`:check-update`, or `sofka check-update`) - sofka
+  checks GitHub for a newer release once a day at startup. A newer release
+  appears in the header and on the status bar with the upgrade command for the
+  install method: Homebrew, Nix, Cargo, winget, or a download link for distro
+  packages and other installs. `:info` shows the latest known release and its
+  notes link. sofka never downloads or installs a release itself. Set
+  `update_check = false` to turn off the startup check. See
+  [Base options](configuration.md#base-options).
 - **Structured logging** (`[logging]`, or `SOFKA_LOG=debug`) - sofka's own
   session log as logfmt lines under the state directory, with every value
   redacted on the way in and writes off the UI thread. Off by default. See

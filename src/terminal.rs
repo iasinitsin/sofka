@@ -16,6 +16,37 @@ pub fn suspend_and_run(
     if argv.is_empty() {
         return Ok(());
     }
+    suspend_and_await(terminal, captured, run_command_async(argv))?
+}
+
+/// Run `context`'s exec auth plugin with the TUI suspended so it can prompt,
+/// then hand the outcome to the app, which retries the connection.
+pub fn authenticate(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut crate::app::App,
+    context: String,
+    switch: bool,
+    captured: bool,
+) {
+    let result = suspend_and_await(
+        terminal,
+        captured,
+        crate::k8s::authenticate_interactively(Some(&context)),
+    )
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result)
+    .map_err(|e| format!("{e:#}"));
+    app.authenticated(context, switch, result);
+}
+
+/// Suspend the TUI, give the terminal to whatever `future` runs, then restore
+/// the terminal modes. Same rules as [`suspend_and_run`]. The future runs on a
+/// runtime of its own, since the caller is inside the main loop's runtime.
+pub fn suspend_and_await<T: Send>(
+    terminal: &mut ratatui::DefaultTerminal,
+    captured: bool,
+    future: impl std::future::Future<Output = T> + Send,
+) -> io::Result<T> {
     // Protect the parent before normal terminal input can generate signals.
     #[cfg(unix)]
     let _signals = SignalGuard::new()?;
@@ -24,7 +55,7 @@ pub fn suspend_and_run(
     }
     let _ = disable_raw_mode();
     let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
-    let result = run_command(argv);
+    let result = block_on_own_runtime(future);
     // Set the modes directly. ratatui::init would install another panic hook.
     let _ = enable_raw_mode();
     let _ = crossterm::execute!(io::stdout(), EnterAlternateScreen);
@@ -37,14 +68,16 @@ pub fn suspend_and_run(
 
 const ERROR_LIMIT: usize = 16 * 1024;
 
-fn run_command(argv: &[String]) -> io::Result<()> {
+fn block_on_own_runtime<T: Send>(
+    future: impl std::future::Future<Output = T> + Send,
+) -> io::Result<T> {
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
+                Ok(tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
-                    .block_on(run_command_async(argv))
+                    .block_on(future))
             })
             .join()
             .map_err(|_| io::Error::other("Command runner failed."))?

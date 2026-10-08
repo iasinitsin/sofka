@@ -89,7 +89,39 @@ async fn aggregated_endpoint(
         "unexpected discovery response kind at {path}: {}",
         document["kind"]
     );
-    Ok(Some(serde_json::from_value(document)?))
+    Ok(Some(parse_aggregated(document)?))
+}
+
+// Some aggregated APIs (KubeVirt's subresources.kubevirt.io) send `"verbs": null`.
+// kube's types default a missing list but reject null, so drop only null verbs and
+// let any other malformed field fail the parse.
+fn parse_aggregated(mut document: serde_json::Value) -> Result<APIGroupDiscoveryList> {
+    fn drop_null_verbs(object: &mut serde_json::Value) {
+        if let Some(map) = object.as_object_mut()
+            && map.get("verbs").is_some_and(serde_json::Value::is_null)
+        {
+            map.remove("verbs");
+        }
+    }
+    let resources = document
+        .get_mut("items")
+        .and_then(serde_json::Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get_mut("versions")?.as_array_mut())
+        .flatten()
+        .filter_map(|version| version.get_mut("resources")?.as_array_mut())
+        .flatten();
+    for resource in resources {
+        drop_null_verbs(resource);
+        if let Some(subresources) = resource
+            .get_mut("subresources")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            subresources.iter_mut().for_each(drop_null_verbs);
+        }
+    }
+    Ok(serde_json::from_value(document)?)
 }
 
 fn append_aggregated(out: &mut Vec<Resource>, list: APIGroupDiscoveryList) -> Result<()> {
@@ -100,7 +132,10 @@ fn append_aggregated(out: &mut Vec<Resource>, list: APIGroupDiscoveryList) -> Re
             let version_name = version.version.unwrap_or_default();
             for resource in version.resources {
                 let plural = resource.resource.unwrap_or_default();
-                if plural.contains('/') {
+                // A group that only serves subresources (subresources.kubevirt.io) lists
+                // the parent with no verbs. Legacy discovery has no such entry, and it
+                // must not claim the bare name from the group that serves the resource.
+                if plural.contains('/') || resource.verbs.is_empty() {
                     continue;
                 }
                 out.push(Resource {
@@ -304,5 +339,35 @@ mod tests {
         let kinds = child_candidates(&resources);
         assert_eq!(kinds.len(), 1);
         assert_eq!(kinds[0].ar.plural, "widgets");
+    }
+
+    #[test]
+    fn aggregated_discovery_skips_resources_with_null_verbs() {
+        let mut resources = Vec::new();
+        append_aggregated(&mut resources, parse_aggregated(json!({
+            "kind": "APIGroupDiscoveryList",
+            "items": [{"metadata":{"name":"subresources.kubevirt.io"}, "versions":[{
+                "version":"v1", "resources":[
+                    {"resource":"virtualmachineinstances", "responseKind":{"kind":"VirtualMachineInstance"}, "scope":"Namespaced", "verbs":null,
+                     "subresources":[{"subresource":"console", "verbs":null}]},
+                    {"resource":"expand-vm-spec", "responseKind":{"kind":"VirtualMachine"}, "scope":"Namespaced", "verbs":null},
+                    {"resource":"guestfs", "responseKind":{"kind":"Guestfs"}, "scope":"Namespaced", "verbs":["get"]}
+                ]
+            }]}]
+        })).unwrap()).unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].kind.ar.plural, "guestfs");
+    }
+
+    #[test]
+    fn aggregated_discovery_rejects_other_null_lists() {
+        for document in [
+            json!({"kind": "APIGroupDiscoveryList", "items": null}),
+            json!({"kind": "APIGroupDiscoveryList", "items": [
+                {"metadata": {"name": "example.io"}, "versions": [{"version": "v1", "resources": null}]}
+            ]}),
+        ] {
+            assert!(parse_aggregated(document).is_err());
+        }
     }
 }

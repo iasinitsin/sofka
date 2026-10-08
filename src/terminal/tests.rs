@@ -14,14 +14,22 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 const CHILD_TEST: &str = "terminal::tests::terminal_plugin_child";
 const COMMAND_TEST: &str = "terminal::tests::terminal_plugin_command";
 const CASE_ENV: &str = "SOFKA_TERMINAL_TEST_CASE";
+const AUTH_TEST: &str = "terminal::tests::exec_auth_child";
 
 struct Session {
     child: Child,
     master: Option<File>,
+    /// Output read past the last marker, which the next `expect` starts from:
+    /// a child can print two markers in one write.
+    unread: Vec<u8>,
 }
 
 impl Session {
     fn start(case: &str) -> Self {
+        Self::start_test(CHILD_TEST, case, &[])
+    }
+
+    fn start_test(test: &str, case: &str, env: &[(&str, &std::path::Path)]) -> Self {
         let mut master = -1;
         let mut slave = -1;
         let mut size = libc::winsize {
@@ -55,8 +63,9 @@ impl Session {
         }
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["--exact", CHILD_TEST, "--nocapture"])
+            .args(["--exact", test, "--nocapture"])
             .env(CASE_ENV, case)
+            .envs(env.iter().copied())
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
@@ -80,12 +89,16 @@ impl Session {
         Self {
             child: command.spawn().unwrap(),
             master: Some(master),
+            unread: Vec::new(),
         }
     }
 
     fn expect(&mut self, marker: &str) {
         let deadline = Instant::now() + Duration::from_secs(15);
-        let mut output = Vec::new();
+        let mut output = std::mem::take(&mut self.unread);
+        if self.consume(&mut output, marker) {
+            return;
+        }
         while Instant::now() < deadline {
             let mut fd = libc::pollfd {
                 fd: self.master.as_ref().unwrap().as_raw_fd(),
@@ -102,12 +115,24 @@ impl Session {
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
-                if String::from_utf8_lossy(&output).contains(marker) {
+                if self.consume(&mut output, marker) {
                     return;
                 }
             }
         }
         panic!("missing {marker}: {}", String::from_utf8_lossy(&output));
+    }
+
+    /// Whether `output` holds `marker`; what follows it is kept for later.
+    fn consume(&mut self, output: &mut Vec<u8>, marker: &str) -> bool {
+        let Some(at) = output
+            .windows(marker.len())
+            .position(|window| window == marker.as_bytes())
+        else {
+            return false;
+        };
+        self.unread = output.split_off(at + marker.len());
+        true
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -356,4 +381,108 @@ async fn stderr_drain_stops_for_idle_or_continuously_writing_descendants() {
     .await;
     assert_eq!(output.len(), 1024 * 1024);
     assert_eq!(tail.len(), ERROR_LIMIT);
+}
+
+/// The exec plugin the auth test runs: it prompts on the terminal like the
+/// AWS CLI does for an MFA code, and caches the code it accepts.
+const AUTH_PLUGIN: &str = r#"printf "Enter MFA code: " >/dev/tty; read code </dev/tty || exit 1; [ "$code" = 123456 ] || { echo "wrong code" >&2; exit 1; }; printf "%s" "$code" > "$CACHE"; printf "{\"apiVersion\":\"client.authentication.k8s.io/v1beta1\",\"kind\":\"ExecCredential\",\"status\":{\"token\":\"t\"}}""#;
+
+/// Accepting the offer a watch error makes suspends the TUI, runs the exec
+/// plugin on the real terminal where it reads the code, and restores the TUI
+/// whether the plugin succeeds, rejects the code, or is interrupted.
+#[test]
+fn exec_auth_runs_the_plugin_on_the_terminal_and_restores_the_tui() {
+    for case in ["ok", "wrong", "interrupt"] {
+        let dir = std::env::temp_dir().join(format!("sofka-auth-{case}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kubeconfig = dir.join("kubeconfig");
+        let config = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Config",
+            "current-context": "test",
+            "contexts": [{"name": "test", "context": {"cluster": "test", "user": "mfa"}}],
+            "clusters": [{"name": "test", "cluster": {"server": "https://127.0.0.1:1"}}],
+            "users": [{"name": "mfa", "user": {"exec": {
+                "apiVersion": "client.authentication.k8s.io/v1beta1",
+                "command": "sh",
+                "args": ["-c", AUTH_PLUGIN],
+                "env": [{"name": "CACHE", "value": dir.join("cache")}]
+            }}}]
+        });
+        std::fs::write(&kubeconfig, serde_yaml::to_string(&config).unwrap()).unwrap();
+        let mut session = Session::start_test(AUTH_TEST, case, &[("KUBECONFIG", &kubeconfig)]);
+        session.expect("TUI_READY");
+        session.send(b"y");
+        session.expect("Enter MFA code");
+        session.send(match case {
+            "ok" => b"123456\n",
+            "wrong" => b"000000\n",
+            _ => b"\x03",
+        });
+        session.expect("TUI_RESUMED");
+        session.send(b"?");
+        session.expect("INPUT_OK");
+        session.expect("ALL_DONE");
+        session.finish();
+        let cache = std::fs::read_to_string(dir.join("cache")).ok();
+        assert_eq!(
+            cache.as_deref(),
+            (case == "ok").then_some("123456"),
+            "{case}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_auth_child() {
+    let Ok(case) = std::env::var(CASE_ENV) else {
+        return;
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(32);
+    let mut app = App::new(Cluster::fake(), tx);
+    app.switch_kind("pods");
+    let mut terminal = ratatui::init();
+    let before = [signal_action(libc::SIGINT), signal_action(libc::SIGQUIT)];
+    let generation = app.generation;
+    app.handle_msg(crate::store::Msg::WatchError {
+        generation: app.generation,
+        error: "MFA code required".into(),
+        failure: crate::store::WatchFailure::NeedsInput,
+    });
+    assert_eq!(app.mode, Mode::Confirm);
+    println!("TUI_READY");
+    app.handle_key(read_key()).unwrap();
+    let Some(Suspend::Authenticate { context, switch }) = app.pending.take() else {
+        panic!("accepting did not queue authentication: {}", app.flash);
+    };
+    authenticate(&mut terminal, &mut app, context, switch, false);
+
+    assert!(crossterm::terminal::is_raw_mode_enabled().unwrap());
+    for (signal, previous) in [libc::SIGINT, libc::SIGQUIT].into_iter().zip(&before) {
+        assert_eq!(signal_action(signal).sa_sigaction, previous.sa_sigaction);
+    }
+    assert_eq!(app.mode, Mode::Table);
+    match case.as_str() {
+        "ok" => {
+            assert_eq!(app.flash, "authenticated");
+            assert!(app.generation > generation, "watch not restarted");
+        }
+        "wrong" => assert!(
+            app.flash.contains("authentication failed") && app.flash.contains("exit status: 1"),
+            "{}",
+            app.flash
+        ),
+        _ => assert!(
+            app.flash.contains("authentication failed") && app.flash.contains("signal"),
+            "{}",
+            app.flash
+        ),
+    }
+    println!("TUI_RESUMED");
+    app.handle_key(read_key()).unwrap();
+    assert_eq!(app.mode, Mode::Help);
+    println!("INPUT_OK");
+    ratatui::restore();
+    println!("ALL_DONE");
 }

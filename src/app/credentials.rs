@@ -11,7 +11,7 @@
 //! keeps renewing every 30 seconds until the watch recovers or a new client
 //! is installed.
 
-use super::{App, Msg, WatchFailure};
+use super::{App, ConfirmAction, Mode, Msg, WatchFailure};
 use crate::k8s::ExecClient;
 
 use k8s_openapi::jiff::{SignedDuration, Timestamp};
@@ -157,13 +157,76 @@ impl App {
         let explains = match failure {
             WatchFailure::CredentialsRefused => true,
             WatchFailure::NoResponse => expired,
-            WatchFailure::Response => false,
+            WatchFailure::Response | WatchFailure::NeedsInput => false,
         };
         if !explains {
             return None;
         }
         let hint = self.credential_error.as_ref()?;
         Some(format!("{error}; credential renewal failed: {hint}"))
+    }
+
+    /// Offer to run `context`'s exec auth plugin on the terminal, because it
+    /// stopped to ask for input. Once per generation, and only over the table
+    /// or the context picker, so it never interrupts typing or another dialog.
+    /// Returns whether the offer is open.
+    pub(super) fn offer_authentication(&mut self, context: String, switch: bool) -> bool {
+        if self.auth_offered == Some(self.generation)
+            || !matches!(self.mode, Mode::Table | Mode::Contexts)
+            || self.ctx_filtering
+        {
+            return false;
+        }
+        self.auth_offered = Some(self.generation);
+        self.confirm_label = format!(
+            "'{context}' needs terminal input to authenticate, such as an MFA code. Run its auth plugin now?"
+        );
+        self.confirm_action = Some(ConfirmAction::Authenticate { context, switch });
+        self.confirm_return = Mode::Table;
+        self.mode = Mode::Confirm;
+        true
+    }
+
+    /// The exec auth plugin for `context` ran on the terminal and cached its
+    /// credentials. After a watch error the live context keeps its client and
+    /// view: kube-rs runs a token plugin per request, so restarting the watch
+    /// picks them up, and a certificate plugin renews. A failed `switch` is
+    /// retried, even to the same context, still headed where it was going.
+    pub fn authenticated(&mut self, context: String, switch: bool, result: Result<(), String>) {
+        if let Err(error) = result {
+            crate::log_warn!(
+                "cluster.credentials.authenticate_failed",
+                context = context,
+                error = error
+            );
+            self.abandon_switch_destination();
+            self.flash_warn(&format!("authentication failed: {error}"));
+            if !self.cluster.connected {
+                self.open_contexts();
+            }
+            return;
+        }
+        crate::log_info!("cluster.credentials.authenticated", context = context);
+        if !switch && self.cluster.connected && context == self.cluster.context {
+            if self.cluster.renews_credentials() {
+                self.credential_rejected = true;
+            }
+            self.set_flash("authenticated");
+            self.resume_pending = Some("authenticated");
+            self.restart_pending_watch();
+            return;
+        }
+        let query = self.pending_resource_query.take();
+        let bookmark = self.pending_bookmark.take();
+        let workspace = self.pending_workspace.take();
+        let argocd_target = self.pending_argocd_target.take();
+        let argocd_return = self.pending_argocd_return.take();
+        self.switch_context_inner(context, true);
+        self.pending_resource_query = query;
+        self.pending_bookmark = bookmark;
+        self.pending_workspace = workspace;
+        self.pending_argocd_target = argocd_target;
+        self.pending_argocd_return = argocd_return;
     }
 
     /// Forget a renewal that belongs to the client a context switch replaced.

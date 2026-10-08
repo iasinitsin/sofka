@@ -27,6 +27,22 @@ pub(super) fn suspend_patch(suspend: bool) -> Value {
     json!({ "spec": { "suspend": suspend } })
 }
 
+/// flux-operator suspend/resume, matching `flux-operator suspend|resume`:
+/// the reconcile annotation pauses the loop, and resume also requests a
+/// reconcile so the object catches up straight away.
+pub(super) fn operator_suspend_patch(suspend: bool, requested_at: &str) -> Value {
+    if suspend {
+        json!({ "metadata": { "annotations": {
+            "fluxcd.controlplane.io/reconcile": "disabled"
+        }}})
+    } else {
+        json!({ "metadata": { "annotations": {
+            "fluxcd.controlplane.io/reconcile": "enabled",
+            "reconcile.fluxcd.io/requestedAt": requested_at
+        }}})
+    }
+}
+
 pub(super) fn reconcile_patch(requested_at: &str, force: bool) -> Value {
     let mut patch = json!({
         "metadata": { "annotations": { "reconcile.fluxcd.io/requestedAt": requested_at } }
@@ -430,6 +446,17 @@ impl App {
                     )
                     | ("notification.toolkit.fluxcd.io", "alerts" | "receivers")
             )
+        }) || self.flux_operator_kind()
+    }
+
+    /// Whether the current kind is a flux-operator CRD with a reconcile loop.
+    pub fn flux_operator_kind(&self) -> bool {
+        self.kind.as_ref().is_some_and(|kind| {
+            kind.ar.group == FLUX_OPERATOR_GROUP
+                && matches!(
+                    kind.ar.plural.as_str(),
+                    "resourcesets" | "resourcesetinputproviders" | "fluxinstances"
+                )
         })
     }
 
@@ -471,13 +498,17 @@ impl App {
             ARGOCD_MENU_ITEMS
         } else if self.argocd_kind() {
             ARGOCD_APPSET_MENU_ITEMS
-        } else if self.kind_plural == "helmreleases"
-            && self
-                .kind
-                .as_ref()
-                .is_some_and(|kind| kind.ar.group == "helm.toolkit.fluxcd.io")
-        {
-            HELMRELEASE_MENU_ITEMS
+        } else if self.kind.as_ref().is_some_and(|kind| {
+            matches!(
+                (kind.ar.group.as_str(), kind.ar.plural.as_str()),
+                ("helm.toolkit.fluxcd.io", "helmreleases")
+                    | (
+                        FLUX_OPERATOR_GROUP,
+                        "resourcesetinputproviders" | "fluxinstances"
+                    )
+            )
+        }) {
+            FLUX_FORCE_MENU_ITEMS
         } else {
             FLUX_MENU_ITEMS
         }
@@ -623,88 +654,6 @@ pub(super) fn osc52_sequence(text: &str) -> String {
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     format!("\x1b]52;c;{encoded}\x07")
-}
-
-pub(super) async fn forward_log_stream(
-    api: Api<Pod>,
-    pod: String,
-    lp: LogParams,
-    prefix: String,
-    tx: Sender<Msg>,
-    generation: u64,
-    flag: Arc<AtomicU64>,
-) {
-    use futures_util::{AsyncBufReadExt, TryStreamExt};
-    use tokio::time::MissedTickBehavior;
-
-    let stream = loop {
-        if flag.load(Ordering::SeqCst) != generation || tx.is_closed() {
-            return;
-        }
-        match api.log_stream(&pod, &lp).await {
-            Ok(stream) => break stream,
-            Err(kube::Error::Api(e))
-                if lp.follow
-                    && !lp.previous
-                    && e.code == 400
-                    && e.message.contains("is waiting to start") =>
-            {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                    _ = tx.closed() => return,
-                }
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(Msg::LogLines {
-                        generation,
-                        lines: vec![format!("{prefix}[error] {e}")],
-                    })
-                    .await;
-                return;
-            }
-        }
-    };
-
-    let mut lines = stream.lines();
-    let mut batch = Vec::with_capacity(LOG_BATCH_LINES);
-    let mut flush = tokio::time::interval(Duration::from_millis(LOG_BATCH_MS));
-    flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    loop {
-        if flag.load(Ordering::SeqCst) != generation {
-            break;
-        }
-
-        tokio::select! {
-            next = lines.try_next() => {
-                match next {
-                    Ok(Some(line)) => {
-                        batch.push(format!("{prefix}{line}"));
-                        if batch.len() >= LOG_BATCH_LINES
-                            && !send_log_batch(&tx, generation, &mut batch).await
-                        {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        batch.push(format!("{prefix}[error] {e}"));
-                        break;
-                    }
-                }
-            }
-            _ = flush.tick(), if !batch.is_empty() => {
-                if !send_log_batch(&tx, generation, &mut batch).await {
-                    break;
-                }
-            }
-        }
-    }
-
-    if flag.load(Ordering::SeqCst) == generation {
-        let _ = send_log_batch(&tx, generation, &mut batch).await;
-    }
 }
 
 pub(super) async fn send_log_batch(

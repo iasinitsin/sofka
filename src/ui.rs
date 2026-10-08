@@ -252,6 +252,7 @@ fn draw_base(frame: &mut Frame, app: &mut App) {
         Mode::DocFilter => app.doc_filter_return,
         Mode::Command => app.palette_return,
         Mode::Confirm if app.confirm_over_document() => Mode::Detail,
+        Mode::Prompt if app.prompt_over_document() => Mode::Detail,
         mode => mode,
     };
     if app.document_fullscreen && matches!(document_mode, Mode::Detail | Mode::Diff | Mode::Events)
@@ -285,6 +286,9 @@ fn draw_base(frame: &mut Frame, app: &mut App) {
         }
         if app.mode == Mode::Confirm {
             draw_confirm(frame, app, chunks[0]);
+        }
+        if app.mode == Mode::Prompt {
+            draw_prompt_popup(frame, app, chunks[0]);
         }
         if needs_prompt {
             draw_prompt(frame, app, chunks[1]);
@@ -389,9 +393,17 @@ fn draw_base(frame: &mut Frame, app: &mut App) {
         Mode::Confirm | Mode::Prompt if app.over_pvc_browser() => {
             draw_pvc_explore(frame, app, chunks[1])
         }
-        // The Flux warning for `e` in a document view keeps the document
-        // underneath, like the view it returns to.
+        // The Flux warning for `e` in a document view, and the decoded Secret
+        // update, keep the document underneath, like the view they return to.
         Mode::Confirm if app.confirm_over_document() => draw_scrollable(
+            frame,
+            show_scrollbars,
+            false,
+            &mut app.detail,
+            chunks[1],
+            theme::sky(),
+        ),
+        Mode::Prompt if app.prompt_over_document() => draw_scrollable(
             frame,
             show_scrollbars,
             false,
@@ -505,14 +517,24 @@ const HEADER_HINT_COLUMNS: [usize; 3] = [16, 13, 13];
 const HEADER_HINTS_WIDTH: u16 = 46;
 /// Minimum width the info cluster keeps before the hint column may appear.
 const HEADER_INFO_MIN: u16 = 44;
+/// Width of the logo column on the right of the header.
+const HEADER_LOGO_WIDTH: u16 = 26;
 
-fn header_title(server_version: &str) -> Line<'static> {
+fn header_title(server_version: &str, update: Option<&str>) -> Line<'static> {
     let mut spans = vec![Span::styled(" sofka ", theme::title())];
     if !server_version.is_empty() {
         spans.push(Span::styled("· K8s Rev: ", theme::dim()));
         spans.push(Span::styled(
             server_version.to_string(),
             Style::default().fg(theme::sapphire()),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    if let Some(version) = update {
+        spans.push(Span::styled("· ", theme::dim()));
+        spans.push(Span::styled(
+            format!("v{version} available"),
+            Style::default().fg(theme::yellow()),
         ));
         spans.push(Span::raw(" "));
     }
@@ -533,9 +555,13 @@ fn diagnostic_value<'a>(app: &App, value: &'a str) -> std::borrow::Cow<'a, str> 
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let hints = header_hints(app);
+    let show_hints = !hints.is_empty() && header_hints_fit(area.width);
+    let show_logo = !show_hints || header_logo_fits(area.width);
+    let logo_width = if show_logo { HEADER_LOGO_WIDTH } else { 0 };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(30), Constraint::Length(26)])
+        .constraints([Constraint::Min(30), Constraint::Length(logo_width)])
         .split(area);
 
     let ns = if app.all_namespaces() {
@@ -562,12 +588,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::border())
-        .title(header_title(&app.cluster.server_version));
+        .title(header_title(
+            &app.cluster.server_version,
+            app.available_update()
+                .map(|release| release.version.as_str()),
+        ));
     let inner = block.inner(cols[0]);
     frame.render_widget(block, cols[0]);
 
-    let hints = header_hints(app);
-    let show_hints = !hints.is_empty() && header_hints_fit(area.width);
     let info_width = if show_hints {
         inner.width.saturating_sub(HEADER_HINTS_WIDTH)
     } else {
@@ -615,37 +643,39 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(info), inner);
     }
 
-    // Sophie the Russian Blue: tall pointed ears, a narrow watchful stare
-    // (not round cutesy eyes), cool grey-blue coat. Lines are equal width so
-    // the right-aligned block stays coherent.
-    let logo = vec![
-        Line::from(Span::styled(
-            "  /\\        /\\ ",
-            Style::default().fg(theme::overlay1()),
-        )),
-        Line::from(Span::styled(
-            " /  \\______/  \\",
-            Style::default().fg(theme::overlay1()),
-        )),
-        Line::from(Span::styled(
-            "( -        -  )",
-            Style::default().fg(theme::green()),
-        )),
-        Line::from(Span::styled(
-            " \\     ᴥ      /",
-            Style::default().fg(theme::maroon()),
-        )),
-        Line::from(Span::styled(
-            "  \\    \\__/   /",
-            Style::default().fg(theme::overlay1()),
-        )),
-        Line::from(Span::styled(
-            "   '--------'  ",
-            Style::default().fg(theme::overlay1()),
-        )),
-        Line::from(Span::styled(format!("   sofka v{VERSION}"), theme::dim())),
-    ];
-    frame.render_widget(Paragraph::new(logo).alignment(Alignment::Right), cols[1]);
+    if show_logo {
+        // Sophie the Russian Blue: tall pointed ears, a narrow watchful stare
+        // (not round cutesy eyes), cool grey-blue coat. Lines are equal width so
+        // the right-aligned block stays coherent.
+        let logo = vec![
+            Line::from(Span::styled(
+                "  /\\        /\\ ",
+                Style::default().fg(theme::overlay1()),
+            )),
+            Line::from(Span::styled(
+                " /  \\______/  \\",
+                Style::default().fg(theme::overlay1()),
+            )),
+            Line::from(Span::styled(
+                "( -        -  )",
+                Style::default().fg(theme::green()),
+            )),
+            Line::from(Span::styled(
+                " \\     ᴥ      /",
+                Style::default().fg(theme::maroon()),
+            )),
+            Line::from(Span::styled(
+                "  \\    \\__/   /",
+                Style::default().fg(theme::overlay1()),
+            )),
+            Line::from(Span::styled(
+                "   '--------'  ",
+                Style::default().fg(theme::overlay1()),
+            )),
+            Line::from(Span::styled(format!("   sofka v{VERSION}"), theme::dim())),
+        ];
+        frame.render_widget(Paragraph::new(logo).alignment(Alignment::Right), cols[1]);
+    }
 }
 
 fn favorite_namespace_spans(app: &App, width: usize) -> Vec<Span<'static>> {
@@ -729,6 +759,14 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
             style,
         ));
     }
+    // After the status text, so a warning keeps its room; it stays once the
+    // update notice on the status bar expires.
+    if let Some(release) = app.available_update() {
+        spans.push(Span::styled(
+            format!("  v{} available", release.version),
+            Style::default().fg(theme::yellow()),
+        ));
+    }
 
     let (synced, sync_color) = if app.refresh_task.is_some() {
         ("● refresh", theme::sky())
@@ -753,9 +791,15 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Whether the frame is wide enough for the header's key-hint column:
-/// logo (26) + box borders (2) + info cluster + hints.
+/// box borders (2) + info cluster + hints. The logo gives up its column
+/// before the hints do.
 fn header_hints_fit(frame_width: u16) -> bool {
-    frame_width.saturating_sub(26 + 2) >= HEADER_INFO_MIN + HEADER_HINTS_WIDTH
+    frame_width.saturating_sub(2) >= HEADER_INFO_MIN + HEADER_HINTS_WIDTH
+}
+
+/// Whether the logo still fits next to the info cluster and the hints.
+fn header_logo_fits(frame_width: u16) -> bool {
+    header_hints_fit(frame_width.saturating_sub(HEADER_LOGO_WIDTH))
 }
 
 /// Show the first effective binding for each action.
@@ -1015,6 +1059,19 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
             ),
             hint_line(app, &[(Action::Delete, "uninstall")]),
         ],
+        "rollouthistory" => vec![
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "diff"),
+                    (Action::RestartOrRefresh, "rollback"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[(Action::Yaml, "yaml"), (Action::Describe, "describe")],
+            ),
+        ],
         "customresourcedefinitions" => vec![
             hint_line(
                 app,
@@ -1092,6 +1149,11 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
             // the YAML, the order `App::drill` tries them in.
             let open = match app.configured_drill() {
                 Some(drill) => drill.kind,
+                None if app.flux_operator_kind()
+                    && matches!(app.kind_plural.as_str(), "resourcesets" | "fluxinstances") =>
+                {
+                    "gitops".to_string()
+                }
                 None if app.node_pointer().is_some() => "node".to_string(),
                 None => "yaml".to_string(),
             };
@@ -2018,12 +2080,17 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
                 continue;
             };
             let l = app.logs.display_line(buf_idx);
+            let record_color = app.logs.record_severity(buf_idx).map(severity_color);
             let mut offset = 0;
             for part in l.split('\n') {
                 if row + offset >= scroll + inner_h {
                     break;
                 }
-                let line = render_log_line(part, highlight);
+                let line = render_log_line_in(
+                    part,
+                    highlight,
+                    record_color.unwrap_or_else(|| log_level_color(part)),
+                );
                 let parts = if wrap {
                     wrap_line(line, inner_w)
                 } else {
@@ -2042,7 +2109,11 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let flags = format!(
         "{}{}{}{}{}{}",
-        if app.logs.json { " JSON" } else { "" },
+        match app.logs.json {
+            crate::app::JsonView::Raw => "",
+            crate::app::JsonView::Record => " record",
+            crate::app::JsonView::Pretty => " JSON",
+        },
         if app.logs.warnings_only {
             " [warn/error]"
         } else {
@@ -2191,8 +2262,7 @@ fn wrap_line<'a>(line: Line<'a>, width: usize) -> Vec<Line<'a>> {
 /// in its own stable color, an optional leading RFC3339 timestamp dimmed (k9s
 /// style), then the message body in its severity color with search matches
 /// highlighted on top.
-fn render_log_line(line: &str, needle: &str) -> Line<'static> {
-    let base = log_level_color(line);
+fn render_log_line_in(line: &str, needle: &str, base: Color) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut rest = line;
 
@@ -2217,6 +2287,11 @@ fn render_log_line(line: &str, needle: &str) -> Line<'static> {
     //    falling back to the severity color, with search matches on top.
     spans.extend(render_body(rest, needle, base));
     Line::from(spans)
+}
+
+#[cfg(test)]
+fn render_log_line(line: &str, needle: &str) -> Line<'static> {
+    render_log_line_in(line, needle, log_level_color(line))
 }
 
 /// Length of a leading RFC3339 timestamp (`2026-06-30T12:52:20.876Z`,
@@ -2514,7 +2589,11 @@ fn ansi_16_color(code: u8) -> Option<Color> {
 }
 
 fn log_level_color(line: &str) -> Color {
-    match crate::logfilter::severity(line) {
+    severity_color(crate::logfilter::severity(line))
+}
+
+fn severity_color(severity: crate::logfilter::Severity) -> Color {
+    match severity {
         crate::logfilter::Severity::Error => theme::red(),
         crate::logfilter::Severity::Warning => theme::peach(),
         crate::logfilter::Severity::Debug => theme::overlay1(),
@@ -2766,11 +2845,11 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         } else if scope == "table" && action == Action::Describe {
             "describe; experimental native backend: --experimental-describe or experimental.native_describe in config"
         } else if scope == "table" && action == Action::RestartOrRefresh {
-            "restart workloads (marked rows, or current); force-sync external secrets; rollback Helm history; refresh elsewhere"
+            "restart workloads (marked rows, or current); force-sync external secrets; rollback Helm or rollout history; refresh elsewhere"
         } else if scope == "table" && action == Action::Logs {
             "logs (marked pods, or current row)"
         } else if scope == "table" && action == Action::ActionMenu {
-            "action menu: Flux suspend/resume/reconcile (includes HelmChart; HelmRelease: + force reconcile); Argo CD suspend/resume (Application: + sync, sync with prune); CronJobs trigger/suspend/resume; pods file transfer"
+            "action menu: Flux suspend/resume/reconcile (includes HelmChart and flux-operator kinds; HelmRelease, ResourceSetInputProvider, FluxInstance: + force reconcile); Argo CD suspend/resume (Application: + sync, sync with prune); CronJobs trigger/suspend/resume; pods file transfer"
         } else if scope == "port_forward_picker" && action == Action::Edit {
             "edit local port of the selected mapping"
         } else if scope == "logs" && action == Action::Lookback {
@@ -2780,7 +2859,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         } else if action == Action::Fullscreen {
             "toggle fullscreen for text selection (no borders or scrollbars)"
         } else if action == Action::Edit && scope == "detail" {
-            "edit the displayed resource in $EDITOR (YAML and describe)"
+            "edit the displayed resource in $EDITOR (YAML, describe, decoded Secret)"
         } else if action == Action::ManagedFields && scope == "detail" {
             "show or hide managedFields (YAML only; hidden when a document opens)"
         } else if action == Action::AutoRefresh && scope == "detail" {
@@ -2837,6 +2916,10 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         ":xray · :diff",
         "hierarchical tree · live-vs-last-applied diff",
     ));
+    lines.push(bind(
+        ":rollout-history",
+        "deployment/statefulset/daemonset revisions: ⏎ diff · r rollback",
+    ));
     lines.push(bind(":events", "browse all events"));
     lines.push(bind(":pf", "view/stop background port-forwards"));
     lines.push(bind(":skin", "switch color skin live"));
@@ -2847,6 +2930,10 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     lines.push(bind(
         ":reload · :config · :info",
         "reload config · config sources + warnings · runtime diagnostics",
+    ));
+    lines.push(bind(
+        ":check-update",
+        "check for a newer sofka release and show how to upgrade",
     ));
     lines.push(bind(
         ":users / :groups",
@@ -6184,10 +6271,18 @@ mod tests {
 
     #[test]
     fn header_title_shows_connected_kubernetes_revision() {
-        assert_eq!(line_text(&header_title("")), " sofka ");
+        assert_eq!(line_text(&header_title("", None)), " sofka ");
         assert_eq!(
-            line_text(&header_title("v1.36.2-eks-bca9cf6")),
+            line_text(&header_title("v1.36.2-eks-bca9cf6", None)),
             " sofka · K8s Rev: v1.36.2-eks-bca9cf6 "
+        );
+    }
+
+    #[test]
+    fn header_title_shows_an_available_update() {
+        assert_eq!(
+            line_text(&header_title("v1.36.2", Some("0.32.0"))),
+            " sofka · K8s Rev: v1.36.2 · v0.32.0 available "
         );
     }
 
@@ -6522,6 +6617,27 @@ mod tests {
         let text = text.join("\n");
         assert!(text.contains("argo view"), "{text}");
         assert_eq!(text.matches("yaml").count(), 1, "{text}");
+    }
+
+    /// `⏎` on a ResourceSet or FluxInstance opens the GitOps view; the same
+    /// plural in another group still opens YAML.
+    #[tokio::test]
+    async fn flux_operator_owner_rows_hint_enter_as_the_gitops_view() {
+        for (group, gitops) in [("fluxcd.controlplane.io", true), ("example.com", false)] {
+            for (kind, plural) in [
+                ("ResourceSet", "resourcesets"),
+                ("FluxInstance", "fluxinstances"),
+            ] {
+                let (tx, _rx) = tokio::sync::mpsc::channel(16);
+                let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+                app.cluster.register_kind(group, kind, plural, true);
+                app.switch_kind(plural);
+                let text: Vec<String> = header_hints(&app).iter().map(line_text).collect();
+                let text = text.join("\n");
+                assert_eq!(text.contains("gitops"), gitops, "{group} {text}");
+                assert_eq!(text.matches("yaml").count(), 1, "{text}");
+            }
+        }
     }
 
     /// With a configured drill, `⏎` runs the drill, so the hint names its

@@ -98,6 +98,10 @@ const FLASH_TTL: std::time::Duration = std::time::Duration::from_secs(8);
 /// and `applicationsets` plurals — only `argoproj.io` kinds get the `t` menu.
 const ARGOCD_GROUP: &str = "argoproj.io";
 
+/// The flux-operator CRD group (ResourceSet, ResourceSetInputProvider,
+/// FluxInstance). These kinds pause through an annotation, not `spec.suspend`.
+const FLUX_OPERATOR_GROUP: &str = "fluxcd.controlplane.io";
+
 /// Items in the Flux action menu (`t`), in display order. Deliberately a menu
 /// — not a single-key toggle — so suspending something always takes an
 /// explicit, visible choice rather than one accidental keystroke. "Reconcile
@@ -105,7 +109,9 @@ const ARGOCD_GROUP: &str = "argoproj.io";
 /// `flux reconcile` CLI uses, shared by every controller in the toolkit.
 pub const FLUX_MENU_ITEMS: &[&str] = &["Suspend", "Resume", "Reconcile now", "Cancel"];
 
-pub const HELMRELEASE_MENU_ITEMS: &[&str] = &[
+/// The Flux menu for kinds whose controller honours `reconcile.fluxcd.io/forceAt`:
+/// HelmRelease, ResourceSetInputProvider, and FluxInstance.
+pub const FLUX_FORCE_MENU_ITEMS: &[&str] = &[
     "Suspend",
     "Resume",
     "Reconcile now",
@@ -234,6 +240,12 @@ pub enum Suspend {
         argv: Vec<String>,
         failure: Box<CommandFailure>,
     },
+    /// Run this context's exec auth plugin on the terminal, then retry
+    /// through [`App::authenticated`].
+    Authenticate {
+        context: String,
+        switch: bool,
+    },
 }
 
 /// A `kubectl port-forward` running in the background (not `Suspend::Shell`
@@ -268,6 +280,22 @@ impl Drop for PortForward {
 /// Spawns a background `kubectl port-forward` child. Overridable in tests
 /// so the unit suite doesn't require `kubectl` on PATH.
 type PortForwardSpawner = fn(&[String]) -> std::io::Result<tokio::process::Child>;
+
+/// Looks up the latest release (`force` skips the daily cache). Overridable
+/// in tests so the unit suite never reaches GitHub.
+type UpdateFetcher = fn(
+    bool,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<crate::update::Release, String>> + Send>,
+>;
+
+fn default_update_fetcher(
+    force: bool,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<crate::update::Release, String>> + Send>,
+> {
+    Box::pin(crate::update::check(force))
+}
 
 fn default_pf_spawner(argv: &[String]) -> std::io::Result<tokio::process::Child> {
     tokio::process::Command::new(&argv[0])
@@ -318,6 +346,13 @@ enum ConfirmAction {
     /// Edit a Flux-managed object (`kubectl edit`) after warning that the edit
     /// will be reverted on the next reconcile.
     Edit { argv: Vec<String> },
+    /// Patch the keys changed in the decoded Secret editor.
+    SecretEdit {
+        kind: Kind,
+        name: String,
+        ns: String,
+        patch: Value,
+    },
     /// Shell into a pod, once a guardrail confirmation is satisfied.
     Exec { ns: String, name: String },
     /// Copy a file between a pod and the local filesystem (`kubectl cp`),
@@ -351,6 +386,16 @@ enum ConfirmAction {
         ns: String,
         name: String,
         revision: String,
+    },
+    /// Roll a workload back to one of its revisions (`kubectl rollout undo
+    /// --to-revision`), from the selected rollout history row.
+    RolloutUndo {
+        kind: Kind,
+        workload: crate::rollout::Workload,
+        name: String,
+        uid: Option<String>,
+        revision: i64,
+        rev: Box<DynamicObject>,
     },
     /// Sync one or more ArgoCD Applications with pruning, which deletes
     /// resources no longer in Git.
@@ -394,6 +439,10 @@ enum ConfirmAction {
     /// Delete the PVC-explore helper pods left behind by earlier sessions.
     /// `None` sweeps every namespace, matching an all-namespaces view.
     PvcClean { scope: Option<String> },
+    /// Suspend the TUI and run `context`'s exec auth plugin on the terminal,
+    /// because it wants input such as an MFA code. `switch` when a context
+    /// switch asked, which is retried afterwards; otherwise a watch did.
+    Authenticate { context: String, switch: bool },
     /// Run a confirmed plugin (`confirm`/`dangerous`) once accepted — one job
     /// (label, argv) per target, so a bulk run confirms once.
     Plugin {
@@ -428,6 +477,7 @@ pub enum PluginMode {
 struct PodLogTarget {
     ns: String,
     name: String,
+    uid: Option<String>,
     containers: Vec<String>,
 }
 
@@ -440,6 +490,7 @@ enum LogSource {
     Pod {
         ns: String,
         name: String,
+        uid: Option<String>,
         containers: Vec<String>,
     },
     /// All pods matching a label selector (aggregated workload logs).
@@ -691,12 +742,14 @@ enum PaletteAction {
     Snapshot,
     Snapshots,
     Info,
+    CheckUpdate,
     Fleet,
     Rightsize,
     PvcExplore,
     PvcClean,
     Find,
     Diff,
+    RolloutHistory,
     Events,
     PortForwards,
     ProviderLogs,
@@ -740,6 +793,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Timeline,
         names: &["timeline", "tl", "history"],
+    },
+    PaletteCommand {
+        action: PaletteAction::RolloutHistory,
+        names: &["rollout-history"],
     },
     PaletteCommand {
         action: PaletteAction::Adjacent,
@@ -836,6 +893,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Info,
         names: &["info", "diagnostics", "about"],
+    },
+    PaletteCommand {
+        action: PaletteAction::CheckUpdate,
+        names: &["check-update", "update-check"],
     },
     PaletteCommand {
         action: PaletteAction::Fleet,
@@ -1241,7 +1302,7 @@ pub struct LogsView {
     pub warnings_only: bool,
     pub wrap: bool,
     pub timestamps: bool,
-    pub json: bool,
+    pub json: logs::JsonView,
     json_budget: usize,
     pub stopped: bool,
     /// Fullscreen (`F`, k9s): the pane takes the whole frame with no header,
@@ -1281,7 +1342,7 @@ impl Default for LogsView {
             warnings_only: false,
             wrap: false,
             timestamps: false,
-            json: false,
+            json: logs::JsonView::Raw,
             json_budget: logs::JSON_CACHE_LIMIT,
             stopped: false,
             fullscreen: false,
@@ -1440,14 +1501,10 @@ impl LogsView {
                 continue;
             }
             index.shown.push(Some(i as u32));
-            let display = if *json {
-                line_meta
-                    .get(i)
-                    .and_then(|m| m.pretty.as_deref())
-                    .unwrap_or(line)
-            } else {
-                line
-            };
+            let display = line_meta
+                .get(i)
+                .and_then(|m| m.display(*json))
+                .unwrap_or(line);
             index.total_rows += logs::display_height(display, wrap_width);
             index.ends.push(index.total_rows as u32);
         }
@@ -1714,6 +1771,9 @@ struct CellCacheEntry {
     cells: Vec<String>,
     status_idx: Option<usize>,
     helm_updated: Option<i64>,
+    /// The revision in effect when a rollout history row was rendered; its
+    /// STATUS cell is stale once that changes.
+    rollout_current: Option<i64>,
     /// Per-cell character-presence masks, and their union across the row.
     /// See [`subseq_mask`]: a cheap necessary condition for a fuzzy
     /// subsequence match, used to skip cells (and whole rows) without paying
@@ -1811,6 +1871,22 @@ pub struct OwnerScope {
 }
 
 impl OwnerScope {
+    /// Like [`Self::owns`], but only through an owner reference carrying this
+    /// scope's UID: no name-prefix fallback for orphans.
+    pub fn owns_strictly(&self, obj: &DynamicObject) -> bool {
+        let Some(uid) = &self.uid else {
+            return false;
+        };
+        obj.metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|r| {
+                r.kind.eq_ignore_ascii_case(&self.kind) && r.name == self.name && r.uid == *uid
+            })
+    }
+
     pub fn owns(&self, obj: &DynamicObject) -> bool {
         let refs = obj.metadata.owner_references.as_deref().unwrap_or_default();
         if refs.is_empty() {
@@ -1840,6 +1916,7 @@ struct Frame {
     labels: Option<String>,
     fields: Option<String>,
     owner: Option<OwnerScope>,
+    rollout_managed: Option<String>,
     filter: String,
     scope_label: Option<String>,
     selected: Option<usize>,
@@ -1867,6 +1944,14 @@ pub struct App {
     pub labels: Option<String>,
     pub fields: Option<String>,
     pub owner: Option<OwnerScope>,
+    /// The Flux or Argo CD owner of the workload whose rollout history is
+    /// open, named in the rollback confirmation.
+    rollout_managed: Option<String>,
+    /// The revision in effect, keyed by the watch generation and store
+    /// version it was computed for.
+    rollout_current_cache: std::cell::Cell<Option<(u64, u64, Option<i64>)>>,
+    /// The latest rollback preview request; an older one's diff is dropped.
+    rollout_preview: u64,
     /// Drill-down breadcrumb shown in the header, e.g. "deploy/foo".
     pub scope_label: Option<String>,
 
@@ -2013,6 +2098,7 @@ pub struct App {
     document_reload_task: Option<JoinHandle<()>>,
     document_edit_task: Option<JoinHandle<()>>,
     document_edit_request: u64,
+    secret_edit: Option<secret_edit::SecretEdit>,
     reload_after_suspend: bool,
     pub(super) refresh_generation: u64,
     document_source: Option<refresh::RefreshSource>,
@@ -2203,6 +2289,9 @@ pub struct App {
     /// the PVC browser sets it away from the table: every other guarded action
     /// is launched from the table and returns there.
     pub(super) confirm_return: Mode,
+    /// The generation that last offered to authenticate an exec plugin that
+    /// needs input, so a retrying watch asks once instead of on every error.
+    auth_offered: Option<u64>,
 
     /// Background `kubectl port-forward` processes started with `f`/`F`.
     /// Viewed/stopped via `:pf`; killed automatically on drop.
@@ -2263,10 +2352,10 @@ pub struct App {
     pub container_metrics: HashMap<String, (i64, i64)>,
     pub(crate) container_history: metrics_history::ContainerHistory,
     pub(crate) node_history: metrics_history::NodeHistory,
-    /// Latest pod count per node (nodes view PODS column). `None` until the
-    /// first successful pods list, so "no data yet" renders as "-" instead of
-    /// a misleading 0.
-    pub node_pods: Option<HashMap<String, usize>>,
+    /// Latest pod count and committed requests and limits per node. `None`
+    /// until the first successful pods list, so "no data yet" renders as "-"
+    /// instead of a misleading 0.
+    pub node_loads: Option<HashMap<String, crate::columns::NodeLoad>>,
 
     pub pulse: Pulse,
     pub xray_items: Vec<XrayItem>,
@@ -2286,6 +2375,10 @@ pub struct App {
     pub explain_source: Option<DynamicObject>,
     /// Latest Explain request, independent of the table watch generation.
     explain_request: u64,
+    /// Latest namespace-list fetch issued.
+    ns_list_request: u64,
+    /// Newest namespace-list fetch applied; answers older than it are dropped.
+    ns_list_applied: u64,
     explain_claim: Option<StatusClaim>,
     /// Parent of the explain view. Kept separately because an evidence view
     /// (logs/events) temporarily uses `return_mode` to return to Explain.
@@ -2381,6 +2474,8 @@ pub struct App {
     log_gen: u64,
     log_flag: Arc<AtomicU64>,
     log_tasks: Vec<JoinHandle<()>>,
+    /// Bumped when the machine wakes, so followed log streams reconnect.
+    log_wake: tokio::sync::watch::Sender<u64>,
     event_gen: u64,
     event_task: Option<JoinHandle<()>>,
 
@@ -2424,6 +2519,12 @@ pub struct App {
     /// Hide the header in normal and compact modes.
     pub hide_header: bool,
     pub terminal_title: bool,
+    /// Background update checks are allowed (`update_check`). Off until
+    /// startup reads the config, so tests never reach the network.
+    pub update_check: bool,
+    /// The latest release the last update check found.
+    pub latest_release: Option<crate::update::Release>,
+    update_fetcher: UpdateFetcher,
     /// Active column layout for the current view; rebuilt by
     /// [`App::refresh_view_spec`] whenever kind/views/wide change.
     spec: crate::columns::ViewSpec,
@@ -2444,6 +2545,9 @@ impl App {
             labels: None,
             fields: None,
             owner: None,
+            rollout_managed: None,
+            rollout_current_cache: std::cell::Cell::new(None),
+            rollout_preview: 0,
             scope_label: None,
             generation: 0,
             gen_flag: Arc::new(AtomicU64::new(0)),
@@ -2523,6 +2627,7 @@ impl App {
             document_reload_task: None,
             document_edit_task: None,
             document_edit_request: 0,
+            secret_edit: None,
             reload_after_suspend: false,
             refresh_generation: 0,
             document_source: None,
@@ -2608,6 +2713,7 @@ impl App {
             pvc: PvcExplore::default(),
             pvc_cfg: crate::config::PvcExploreConfig::default(),
             confirm_return: Mode::Table,
+            auth_offered: None,
             port_forwards: Vec::new(),
             pf_spawner: default_pf_spawner,
             forwards_cfg: Vec::new(),
@@ -2637,7 +2743,7 @@ impl App {
             container_metrics: HashMap::new(),
             container_history: metrics_history::ContainerHistory::default(),
             node_history: metrics_history::NodeHistory::default(),
-            node_pods: None,
+            node_loads: None,
             pulse: Pulse::default(),
             xray_items: Vec::new(),
             xray_state: ListState::default(),
@@ -2649,6 +2755,8 @@ impl App {
             findings_scroll: FindingsScroll::default(),
             explain_source: None,
             explain_request: 0,
+            ns_list_request: 0,
+            ns_list_applied: 0,
             explain_claim: None,
             explain_return: Mode::Table,
             rbac: rbac::State::default(),
@@ -2702,6 +2810,7 @@ impl App {
             log_gen: 0,
             log_flag: Arc::new(AtomicU64::new(0)),
             log_tasks: Vec::new(),
+            log_wake: tokio::sync::watch::channel(0).0,
             event_gen: 0,
             event_task: None,
             pending: None,
@@ -2734,6 +2843,9 @@ impl App {
             compact: false,
             hide_header: false,
             terminal_title: true,
+            update_check: false,
+            latest_release: None,
+            update_fetcher: default_update_fetcher,
             spec: crate::columns::build_spec("", "", None, None, false),
         }
     }
@@ -2781,6 +2893,14 @@ impl App {
             && matches!(self.prompt_kind, Some(PromptKind::GuardConfirm { .. }))
     }
 
+    /// Whether the active prompt is a guardrail confirmation raised from a
+    /// document view (the decoded Secret editor), so the document stays.
+    pub fn prompt_over_document(&self) -> bool {
+        self.confirm_return == Mode::Detail
+            && self.document_source.is_some()
+            && matches!(self.prompt_kind, Some(PromptKind::GuardConfirm { .. }))
+    }
+
     /// Whether the logs view is showing the external log provider (enables
     /// provider-only keys like `T`).
     pub fn provider_logs_active(&self) -> bool {
@@ -2811,7 +2931,9 @@ mod helpers;
 mod input;
 mod journal;
 mod lifecycle;
+mod log_follow;
 mod logs;
+pub use logs::JsonView;
 mod metrics_history;
 mod mouse;
 mod namespace_patterns;
@@ -2826,15 +2948,19 @@ pub mod rbac;
 mod refresh;
 mod resume;
 mod rightsize;
+mod rollout;
 mod rows;
+mod secret_edit;
 mod snapshot;
 mod timeline;
 mod transfer;
+mod update;
 mod workspaces;
 
 use helpers::*;
 pub use notify::notification_sequence;
 pub use pickers::DEFAULT_SORT_LABEL;
+pub use secret_edit::sweep_abandoned as sweep_abandoned_secret_edits;
 
 #[cfg(test)]
 mod tests;

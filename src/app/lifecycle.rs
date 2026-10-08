@@ -196,6 +196,7 @@ impl App {
         match self.kind_plural.as_str() {
             "helm" => Some("helm"),
             "helmhistory" => Some("helm history"),
+            crate::rollout::VIEW => Some("rollout history"),
             _ => None,
         }
     }
@@ -317,6 +318,7 @@ impl App {
             labels: self.labels.clone(),
             fields: self.fields.clone(),
             owner: self.owner.clone(),
+            rollout_managed: self.rollout_managed.clone(),
             filter: self.filter.clone(),
             scope_label: self.scope_label.clone(),
             selected: self.table_state.selected(),
@@ -330,6 +332,7 @@ impl App {
         self.labels = f.labels;
         self.fields = f.fields;
         self.owner = f.owner;
+        self.rollout_managed = f.rollout_managed;
         self.filter = f.filter;
         self.scope_label = f.scope_label;
         self.reset_sort();
@@ -416,7 +419,7 @@ impl App {
         self.watch_key = Some(key);
         self.metrics.clear();
         self.container_metrics.clear();
-        self.node_pods = None;
+        self.node_loads = None;
         self.clear_marks();
         self.range_selection = None;
         self.clear_rows_cache();
@@ -756,8 +759,8 @@ impl App {
         self.tasks.push(handle);
     }
 
-    /// Watch the pods API for the nodes view: pod count per node (the PODS
-    /// column). Counts non-terminated pods — Succeeded/Failed pods hold no
+    /// Watch the pods API for the nodes view: pod count and committed
+    /// requests and limits per node. Counts non-terminated pods — Succeeded/Failed pods hold no
     /// node resources — mirroring `kubectl describe node`. Replaces a full
     /// cluster-wide pod re-list every 10s with one watch, kept incrementally
     /// up to date and coalesced to at most one `Msg::NodePods` per second.
@@ -795,10 +798,9 @@ impl App {
             // somewhere: see `established` below.
             let mut stream = watcher(api.clone(), cfg).boxed();
             let mut backoff = watcher::DefaultBackoff::default();
-            // Node per pod, kept incrementally so per-node counts never need
-            // a full rescan of the cluster's pods.
-            let mut pod_nodes: HashMap<String, String> = HashMap::new();
-            let mut counts: HashMap<String, usize> = HashMap::new();
+            // Kept incrementally so per-node totals never need a full rescan
+            // of the cluster's pods.
+            let mut loads = crate::columns::NodeLoads::default();
             let mut dirty = false;
             // The initial list arrives as a stream of `InitApply`s, so the
             // counts are incomplete until `InitDone`. Publishing mid-init
@@ -815,14 +817,6 @@ impl App {
                         if flag.load(Ordering::SeqCst) != genr {
                             break;
                         }
-                        let retire = |node: &str, counts: &mut HashMap<String, usize>| {
-                            if let Some(c) = counts.get_mut(node) {
-                                *c = c.saturating_sub(1);
-                                if *c == 0 {
-                                    counts.remove(node);
-                                }
-                            }
-                        };
                         // Progress, as opposed to another doomed list attempt.
                         // `Init` and the `InitApply`s behind it are replayed on
                         // every attempt, so resetting on those is exactly the
@@ -838,35 +832,13 @@ impl App {
                         }
                         match event {
                             Ok(watcher::Event::Apply(obj)) | Ok(watcher::Event::InitApply(obj)) => {
-                                let key = row_key(&obj);
-                                let new_node = obj
-                                    .data
-                                    .pointer("/spec/nodeName")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_string);
-                                let old_node = match &new_node {
-                                    Some(n) => pod_nodes.insert(key, n.clone()),
-                                    None => pod_nodes.remove(&key),
-                                };
-                                if old_node != new_node {
-                                    if let Some(old) = &old_node {
-                                        retire(old, &mut counts);
-                                    }
-                                    if let Some(new) = &new_node {
-                                        *counts.entry(new.clone()).or_insert(0) += 1;
-                                    }
-                                    dirty = true;
-                                }
+                                dirty |= loads.apply(row_key(&obj), &obj);
                             }
                             Ok(watcher::Event::Delete(obj)) => {
-                                if let Some(old) = pod_nodes.remove(&row_key(&obj)) {
-                                    retire(&old, &mut counts);
-                                    dirty = true;
-                                }
+                                dirty |= loads.remove(&row_key(&obj));
                             }
                             Ok(watcher::Event::Init) => {
-                                pod_nodes.clear();
-                                counts.clear();
+                                loads.clear();
                                 synced = false;
                             }
                             Ok(watcher::Event::InitDone) => {
@@ -902,7 +874,7 @@ impl App {
                             if tx
                                 .send(Msg::NodePods {
                                     generation: genr,
-                                    counts: counts.clone(),
+                                    loads: loads.snapshot(),
                                 })
                                 .await
                                 .is_err()
@@ -926,20 +898,14 @@ impl App {
                     break;
                 }
                 if let Ok(list) = api.list(&params).await {
-                    let mut counts: HashMap<String, usize> = HashMap::new();
+                    let mut loads = crate::columns::NodeLoads::default();
                     for item in list {
-                        if let Some(node) = item
-                            .data
-                            .pointer("/spec/nodeName")
-                            .and_then(serde_json::Value::as_str)
-                        {
-                            *counts.entry(node.to_string()).or_insert(0) += 1;
-                        }
+                        loads.apply(row_key(&item), &item);
                     }
                     if tx
                         .send(Msg::NodePods {
                             generation: genr,
-                            counts,
+                            loads: loads.snapshot(),
                         })
                         .await
                         .is_err()
@@ -959,12 +925,30 @@ impl App {
         self.watch_error_flash = Some(self.flash.clone());
     }
 
+    /// Drop what a failed context switch was going to open.
+    pub(super) fn abandon_switch_destination(&mut self) {
+        self.pending_resource_query = None;
+        self.pending_bookmark = None;
+        self.pending_workspace = None;
+        // A jump that never landed reopens the view it left; a
+        // return that never landed leaves its way back on the table.
+        if let Some(jump) = self.pending_argocd_target.take() {
+            self.reopen_argocd(jump.back);
+        }
+        if let Some(back) = self.pending_argocd_return.take() {
+            self.argocd_return = Some(back);
+        }
+    }
+
     fn show_watch_error(&mut self, error: String, failure: WatchFailure) {
         self.watch_errors = self.watch_errors.saturating_add(1);
         self.last_error = Some(error.clone());
         crate::log_warn!("view.error", kind = self.kind_plural, error = error);
         self.note_watch_failure(failure);
         self.set_watch_error_flash(error, failure);
+        if failure == WatchFailure::NeedsInput {
+            self.offer_authentication(self.cluster.context.clone(), false);
+        }
     }
 
     fn clear_watch_error_flash(&mut self) -> bool {
@@ -1218,6 +1202,7 @@ impl App {
             } if generation == self.generation => {
                 self.set_claimed_status(claim, message, err);
             }
+            Msg::UpdateCheck { claim, result } => self.finish_update_check(claim, result),
             Msg::Panic(error) => {
                 crate::log_error!("task.panic", error = error);
                 self.last_error = Some(error.clone());
@@ -1275,18 +1260,16 @@ impl App {
                     self.invalidate_rows();
                 }
             }
-            Msg::NodePods { generation, counts } if generation == self.generation => {
-                let sort_uses_pods = self
+            Msg::NodePods { generation, loads } if generation == self.generation => {
+                let sort_uses_load = self
                     .sort_column
                     .and_then(|i| self.display_headers().get(i).cloned())
-                    .is_some_and(|h| {
-                        self.spec.metric(&h) == Some(crate::columns::MetricColumn::NodePods)
-                    });
-                self.node_pods = Some(counts);
-                if sort_uses_pods
-                    || self.parsed_filter().uses_metrics(&|key| {
-                        self.spec.metric(key) == Some(crate::columns::MetricColumn::NodePods)
-                    })
+                    .is_some_and(|h| self.spec.metric(&h).is_some_and(|m| m.node_load()));
+                self.node_loads = Some(loads);
+                if sort_uses_load
+                    || self
+                        .parsed_filter()
+                        .uses_metrics(&|key| self.spec.metric(key).is_some_and(|m| m.node_load()))
                 {
                     self.invalidate_rows();
                 }
@@ -1745,6 +1728,11 @@ impl App {
                 self.document_edit_task = None;
                 self.edit_document_object(result);
             }
+            Msg::SecretEditApplied {
+                generation,
+                claim,
+                result,
+            } if generation == self.generation => self.secret_edit_applied(claim, result),
             Msg::NativeDescribeReady {
                 generation,
                 claim,
@@ -1826,6 +1814,34 @@ impl App {
                     None => self.clear_claimed_status(claim),
                 }
             }
+            Msg::Diff {
+                generation,
+                request,
+                claim,
+                title,
+                lines,
+                warn,
+            } if generation == self.generation
+                && request == self.rollout_preview
+                && self.mode == Mode::Table =>
+            {
+                self.stop_resource_refresh();
+                self.clear_document_source();
+                self.detail = Scrollable {
+                    wrap: self.detail.wrap,
+                    title,
+                    lines: lines.into(),
+                    ..Default::default()
+                };
+                self.mode = Mode::Diff;
+                match warn {
+                    Some(w) => self.set_claimed_status(claim, w, false),
+                    None => self.clear_claimed_status(claim),
+                }
+            }
+            // A newer preview, a rollback confirmation, or another view took
+            // over while this one was reading the workload.
+            Msg::Diff { claim, .. } => self.clear_claimed_status(claim),
             Msg::ResourceRefresh { generation, result }
                 if generation == self.refresh_generation
                     && (self.refresh_task.is_some()
@@ -1992,7 +2008,12 @@ impl App {
                     self.set_claimed_status(claim, failure, true);
                 }
             }
-            Msg::Namespaces { generation, list } if generation == self.generation => {
+            Msg::Namespaces {
+                generation,
+                request,
+                list,
+            } if generation == self.generation && request >= self.ns_list_applied => {
+                self.ns_list_applied = request;
                 let names = self.filtered_namespaces();
                 let keep = self.ns_state.selected().unwrap_or(0);
                 let selected = names.get(keep);
@@ -2002,6 +2023,9 @@ impl App {
                     .and_then(|selected| names.iter().position(|n| n == selected))
                     .unwrap_or_else(|| keep.min(names.len().saturating_sub(1)));
                 self.ns_state.select(Some(index));
+                if self.mode == Mode::Command && !self.cmd_navigated {
+                    self.update_suggestions();
+                }
             }
             Msg::Contexts { generation, list } if generation == self.generation => {
                 self.all_contexts = list.clone();
@@ -2055,23 +2079,18 @@ impl App {
                 match result {
                     Ok(cluster) => self.apply_context_switch(name, cluster),
                     Err(e) => {
-                        self.pending_resource_query = None;
-                        self.pending_bookmark = None;
-                        self.pending_workspace = None;
-                        // A jump that never landed reopens the view it left; a
-                        // return that never landed leaves its way back on the table.
-                        if let Some(jump) = self.pending_argocd_target.take() {
-                            self.reopen_argocd(jump.back);
-                        }
-                        if let Some(back) = self.pending_argocd_return.take() {
-                            self.argocd_return = Some(back);
-                        }
-                        self.flash_warn(&format!("context switch failed: {e}"));
                         // Never connected anywhere yet — put the picker back up
                         // instead of stranding the user on an empty table.
                         if !self.cluster.connected {
                             self.open_contexts();
                         }
+                        // Whatever the switch was for waits on the answer: an
+                        // authenticated retry still lands there.
+                        if !(e.needs_input && self.offer_authentication(name, true)) {
+                            self.abandon_switch_destination();
+                        }
+                        // Last, so a view the abandoned jump reopens keeps it.
+                        self.flash_warn(&format!("context switch failed: {e}"));
                     }
                 }
             }

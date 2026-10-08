@@ -40,7 +40,7 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `:ns <name-or-pattern>`                                      | change namespace and keep the resource view; from Namespaces, return to the previous view or Pods (`all`/`*` = all namespaces)                                                                   |
 | `[` / `]`                                                    | view history - back / forward through visited kind+namespace views                                                                                                                               |
 | `Tab` / `shift-Tab`                                          | next / previous common resource in the current namespace; cycle workspace views when one is open                                                                                                 |
-| `enter`                                                      | drill down (workload/svc → pods, machinedeployment → machines, cronjob → jobs, node → pods, pod → containers, ns → pods, CRD → resources, Argo app → `:argo`, or [views](views.md))              |
+| `enter`                                                      | drill down (workload/svc/node/ns → pods, machinedeployment → machines, cronjob → jobs, pod → containers, CRD → its resources, Argo app → `:argo`, ResourceSet → `:gitops`, or [views](views.md)) |
 | `esc`                                                        | go back / pop the view stack / clear filter / clear marks                                                                                                                                        |
 | `j`/`k`, `↓`/`↑`, `g`/`G`                                    | navigate                                                                                                                                                                                         |
 | `ctrl-f` / `ctrl-b`, `PgDn` / `PgUp`                         | page forward / back - one screenful at a time                                                                                                                                                    |
@@ -74,9 +74,11 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `:rightsize`                                                 | historical right-sizing: P50/P95/P99 usage → suggested requests + patch preview (needs a metrics backend)                                                                                        |
 | `:ctx` / `:ctx <name>`                                       | context switcher popup (type to filter, `r` renames, `space` toggles fleet membership) / switch directly (the name tab-completes)                                                                |
 | `:helm`                                                      | Helm releases (native storage-Secret decode): ⏎ history → values · `y` manifest · `d` notes · `r` rollback                                                                                       |
+| `:rollout-history`                                           | Deployment, StatefulSet, or DaemonSet revisions: ⏎ diff against the live template · `r` rollback                                                                                                 |
 | `:fleet`                                                     | cross-context health dashboard (opt-in: `[fleet]` contexts or `space` in `:ctx`; `⏎` switches, `r` refreshes)                                                                                    |
 | `:skin`                                                      | switch the color skin live (`:skin gruvbox-dark` applies directly)                                                                                                                               |
 | `:reload` / `:config` / `:info`                              | reload config from disk · config sources + warnings · runtime diagnostics                                                                                                                        |
+| `:check-update`                                              | check for a newer sofka release and show the upgrade command                                                                                                                                     |
 | `l` / `p`                                                    | logs (marked pods, or current row; workload = all matching pods) / previous-container logs                                                                                                       |
 | `L` / `:vlogs`                                               | VictoriaLogs history for the selection (pod, container, workload, service, namespace)                                                                                                            |
 | `c`                                                          | copy resource name to clipboard                                                                                                                                                                  |
@@ -92,9 +94,9 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `:notify`                                                    | toggle watch notifications on the selected object                                                                                                                                                |
 | `:find <text>`                                               | global fuzzy find over object names across common kinds, all namespaces                                                                                                                          |
 | `i`                                                          | set container image                                                                                                                                                                              |
-| `r`                                                          | rollout restart (marked workloads, or current) / force-sync (ExternalSecrets/PushSecrets) / refresh (elsewhere)                                                                                  |
+| `r`                                                          | rollout restart (marked workloads, or current) / force-sync (ExternalSecrets/PushSecrets) / rollback (Helm or rollout history) / refresh (elsewhere)                                             |
 | `f` / `shift-f`                                              | port-forward (pods/services) — picker shows declared ports, or "Custom…" for manual entry; active forwards show `●` next to the name                                                             |
-| `t`                                                          | Flux: suspend/resume/reconcile (includes HelmChart; + force for HelmRelease) · ArgoCD: suspend/resume (+ sync, sync with prune for App) · CronJobs: trigger/suspend/resume · pods: file transfer |
+| `t`                                                          | Flux and flux-operator: suspend/resume/reconcile (+ force where supported) · ArgoCD: suspend/resume (+ sync, sync with prune for App) · CronJobs: trigger/suspend/resume · pods: file transfer   |
 | `C` / `U` / `D`                                              | nodes: cordon / uncordon / open drain options                                                                                                                                                    |
 | `ctrl-d` / `ctrl-k`                                          | delete / force-delete (marked rows, or current); in confirm: `f` toggles force, `c` cycles cascade (background → foreground → orphan)                                                            |
 | `w`                                                          | toggle wide-only columns (kubectl `-o wide`), including node IP addresses and labels                                                                                                             |
@@ -166,7 +168,7 @@ point instead. See [PVC explore](features.md#pvc-explore).
 ## Logs view
 
 `/` filter (substring · `/regex/` · `!invert`) · `s`/`f` autoscroll · `w` wrap ·
-`J` JSON formatting · `Ctrl+Z` warning/error filter · `m` visual marker · `t` timestamps · `x` stop/resume stream · `z` clear buffer · `c` copy buffer ·
+`J` JSON view (raw/record/pretty) · `Ctrl+Z` warning/error filter · `m` visual marker · `t` timestamps · `x` stop/resume stream · `z` clear buffer · `c` copy buffer ·
 `ctrl-s` save to file · `F` fullscreen (no chrome, clean text selection) ·
 `0`–`5` time anchors (tail · 1m · 5m · 15m · 30m · 1h) · `T` custom lookback (`s`/`m`/`h`/`d`, or `tail` for kubelet logs)
 (VictoriaLogs views) · `esc` back. The newest line anchors to the bottom of the
@@ -211,9 +213,21 @@ In the YAML and describe views, `e` opens the displayed resource in `$EDITOR`
 (`kubectl edit`), even if the table selection moved while the document was open.
 Read-only mode blocks it, and a Flux-managed resource asks for confirmation
 first. sofka reads the resource before opening the editor and refuses if it was
-replaced under the same name. The document is read again when the editor closes. The decoded Secret,
-diff, and events views do not support `e`. Use `keys.detail.edit` to change the
-key binding.
+replaced under the same name. The document is read again when the editor closes. The diff and
+events views do not support `e`. Use `keys.detail.edit` to change the key
+binding.
+
+In the decoded Secret view, `e` opens the text values as `stringData` in
+`$KUBE_EDITOR` or `$EDITOR` (`vi` when neither is set). The file is private to
+your user and is deleted when the editor closes. If sofka exits without
+deleting it, the next start removes it. Values that are not text are not shown
+and cannot be overwritten from the editor. Delete a key to remove it, or write
+`stringData: {}` to remove every text key. Save the file unchanged to cancel.
+If the file does not parse, or a value is not a string, the editor opens again
+with the error on top. sofka then asks for confirmation, naming the keys it
+will change, add, or remove, and patches only those keys. The patch fails if
+the Secret changed after `e` read it. An immutable Secret cannot be edited.
+Read-only mode and the `secret-edit` guardrail apply.
 
 In the YAML view, `m` shows or hides `metadata.managedFields`. Fields are hidden
 when a document opens. Showing them reads the full resource from the API. The
