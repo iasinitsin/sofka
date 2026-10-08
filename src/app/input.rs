@@ -320,47 +320,12 @@ impl App {
                 }
             })
             .collect();
-        for (kind, name, binding, resources) in self
-            .plugins
-            .iter()
-            .map(|p| {
-                (
-                    "plugin",
-                    p.name.as_str(),
-                    Some(p.key.as_str()),
-                    p.scopes.as_slice(),
-                )
-            })
-            .chain(
-                self.bookmarks
-                    .iter()
-                    .map(|b| ("bookmark", b.name.as_str(), b.key.as_deref(), &[][..])),
-            )
-            .chain(
-                self.workspaces
-                    .iter()
-                    .map(|w| ("workspace", w.name.as_str(), w.key.as_deref(), &[][..])),
-            )
-        {
-            if let Some(binding) = binding
-                && let Ok(chord) = crate::keys::KeyChord::parse(binding)
-            {
-                for (scope, action, chords) in self.keymap.entries() {
-                    if scope == "table"
-                        && action != Action::Faults
-                        && action.kinds().is_none_or(|kinds| {
-                            resources.is_empty()
-                                || resources.iter().any(|s| kinds.contains(&s.as_str()))
-                        })
-                        && chords
-                            .iter()
-                            .any(|other| crate::keymap::overlaps(&chord, other))
-                    {
-                        warnings.push(format!("{kind} {name:?}: {} is hidden by keys.table.{} when that action is available", chord.label(), action.name()));
-                    }
-                }
-            }
-        }
+        warnings.extend(crate::keymap::hidden_bindings(
+            &self.keymap,
+            &self.plugins,
+            &self.bookmarks,
+            &self.workspaces,
+        ));
         warnings
     }
 
@@ -540,6 +505,8 @@ impl App {
                     self.request_refresh_es();
                 } else if self.kind_plural == "helmhistory" {
                     self.request_helm_rollback();
+                } else if self.kind_plural == crate::rollout::VIEW {
+                    self.request_rollout_undo();
                 } else {
                     self.refresh_namespace_selection();
                 }
@@ -807,7 +774,7 @@ impl App {
         self.palette_return = self.mode;
         self.mode = Mode::Command;
         self.command.clear();
-        self.ensure_namespace_cache();
+        self.spawn_namespace_fetch();
         self.update_suggestions();
     }
 
@@ -849,12 +816,14 @@ impl App {
             PaletteAction::Snapshot => self.take_snapshot(""),
             PaletteAction::Snapshots => self.open_snapshots(),
             PaletteAction::Info => self.open_info(),
+            PaletteAction::CheckUpdate => self.start_update_check(true),
             PaletteAction::Fleet => self.open_fleet(),
             PaletteAction::Rightsize => self.open_rightsize(),
             PaletteAction::PvcExplore => self.open_pvc_explore(),
             PaletteAction::PvcClean => self.request_pvc_clean(),
             PaletteAction::Find => self.flash_warn("usage: :find <text>"),
             PaletteAction::Diff => self.open_diff(),
+            PaletteAction::RolloutHistory => self.open_rollout_history(),
             PaletteAction::Events => self.switch_kind("events.events.k8s.io"),
             PaletteAction::PortForwards => self.open_port_forwards(),
             PaletteAction::ProviderLogs => self.open_provider_logs(),
@@ -1446,10 +1415,7 @@ impl App {
             }
             (Some(Action::Json), _) => {
                 self.logs.toggle_json();
-                self.flash = format!(
-                    "JSON formatting: {}",
-                    if self.logs.json { "on" } else { "off" }
-                );
+                self.flash = format!("JSON view: {}", self.logs.json.label());
                 self.flash_err = false;
                 return;
             }

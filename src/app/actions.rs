@@ -19,7 +19,7 @@ impl App {
     // ----- actions -------------------------------------------------------
 
     pub(super) fn request_delete(&mut self, force: bool) {
-        if self.deny_readonly() {
+        if self.deny_readonly() || self.deny_revision_mutation() {
             return;
         }
         // A Helm release row's underlying object is its storage Secret —
@@ -676,7 +676,7 @@ impl App {
     }
 
     pub(super) fn request_edit(&mut self) {
-        if self.deny_readonly() {
+        if self.deny_readonly() || self.deny_revision_mutation() {
             return;
         }
         let Some(obj) = self.selected_ref() else {
@@ -692,7 +692,11 @@ impl App {
     /// `kubectl edit` goes by name, so the object is read first to make sure
     /// it was not replaced under the same name while the document was open.
     pub(super) fn request_document_edit(&mut self) {
-        if !self.document_editable() || self.deny_readonly() || self.document_edit_task.is_some() {
+        if !self.document_editable()
+            || self.deny_readonly()
+            || self.deny_revision_mutation()
+            || self.document_edit_task.is_some()
+        {
             return;
         }
         let Some(source) = self.document_source.clone() else {
@@ -729,6 +733,10 @@ impl App {
         let Some(source) = self.document_source.as_ref() else {
             return;
         };
+        if matches!(source.view, refresh::RefreshView::DecodedSecret) {
+            self.edit_decoded_secret(*fresh);
+            return;
+        }
         let ar = &source.kind.ar;
         let resource = if ar.group.is_empty() {
             ar.plural.clone()
@@ -1120,7 +1128,7 @@ impl App {
     }
 
     pub(super) fn request_scale(&mut self) {
-        if self.deny_readonly() {
+        if self.deny_readonly() || self.deny_revision_mutation() {
             return;
         }
         if !self.kind.as_ref().is_some_and(|kind| kind.scalable) {
@@ -1486,6 +1494,7 @@ impl App {
             crate::config::mouse_scroll_lines(resolved.config.mouse_scroll_lines, &mut warnings);
         self.hide_header = resolved.config.hide_header;
         self.terminal_title = resolved.config.terminal_title.unwrap_or(true);
+        self.update_check = resolved.config.update_check.unwrap_or(true);
         self.plugins = resolved.config.plugins;
         self.bookmarks = resolved.config.bookmarks;
         self.workspaces = resolved.config.workspaces;
@@ -1493,7 +1502,7 @@ impl App {
         self.debug = resolved.config.debug;
         self.bundle_cfg = resolved.config.bundle;
         self.pvc_cfg = resolved.config.pvc_explore;
-        self.logs_cfg = resolved.config.logs;
+        self.apply_logs_config(resolved.config.logs);
         self.fleet_cfg = resolved.config.fleet;
         // Running forwards keep running; :reload only refreshes what's saved.
         self.forwards_cfg = resolved.config.forwards;
@@ -1505,6 +1514,7 @@ impl App {
         warnings.extend(crate::config::forward_warnings(&self.forwards_cfg));
         warnings.extend(crate::config::notify_warnings(&self.notify_cfg));
         warnings.extend(crate::config::pvc_explore_warnings(&self.pvc_cfg));
+        warnings.extend(crate::config::logs_warnings(&self.logs_cfg));
         warnings.extend(self.configure_keys(&resolved.config.keys));
         let (views, view_warnings) = crate::views::compile(&resolved.config.views);
         self.user_views = views;
@@ -1952,7 +1962,7 @@ impl App {
             return;
         }
         if !self.flux_suspendable() && !self.cronjob_kind() && !self.argocd_kind() {
-            self.flash_warn("suspend/resume only applies to CronJobs, Flux resources (ks/hr/HelmCharts/git-, helm-, oci-repos, buckets, image automation, alerts, receivers), and ArgoCD Applications/ApplicationSets");
+            self.flash_warn("suspend/resume only applies to CronJobs, Flux resources (ks/hr/HelmCharts/git-, helm-, oci-repos, buckets, image automation, alerts, receivers, ResourceSets, input providers, FluxInstances), and ArgoCD Applications/ApplicationSets");
             return;
         }
         if self.action_targets().is_empty() {
@@ -2046,10 +2056,16 @@ impl App {
         } else {
             format!("{verb_done} {} {}", targets.len(), self.kind_plural)
         };
+        let patch = if self.flux_operator_kind() {
+            let now = k8s_openapi::jiff::Timestamp::now().to_string();
+            operator_suspend_patch(suspend, &now)
+        } else {
+            suspend_patch(suspend)
+        };
         self.spawn_patch_action(
             kind,
             targets,
-            Patch::Merge(suspend_patch(suspend)),
+            Patch::Merge(patch),
             claim,
             ok_message,
             move |name, _, e| format!("{verb} {name} failed: {e}"),

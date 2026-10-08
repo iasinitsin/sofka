@@ -4,6 +4,8 @@ use super::*;
 pub(super) struct LogLineMeta {
     sort_time: Option<i128>,
     pub(super) pretty: Option<String>,
+    record: Option<String>,
+    record_severity: Option<crate::logfilter::Severity>,
     checked_json: bool,
     pub(super) json_charge: usize,
     timestamp: Option<(usize, String)>,
@@ -81,21 +83,192 @@ impl LogLineMeta {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
             return;
         };
-        // The input and parser depth limits also bound the temporary output.
-        let Ok(pretty) = serde_json::to_string_pretty(&value) else {
-            return;
-        };
         let timestamp_reserve = self
             .timestamp
             .as_ref()
             .map_or(0, |(_, timestamp)| timestamp.len());
-        let charge = pretty.len() + time_end + timestamp_reserve;
-        if charge > *budget {
-            return;
+        let mut cache = |text: String| {
+            let charge = text.len() + time_end + timestamp_reserve;
+            if charge > *budget {
+                return None;
+            }
+            *budget -= charge;
+            self.json_charge += charge;
+            Some(format!("{}{}", &line[..time_end], text))
+        };
+        // The input and parser depth limits also bound the temporary output.
+        // Each view is charged on its own, so an indented form that does not
+        // fit cannot keep a short record row raw.
+        let record = render_record(&value);
+        let record_severity = record.as_ref().and_then(|(_, severity)| *severity);
+        let record = record.and_then(|(text, _)| cache(text));
+        let pretty = serde_json::to_string_pretty(&value)
+            .ok()
+            .and_then(&mut cache);
+        self.record_severity = record_severity;
+        self.record = record;
+        self.pretty = pretty;
+    }
+
+    pub(super) fn display(&self, view: JsonView) -> Option<&str> {
+        match view {
+            JsonView::Raw => None,
+            JsonView::Record => self.record.as_deref(),
+            JsonView::Pretty => self.pretty.as_deref(),
         }
-        *budget -= charge;
-        self.json_charge += charge;
-        self.pretty = Some(format!("{}{}", &line[..time_end], pretty));
+    }
+}
+
+/// How the log view shows JSON records. `J` cycles through the variants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JsonView {
+    #[default]
+    Raw,
+    /// One row per structured log record: time, level, message, fields.
+    Record,
+    /// Indented JSON.
+    Pretty,
+}
+
+impl JsonView {
+    /// The view a `[logs] json_view` value names; `Raw` for anything else,
+    /// which `config::logs_warnings` reports.
+    pub fn from_config(name: &str) -> Self {
+        match name {
+            "record" => Self::Record,
+            "pretty" => Self::Pretty,
+            _ => Self::Raw,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Raw => Self::Record,
+            Self::Record => Self::Pretty,
+            Self::Pretty => Self::Raw,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Record => "record",
+            Self::Pretty => "pretty",
+        }
+    }
+}
+
+const RECORD_TIME_KEYS: &[&str] = &["time", "ts", "timestamp", "@timestamp"];
+const RECORD_LEVEL_KEYS: &[&str] = &["level", "lvl", "severity"];
+const RECORD_MESSAGE_KEYS: &[&str] = &["msg", "message"];
+
+/// One-line rendering of a structured log record (zap, slog, logrus, pino):
+/// `time LEVEL message key=value ...`, with the severity of its level if it
+/// has one. `None` when the value is not an object with a level or message
+/// field.
+fn render_record(
+    value: &serde_json::Value,
+) -> Option<(String, Option<crate::logfilter::Severity>)> {
+    let fields = value.as_object()?;
+    let find = |keys: &[&'static str]| {
+        keys.iter()
+            .find_map(|&key| fields.get(key).map(|value| (key, value)))
+    };
+    let level = find(RECORD_LEVEL_KEYS);
+    let message = find(RECORD_MESSAGE_KEYS);
+    if level.is_none() && message.is_none() {
+        return None;
+    }
+    let time = find(RECORD_TIME_KEYS);
+    let mut out = String::new();
+    let mut push = |part: &str| {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(part);
+    };
+    if let Some((_, time)) = time {
+        push(&record_time(time));
+    }
+    let level_name = level.map(|(_, level)| record_level(level));
+    if let Some(name) = &level_name {
+        push(&format!("{:<5}", record_text(name)));
+    }
+    if let Some((_, message)) = message {
+        match message.as_str() {
+            Some(text) => push(&record_text(text)),
+            None => push(&message.to_string()),
+        }
+    }
+    let used = [time, level, message].map(|field| field.map(|(key, _)| key));
+    for (key, value) in fields {
+        if used.contains(&Some(key.as_str())) {
+            continue;
+        }
+        push(&format!("{}={}", record_text(key), record_value(value)));
+    }
+    let severity = level_name.map(|name| crate::logfilter::parse_level(&name.to_ascii_lowercase()));
+    Some((out, severity))
+}
+
+/// Text with control characters (a multi-line stack trace, terminal escapes)
+/// as an escaped JSON string, so it stays on the record's row.
+fn record_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains(char::is_control) {
+        serde_json::Value::from(text).to_string().into()
+    } else {
+        text.into()
+    }
+}
+
+/// Epoch numbers (zap seconds, pino milliseconds) become RFC 3339; strings
+/// are kept as the application wrote them.
+fn record_time(time: &serde_json::Value) -> String {
+    let Some(number) = time.as_f64() else {
+        return time
+            .as_str()
+            .map_or_else(|| time.to_string(), |text| record_text(text).into_owned());
+    };
+    let micros = if number.abs() >= 1e11 {
+        number * 1e3
+    } else {
+        number * 1e6
+    };
+    k8s_openapi::jiff::Timestamp::from_microsecond(micros.round() as i64)
+        .map_or_else(|_| time.to_string(), |time| time.to_string())
+}
+
+/// Level names in upper case; pino's numeric levels mapped to their names.
+fn record_level(level: &serde_json::Value) -> String {
+    match level.as_u64() {
+        Some(10) => "TRACE".into(),
+        Some(20) => "DEBUG".into(),
+        Some(30) => "INFO".into(),
+        Some(40) => "WARN".into(),
+        Some(50) => "ERROR".into(),
+        Some(60) => "FATAL".into(),
+        _ => level
+            .as_str()
+            .map_or_else(|| level.to_string(), str::to_ascii_uppercase),
+    }
+}
+
+/// Bare strings stay bare. Strings that would be ambiguous in `key=value`
+/// form or read as another JSON type (`"true"`, `"3"`, `"{}"`), and every
+/// other JSON value, use compact JSON.
+fn record_value(value: &serde_json::Value) -> String {
+    match value.as_str() {
+        Some(text)
+            if !text.is_empty()
+                && !text.starts_with(['{', '['])
+                && serde_json::from_str::<serde_json::Value>(text).is_err()
+                && !text
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '=')) =>
+        {
+            text.to_owned()
+        }
+        _ => value.to_string(),
     }
 }
 
@@ -113,21 +286,41 @@ pub(super) fn display_height(line: &str, width: usize) -> usize {
 
 impl LogsView {
     pub fn display_line(&self, i: usize) -> &str {
-        if self.json
-            && let Some(pretty) = self.line_meta.get(i).and_then(|m| m.pretty.as_deref())
-        {
-            pretty
-        } else {
-            &self.view.lines[i]
+        self.line_meta
+            .get(i)
+            .and_then(|m| m.display(self.json))
+            .unwrap_or(&self.view.lines[i])
+    }
+
+    /// Severity of the record row shown for line `i`, when record view shows
+    /// one. Its level can sit under any supported key or be a pino number,
+    /// which the raw-line severity check does not read. A record without a
+    /// level keeps the raw line's severity (`"msg":"request error: …"`).
+    pub fn record_severity(&self, i: usize) -> Option<crate::logfilter::Severity> {
+        if self.json != JsonView::Record {
+            return None;
         }
+        let meta = self.line_meta.get(i)?;
+        meta.record.as_ref()?;
+        Some(
+            meta.record_severity
+                .unwrap_or_else(|| crate::logfilter::severity(&self.view.lines[i])),
+        )
     }
 
     pub(super) fn toggle_json(&mut self) {
+        self.set_json(self.json.next());
+    }
+
+    pub(super) fn set_json(&mut self, view: JsonView) {
+        if self.json == view {
+            return;
+        }
         let scroll = self.view.scroll;
         let shown = self
             .refresh_index(self.last_wrap_width)
             .first_at_row(scroll);
-        self.json = !self.json;
+        self.json = view;
         self.prepare_json();
         self.view.revision = self.view.revision.wrapping_add(1);
         let width = self.last_wrap_width;
@@ -141,7 +334,7 @@ impl LogsView {
     }
 
     pub(super) fn prepare_json(&mut self) {
-        if !self.json {
+        if self.json == JsonView::Raw {
             return;
         }
         self.line_meta
@@ -160,7 +353,7 @@ impl LogsView {
         {
             line.replace_range(*start..start + timestamp.len(), "");
         }
-        if self.json {
+        if self.json != JsonView::Raw {
             meta.format_json(&line, &mut self.json_budget);
         }
         // Equal timestamps keep their arrival order. Missing timestamps use
@@ -189,7 +382,7 @@ impl LogsView {
                 }) && self.index.start_row(shown) <= self.view.scroll
                 {
                     self.view.scroll += display_height(
-                        meta.pretty.as_deref().unwrap_or(&line),
+                        meta.display(self.json).unwrap_or(&line),
                         self.last_wrap_width,
                     );
                 }
@@ -221,11 +414,11 @@ impl LogsView {
         self.timestamps = !self.timestamps;
         for (line, meta) in self.view.lines.iter_mut().zip(&mut self.line_meta) {
             if let Some((start, timestamp)) = &meta.timestamp {
-                if let Some(pretty) = &mut meta.pretty {
+                for formatted in [&mut meta.pretty, &mut meta.record].into_iter().flatten() {
                     if self.timestamps {
-                        pretty.insert_str(*start, timestamp);
+                        formatted.insert_str(*start, timestamp);
                     } else {
-                        pretty.replace_range(*start..start + timestamp.len(), "");
+                        formatted.replace_range(*start..start + timestamp.len(), "");
                     }
                 }
                 if self.timestamps {
@@ -269,6 +462,16 @@ impl LogsView {
 }
 
 impl App {
+    /// Take a new `[logs]` config. The JSON view follows `json_view` only
+    /// when the configured value changes, at startup or on a context switch,
+    /// so `J` keeps the session's choice across views otherwise.
+    pub fn apply_logs_config(&mut self, cfg: crate::config::LogsConfig) {
+        if cfg.json_view != self.logs_cfg.json_view {
+            self.logs.set_json(JsonView::from_config(&cfg.json_view));
+        }
+        self.logs_cfg = cfg;
+    }
+
     // ----- selection -----------------------------------------------------
 
     pub(super) fn push_log_lines<I>(&mut self, lines: I)
@@ -320,6 +523,7 @@ impl App {
                 .map(|obj| PodLogTarget {
                     ns: obj.metadata.namespace.clone().unwrap_or_default(),
                     name: obj.metadata.name.clone().unwrap_or_default(),
+                    uid: obj.metadata.uid.clone(),
                     containers: container_names(obj),
                 })
                 .collect();
@@ -344,6 +548,7 @@ impl App {
                     LogSource::Pod {
                         ns,
                         name: name.clone(),
+                        uid: obj.metadata.uid.clone(),
                         containers,
                     },
                     format!("{name} — logs"),
@@ -551,16 +756,29 @@ impl App {
                 for PodLogTarget {
                     ns,
                     name,
+                    uid,
                     containers,
                 } in pods
                 {
+                    // The marked set is fixed, so a replacement is not followed.
+                    let instance = || match &uid {
+                        Some(uid) => log_follow::Instance::Only(uid.clone()),
+                        None => log_follow::Instance::Named(None),
+                    };
                     if containers.is_empty() {
                         let prefix = format!("[{ns}/{name}] ");
-                        self.spawn_one_log(ns, name, None, prefix, false);
+                        self.spawn_one_log(ns, name, instance(), None, prefix, false);
                     } else {
                         for c in containers {
                             let prefix = format!("[{ns}/{name}:{c}] ");
-                            self.spawn_one_log(ns.clone(), name.clone(), Some(c), prefix, false);
+                            self.spawn_one_log(
+                                ns.clone(),
+                                name.clone(),
+                                instance(),
+                                Some(c),
+                                prefix,
+                                false,
+                            );
                         }
                     }
                 }
@@ -568,11 +786,13 @@ impl App {
             Some(LogSource::Pod {
                 ns,
                 name,
+                uid,
                 containers,
             }) => {
                 if containers.is_empty() {
                     // Unknown container set (e.g. from xray) — stream the default.
-                    self.spawn_one_log(ns, name, None, String::new(), false);
+                    let instance = log_follow::Instance::Named(uid);
+                    self.spawn_one_log(ns, name, instance, None, String::new(), false);
                 } else {
                     let multi = containers.len() > 1;
                     for c in containers {
@@ -581,7 +801,14 @@ impl App {
                         } else {
                             String::new()
                         };
-                        self.spawn_one_log(ns.clone(), name.clone(), Some(c), prefix, false);
+                        self.spawn_one_log(
+                            ns.clone(),
+                            name.clone(),
+                            log_follow::Instance::Named(uid.clone()),
+                            Some(c),
+                            prefix,
+                            false,
+                        );
                     }
                 }
             }
@@ -591,7 +818,14 @@ impl App {
                 pod,
                 container,
                 previous,
-            }) => self.spawn_one_log(ns, pod, container, String::new(), previous),
+            }) => self.spawn_one_log(
+                ns,
+                pod,
+                log_follow::Instance::Named(None),
+                container,
+                String::new(),
+                previous,
+            ),
             Some(LogSource::Provider { request }) => self.spawn_provider_logs(request),
             None => {}
         }
@@ -674,6 +908,7 @@ impl App {
         &mut self,
         ns: String,
         pod: String,
+        instance: log_follow::Instance,
         container: Option<String>,
         prefix: String,
         previous: bool,
@@ -683,16 +918,18 @@ impl App {
         let genr = self.log_gen;
         let flag = self.log_flag.clone();
         let (tail, since) = self.log_tail_and_since();
-        let handle = tokio::spawn(async move {
-            let api: Api<Pod> = Api::namespaced(client, &ns);
-            // The API applies the tail limit within the lookback window.
-            // Previous-container logs retain their full history.
-            let (tail_lines, since_seconds) = if previous {
-                (None, None)
-            } else {
-                (Some(tail), since)
-            };
-            let lp = LogParams {
+        // The API applies the tail limit within the lookback window.
+        // Previous-container logs retain their full history.
+        let (tail_lines, since_seconds) = if previous {
+            (None, None)
+        } else {
+            (Some(tail), since)
+        };
+        let stream = log_follow::LogStream {
+            api: Api::namespaced(client, &ns),
+            pod,
+            instance,
+            params: LogParams {
                 follow: !previous,
                 previous,
                 container,
@@ -701,10 +938,14 @@ impl App {
                 tail_lines,
                 since_seconds,
                 ..Default::default()
-            };
-            forward_log_stream(api, pod, lp, prefix, tx, genr, flag).await;
-        });
-        self.log_tasks.push(handle);
+            },
+            prefix,
+            tx,
+            generation: genr,
+            flag,
+            wake: self.log_wake.subscribe(),
+        };
+        self.log_tasks.push(tokio::spawn(stream.run()));
     }
 
     /// The configured initial `tail` line count and optional `since` lookback
@@ -790,72 +1031,18 @@ impl App {
         let (tail, since) = self.log_tail_and_since();
         // Bound the per-pod tail so an aggregate over many pods stays sane; the
         // follow buffer trims the total anyway.
-        let per_pod_tail = tail.min(100);
-        let handle = tokio::spawn(async move {
-            let list_api: Api<Pod> = if ns.is_empty() {
-                Api::all(client.clone())
-            } else {
-                Api::namespaced(client.clone(), &ns)
-            };
-            let pods = match list_api.list(&ListParams::default().labels(&labels)).await {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx
-                        .send(Msg::LogLines {
-                            generation: genr,
-                            lines: vec![format!("[error] {e}")],
-                        })
-                        .await;
-                    return;
-                }
-            };
-            if pods.items.is_empty() {
-                let _ = tx
-                    .send(Msg::LogLines {
-                        generation: genr,
-                        lines: vec!["(no matching pods)".into()],
-                    })
-                    .await;
-            }
-            let mut streams = tokio::task::JoinSet::new();
-            for p in pods {
-                let pod_ns = p.metadata.namespace.clone().unwrap_or_default();
-                let pod_name = p.metadata.name.clone().unwrap_or_default();
-                let containers: Vec<String> = p
-                    .spec
-                    .as_ref()
-                    .map(|s| s.containers.iter().map(|c| c.name.clone()).collect())
-                    .unwrap_or_default();
-                let multi = containers.len() > 1;
-                for c in containers {
-                    let prefix = if multi {
-                        format!("[{pod_name}:{c}] ")
-                    } else {
-                        format!("[{pod_name}] ")
-                    };
-                    let (client, tx, flag) = (client.clone(), tx.clone(), flag.clone());
-                    let (pn, pns) = (pod_name.clone(), pod_ns.clone());
-                    streams.spawn(async move {
-                        let api: Api<Pod> = Api::namespaced(client, &pns);
-                        let lp = LogParams {
-                            follow: true,
-                            container: Some(c),
-                            timestamps: true,
-                            tail_lines: Some(per_pod_tail),
-                            since_seconds: since,
-                            ..Default::default()
-                        };
-                        forward_log_stream(api, pn, lp, prefix, tx, genr, flag).await;
-                    });
-                }
-            }
-            while streams.join_next().await.is_some() {
-                if flag.load(Ordering::SeqCst) != genr {
-                    break;
-                }
-            }
-        });
-        self.log_tasks.push(handle);
+        let follow = log_follow::SelectorLogs {
+            client,
+            ns,
+            labels,
+            tail: tail.min(100),
+            since,
+            tx,
+            generation: genr,
+            flag,
+            wake: self.log_wake.subscribe(),
+        };
+        self.log_tasks.push(tokio::spawn(follow.run()));
     }
 }
 

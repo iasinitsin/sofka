@@ -39,6 +39,8 @@ pub enum WatchFailure {
     NoResponse,
     /// The API server answered with an error, such as a forbidden resource.
     Response,
+    /// The exec auth plugin wanted terminal input, such as an MFA code.
+    NeedsInput,
 }
 
 /// Messages flowing from watch tasks to the UI loop. Tagged with a
@@ -94,11 +96,12 @@ pub enum Msg {
         /// Per-container usage keyed by `namespace/pod/container`.
         containers: HashMap<String, (i64, i64)>,
     },
-    /// Pod count per node from the pods poll on the nodes view, keyed by node
-    /// name. Counts non-terminated pods, mirroring `kubectl describe node`.
+    /// Pod count and committed requests and limits per node from the pods
+    /// poll on the nodes view, keyed by node name. Counts non-terminated pods,
+    /// mirroring `kubectl describe node`.
     NodePods {
         generation: u64,
-        counts: HashMap<String, usize>,
+        loads: HashMap<String, crate::columns::NodeLoad>,
     },
     /// CRD `additionalPrinterColumns` fallback for an API resource,
     /// fetched off-thread (`None` = CRD had nothing usable for the version).
@@ -240,6 +243,17 @@ pub enum Msg {
         lines: Vec<String>,
         warn: Option<String>,
     },
+    /// Like [`Msg::Detail`], but the lines are a unified diff and open in the
+    /// diff view.
+    Diff {
+        generation: u64,
+        /// The rollback preview request this answers; only the latest opens.
+        request: u64,
+        claim: StatusClaim,
+        title: String,
+        lines: Vec<String>,
+        warn: Option<String>,
+    },
     ResourceRefresh {
         generation: u64,
         result: Result<RefreshContent, String>,
@@ -249,6 +263,12 @@ pub enum Msg {
         generation: u64,
         request: u64,
         result: Result<Box<DynamicObject>, String>,
+    },
+    /// The patch from the decoded Secret editor finished.
+    SecretEditApplied {
+        generation: u64,
+        claim: StatusClaim,
+        result: Result<String, String>,
     },
     /// Native describe keeps the fresh object for subsequent refresh/decoded views.
     NativeDescribeReady {
@@ -315,6 +335,7 @@ pub enum Msg {
     /// Namespace list for the switcher, fetched off-thread.
     Namespaces {
         generation: u64,
+        request: u64,
         list: Vec<String>,
     },
     /// Kubeconfig context names for the switcher, fetched off-thread.
@@ -326,7 +347,7 @@ pub enum Msg {
     ContextSwitched {
         generation: u64,
         name: String,
-        result: Result<Box<crate::k8s::Cluster>, String>,
+        result: Result<Box<crate::k8s::Cluster>, crate::k8s::ConnectError>,
     },
     /// Result of re-running the exec plugin for an expiring client
     /// certificate, for renewal `attempt`.
@@ -463,6 +484,12 @@ pub enum Msg {
         /// `:can-i` denial, which is an answer rather than a watch error but
         /// still wants to read as a "no".
         err: bool,
+    },
+    /// Result of an update check. `claim` is set for `:check-update`, which
+    /// reports every outcome; the startup check only reports a newer release.
+    UpdateCheck {
+        claim: Option<StatusClaim>,
+        result: Result<crate::update::Release, String>,
     },
     /// A panic in a background task, reported by the process panic hook.
     /// Deliberately generation-free: it must surface no matter which view is

@@ -189,15 +189,16 @@ impl App {
             self.flash_warn("no resource to jump to on this line");
             return;
         };
-        if t.plural != "pods" {
-            self.flash_warn("can only jump to pods here");
+        if !matches!(t.plural.as_str(), "pods" | "jobs") {
+            self.flash_warn("can only jump to pods and jobs here");
             return;
         }
-        self.drill_to_pods(
+        self.drill_to(
+            &t.plural,
             t.namespace.unwrap_or_default(),
             None,
             Some(format!("metadata.name={}", t.name)),
-            format!("pod/{}", t.name),
+            format!("{}/{}", trim_s(&t.plural), t.name),
         );
         self.mode = Mode::Table;
     }
@@ -219,6 +220,7 @@ impl App {
                 LogSource::Pod {
                     ns: t.namespace.unwrap_or_default(),
                     name: t.name.clone(),
+                    uid: None,
                     containers: vec![],
                 },
                 format!("{} — logs", t.name),
@@ -228,29 +230,192 @@ impl App {
     }
 }
 
-/// List one kind, narrowed to a label selector (a workload's pods). A failure
-/// degrades to an empty list recorded in `warn` — a 403 must not read as "no
-/// pods" to the analysis downstream.
-pub(super) async fn list_selected(
+async fn list_with(
     client: &Client,
     ar: &ApiResource,
     namespaced: bool,
     ns: &str,
-    selector: &str,
-    warn: &mut Option<String>,
-) -> Vec<DynamicObject> {
+    params: &ListParams,
+) -> Result<Vec<DynamicObject>, String> {
     let api: Api<DynamicObject> = if namespaced && !ns.is_empty() {
         Api::namespaced_with(client.clone(), ns, ar)
     } else {
         Api::all_with(client.clone(), ar)
     };
-    match api.list(&ListParams::default().labels(selector)).await {
-        Ok(l) => l.items,
-        Err(e) => {
-            warn.get_or_insert(format!("listing {}: {e}", ar.plural));
-            Vec::new()
+    api.list(params)
+        .await
+        .map(|l| l.items)
+        .map_err(|e| format!("listing {}: {e}", ar.plural))
+}
+
+/// What [`crate::explain`] reads besides the object itself.
+pub(super) struct Gathered {
+    pub(super) pods: Vec<DynamicObject>,
+    pub(super) pods_listed: bool,
+    pub(super) related: Vec<DynamicObject>,
+    pub(super) related_listed: bool,
+    pub(super) storage_classes: Option<Vec<DynamicObject>>,
+    pub(super) events: Vec<DynamicObject>,
+    pub(super) events_v1: bool,
+}
+
+impl Gathered {
+    pub(super) fn evidence<'a>(
+        &'a self,
+        kind: &'a str,
+        plural: &'a str,
+        obj: &'a DynamicObject,
+    ) -> crate::explain::Evidence<'a> {
+        crate::explain::Evidence {
+            kind,
+            plural,
+            obj,
+            pods: &self.pods,
+            pods_listed: self.pods_listed,
+            related: &self.related,
+            related_listed: self.related_listed,
+            storage_classes: self.storage_classes.as_deref(),
+            events: &self.events,
+            events_v1: self.events_v1,
         }
     }
+}
+
+/// Collect the evidence for one object: the pods it owns, runs, or serves,
+/// the Jobs of a CronJob, the StorageClasses a claim may use, and the events
+/// regarding all of them. Failures degrade to a warning in `warn` and are
+/// marked as unlisted, so the analysis never reads them as empty.
+pub(super) async fn gather_evidence(
+    client: &Client,
+    plural: &str,
+    obj: &DynamicObject,
+    pods_kind: Option<(&ApiResource, bool)>,
+    events_kind: Option<(&ApiResource, bool)>,
+    warn: &mut Option<String>,
+) -> Gathered {
+    let ns = obj.metadata.namespace.as_deref().unwrap_or_default();
+    let name = obj.metadata.name.as_deref().unwrap_or_default();
+    let mut related = Ok(Vec::new());
+    // Many users may not list cluster-scoped StorageClasses. The analysis
+    // then says the class is unknown rather than missing.
+    let storage_classes = if plural == "persistentvolumeclaims" {
+        let classes = ApiResource::erase::<k8s_openapi::api::storage::v1::StorageClass>(&());
+        list_with(client, &classes, false, "", &ListParams::default())
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let labels = |selector: &str| ListParams::default().labels(selector);
+    let pods: Result<Vec<DynamicObject>, String> = match (plural, pods_kind) {
+        ("pods", _) => Ok(vec![obj.clone()]),
+        ("deployments" | "statefulsets" | "daemonsets" | "replicasets", Some((ar, nsd))) => {
+            match label_selector(obj, "matchLabels") {
+                Some(selector) => list_with(client, ar, nsd, ns, &labels(&selector)).await,
+                None => Ok(Vec::new()),
+            }
+        }
+        // A Job's selector can be set by hand and match other pods, so keep
+        // only the pods the Job created.
+        ("jobs", Some((ar, nsd))) => match label_selector(obj, "matchLabels") {
+            Some(selector) => list_with(client, ar, nsd, ns, &labels(&selector))
+                .await
+                .map(|pods| owned_by(pods, obj)),
+            None => Ok(Vec::new()),
+        },
+        ("nodes", Some((ar, nsd))) => {
+            let params = ListParams::default().fields(&format!("spec.nodeName={name}"));
+            list_with(client, ar, nsd, "", &params).await
+        }
+        ("persistentvolumeclaims", Some((ar, nsd))) => {
+            list_with(client, ar, nsd, ns, &ListParams::default())
+                .await
+                .map(|pods| pods.into_iter().filter(|p| mounts_claim(p, name)).collect())
+        }
+        ("cronjobs", pods_kind) => {
+            let jobs = ApiResource::erase::<k8s_openapi::api::batch::v1::Job>(&());
+            related = list_with(client, &jobs, true, ns, &ListParams::default())
+                .await
+                .map(|jobs| owned_by(jobs, obj));
+            let latest = related.as_ref().ok().and_then(|jobs| {
+                jobs.iter()
+                    .max_by_key(|j| j.metadata.creation_timestamp.as_ref().map(|t| t.0))
+            });
+            match (pods_kind, latest) {
+                (Some((ar, nsd)), Some(job)) => match label_selector(job, "matchLabels") {
+                    Some(selector) => list_with(client, ar, nsd, ns, &labels(&selector))
+                        .await
+                        .map(|pods| owned_by(pods, job)),
+                    None => Ok(Vec::new()),
+                },
+                _ => Ok(Vec::new()),
+            }
+        }
+        _ => Ok(Vec::new()),
+    };
+    let mut unwrap = |listed: Result<Vec<DynamicObject>, String>| match listed {
+        Ok(items) => (items, true),
+        Err(e) => {
+            warn.get_or_insert(e);
+            (Vec::new(), false)
+        }
+    };
+    let (pods, mut pods_listed) = unwrap(pods);
+    // Without a pods kind in discovery nothing was listed, so the empty set
+    // says nothing about which pods exist.
+    if pods_kind.is_none() && plural != "pods" {
+        pods_listed = false;
+    }
+    let (related, related_listed) = unwrap(related);
+    let (events, events_v1) = match events_kind {
+        Some((ar, nsd)) => {
+            let v1 = ar.group == "events.k8s.io";
+            let all = list_or_warn(client, ar, nsd, ns, warn).await;
+            let regarding: Vec<DynamicObject> = pods.iter().chain(&related).cloned().collect();
+            (filter_events(&all, obj, &regarding, v1), v1)
+        }
+        None => (Vec::new(), false),
+    };
+    Gathered {
+        pods,
+        pods_listed,
+        related,
+        related_listed,
+        storage_classes,
+        events,
+        events_v1,
+    }
+}
+
+/// The objects `owner` owns.
+fn owned_by(objects: Vec<DynamicObject>, owner: &DynamicObject) -> Vec<DynamicObject> {
+    let Some(uid) = owner.metadata.uid.as_deref() else {
+        return objects;
+    };
+    objects
+        .into_iter()
+        .filter(|o| {
+            o.metadata
+                .owner_references
+                .iter()
+                .flatten()
+                .any(|r| r.uid == uid)
+        })
+        .collect()
+}
+
+/// Whether `pod` mounts the PersistentVolumeClaim `claim`.
+fn mounts_claim(pod: &DynamicObject, claim: &str) -> bool {
+    pod.data
+        .pointer("/spec/volumes")
+        .and_then(Value::as_array)
+        .is_some_and(|volumes| {
+            volumes.iter().any(|v| {
+                v.pointer("/persistentVolumeClaim/claimName")
+                    .and_then(Value::as_str)
+                    == Some(claim)
+            })
+        })
 }
 
 /// Keep only events that regard the object or one of its pods, matching by UID
@@ -267,13 +432,15 @@ pub(super) fn filter_events(
         "involvedObject"
     };
     let mut uids: HashSet<&str> = HashSet::new();
-    let mut names: HashSet<&str> = HashSet::new();
+    // Without a UID an event is matched by namespace and name, so a pod of the
+    // same name in another namespace does not count.
+    let mut names: HashSet<(&str, &str)> = HashSet::new();
     for o in std::iter::once(obj).chain(pods.iter()) {
         if let Some(u) = o.metadata.uid.as_deref() {
             uids.insert(u);
         }
         if let Some(n) = o.metadata.name.as_deref() {
-            names.insert(n);
+            names.insert((o.metadata.namespace.as_deref().unwrap_or_default(), n));
         }
     }
     all.iter()
@@ -281,9 +448,13 @@ pub(super) fn filter_events(
             let inv = e.data.get(field);
             let uid = inv.and_then(|o| o.get("uid")).and_then(|v| v.as_str());
             let name = inv.and_then(|o| o.get("name")).and_then(|v| v.as_str());
+            let namespace = inv
+                .and_then(|o| o.get("namespace"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             match uid {
                 Some(u) => uids.contains(u),
-                None => name.is_some_and(|n| names.contains(n)),
+                None => name.is_some_and(|n| names.contains(&(namespace, n))),
             }
         })
         .cloned()
@@ -296,45 +467,17 @@ pub(super) async fn gather_explain(
     events_kind: Option<&Kind>,
 ) -> Result<(DynamicObject, Vec<crate::explain::Finding>, Option<String>), String> {
     let obj = source.read().await?;
-    let client = &source.client;
-    let ns = obj.metadata.namespace.as_deref().unwrap_or_default();
     let plural = source.kind.ar.plural.as_str();
-    let selector = match plural {
-        "deployments" | "statefulsets" | "daemonsets" | "replicasets" => {
-            label_selector(&obj, "matchLabels")
-        }
-        _ => None,
-    };
     let mut warning = None;
-    let pods = if plural == "pods" {
-        vec![obj.clone()]
-    } else if let (Some(kind), Some(selector)) = (pods_kind, selector.as_ref()) {
-        list_selected(
-            client,
-            &kind.ar,
-            kind.namespaced,
-            ns,
-            selector,
-            &mut warning,
-        )
-        .await
-    } else {
-        Vec::new()
-    };
-    let (events, events_v1) = if let Some(kind) = events_kind {
-        let v1 = kind.ar.group == "events.k8s.io";
-        let all = list_or_warn(client, &kind.ar, kind.namespaced, ns, &mut warning).await;
-        (filter_events(&all, &obj, &pods, v1), v1)
-    } else {
-        (Vec::new(), false)
-    };
-    let findings = crate::explain::explain(&crate::explain::Evidence {
-        kind: &source.kind.ar.kind,
+    let gathered = gather_evidence(
+        &source.client,
         plural,
-        obj: &obj,
-        pods: &pods,
-        events: &events,
-        events_v1,
-    });
+        &obj,
+        pods_kind.map(|k| (&k.ar, k.namespaced)),
+        events_kind.map(|k| (&k.ar, k.namespaced)),
+        &mut warning,
+    )
+    .await;
+    let findings = crate::explain::explain(&gathered.evidence(&source.kind.ar.kind, plural, &obj));
     Ok((obj, findings, warning))
 }

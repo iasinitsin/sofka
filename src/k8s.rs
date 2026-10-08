@@ -78,17 +78,21 @@ pub(crate) fn build_exec_client(
         .auth_info
         .token
         .filter(|token| !token.expose_secret().is_empty());
+    let mut command = String::new();
     if let Some(exec) = &mut config.auth_info.exec {
         // Authentication commands must not read from or write to the TUI terminal.
         exec.interactive_mode = Some(kube::config::ExecInteractiveMode::Never);
+        command = exec_command_line(exec);
+        detach_exec(exec);
     }
     let (builder, certificate) = crate::legacy_tls::client_builder_with_certificate(
         config,
         allow_v1_client_cert,
         no_tls_resumption,
     )
-    .map_err(|error| match exec_auth_message(error.as_ref()) {
-        Some(message) => anyhow::anyhow!(message),
+    .map_err(|error| match exec_auth_failure(error.as_ref(), &command) {
+        Some(ExecAuthFailure::NeedsInput(needs)) => anyhow::Error::new(needs),
+        Some(ExecAuthFailure::Message(message)) => anyhow::anyhow!(message),
         None => error,
     })?;
     let layer =
@@ -106,12 +110,14 @@ pub(crate) fn build_exec_client(
             }
             request
         });
-    let auth_errors = tower::util::MapErrLayer::new(|error: tower::BoxError| -> tower::BoxError {
-        match exec_auth_message(error.as_ref()) {
-            Some(message) => std::io::Error::other(message).into(),
-            None => error,
-        }
-    });
+    let auth_errors =
+        tower::util::MapErrLayer::new(move |error: tower::BoxError| -> tower::BoxError {
+            match exec_auth_failure(error.as_ref(), &command) {
+                Some(ExecAuthFailure::NeedsInput(needs)) => std::io::Error::other(needs).into(),
+                Some(ExecAuthFailure::Message(message)) => std::io::Error::other(message).into(),
+                None => error,
+            }
+        });
     let client = builder
         .with_layer(&layer)
         .with_layer(&auth_errors)
@@ -123,19 +129,72 @@ pub(crate) fn build_exec_client(
     })
 }
 
-fn exec_auth_message(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+/// An exec auth plugin stopped because it wanted terminal input, such as an
+/// MFA code. sofka runs plugins without a terminal, so the user has to run the
+/// command themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecNeedsInput {
+    /// The plugin command line as the kubeconfig spells it.
+    pub command: String,
+    mfa: bool,
+}
+
+impl std::fmt::Display for ExecNeedsInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.mfa {
+            write!(
+                f,
+                "MFA code required. Run this in a shell, enter the code, then retry: {}",
+                self.command
+            )
+        } else {
+            write!(
+                f,
+                "Authentication command needs terminal input. Run this in a shell, then retry: {}",
+                self.command
+            )
+        }
+    }
+}
+
+impl std::error::Error for ExecNeedsInput {}
+
+enum ExecAuthFailure {
+    NeedsInput(ExecNeedsInput),
+    Message(String),
+}
+
+fn exec_auth_failure(
+    error: &(dyn std::error::Error + 'static),
+    command: &str,
+) -> Option<ExecAuthFailure> {
+    if let Some(needs) = exec_needs_input(error) {
+        return Some(ExecAuthFailure::NeedsInput(needs.clone()));
+    }
     let mut source = Some(error);
     while let Some(error) = source {
         if let Some(kube::client::AuthError::AuthExecRun { out, .. }) =
             error.downcast_ref::<kube::client::AuthError>()
         {
             let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            // The prompt itself, not any mention of MFA: a rejected code or a
+            // bad mfa_serial also says "MFA" but asks for nothing.
+            let mfa = stderr.contains("enter mfa code");
             return Some(if stderr.contains("sso") {
-                "Authentication failed. Run 'aws sso login' for the active AWS profile, then retry."
-                    .into()
+                ExecAuthFailure::Message(
+                    "Authentication failed. Run 'aws sso login' for the active AWS profile, then retry."
+                        .into(),
+                )
+            } else if mfa || stderr.contains("/dev/tty") {
+                ExecAuthFailure::NeedsInput(ExecNeedsInput {
+                    command: command.to_string(),
+                    mfa,
+                })
             } else {
-                "Authentication command failed. Log in with your credential provider, then retry."
-                    .into()
+                ExecAuthFailure::Message(
+                    "Authentication command failed. Log in with your credential provider, then retry."
+                        .into(),
+                )
             });
         }
         source = error.source();
@@ -143,9 +202,244 @@ fn exec_auth_message(error: &(dyn std::error::Error + 'static)) -> Option<String
     None
 }
 
+/// The plugin that needs terminal input somewhere in `error`'s source chain.
+/// Also looks inside `io::Error`s, whose `source` skips the error they wrap.
+pub fn exec_needs_input<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a ExecNeedsInput> {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        let inner = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static));
+        if let Some(needs) = [Some(error), inner]
+            .into_iter()
+            .flatten()
+            .find_map(|error| error.downcast_ref::<ExecNeedsInput>())
+        {
+            return Some(needs);
+        }
+        source = error.source();
+    }
+    None
+}
+
+/// The exec plugin's command line, for telling the user what to run. The
+/// kubeconfig's `env` entries come first as assignments, since they can pick
+/// the profile the command runs with. This text ends up on screen and in the
+/// log, so the word after a credential-named flag is always redacted (it may
+/// look like a flag), as are credential-named variables, and every other word
+/// goes through [`crate::redact::credentials`] for URL passwords and inline
+/// tokens before it is quoted, so the line stays runnable.
+fn exec_command_line(exec: &kube::config::ExecConfig) -> String {
+    let redacted = crate::redact::REDACTED;
+    let mut words = Vec::new();
+    for var in exec.env.iter().flatten() {
+        if let (Some(name), Some(value)) = (var.get("name"), var.get("value")) {
+            words.push(if crate::redact::is_credential_key(name) {
+                format!("{name}={redacted}")
+            } else {
+                format!("{name}={}", shell_word(&crate::redact::credentials(value)))
+            });
+        }
+    }
+    words.extend(
+        exec.command
+            .as_deref()
+            .map(|command| shell_word(&crate::redact::credentials(command))),
+    );
+    let mut secret_next = false;
+    for arg in exec.args.iter().flatten() {
+        if std::mem::take(&mut secret_next) {
+            words.push(redacted.into());
+        } else if !arg.starts_with('-') || !crate::redact::is_credential_key(arg) {
+            words.push(shell_word(&crate::redact::credentials(arg)));
+        } else if let Some((flag, _)) = arg.split_once('=') {
+            words.push(format!("{}={redacted}", shell_word(flag)));
+        } else {
+            words.push(shell_word(arg));
+            secret_next = true;
+        }
+    }
+    words.join(" ")
+}
+
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+%".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(unix)]
+static EXEC_WRAPPER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The argument that makes sofka run the rest of its arguments as a detached
+/// exec auth plugin. See [`run_detached`].
+pub const EXEC_DETACHED_ARG: &str = "--exec-detached";
+
+/// Route exec auth plugins through `exe` so they run without a controlling
+/// terminal. Call once at startup with the sofka binary.
+pub fn detach_exec_plugins(exe: std::path::PathBuf) {
+    #[cfg(unix)]
+    let _ = EXEC_WRAPPER.set(exe);
+    #[cfg(not(unix))]
+    let _ = exe;
+}
+
+/// Run the plugin through the sofka binary, which drops the controlling
+/// terminal first. kube-rs runs the plugin with stdin closed, but a plugin can
+/// still open /dev/tty for a prompt (the AWS CLI does for MFA codes). That
+/// prompt lands under the TUI and its read never finishes. Without a
+/// controlling terminal the open fails and the plugin exits with an error.
+fn detach_exec(exec: &mut kube::config::ExecConfig) {
+    #[cfg(unix)]
+    if let Some(wrapper) = EXEC_WRAPPER.get()
+        && let Some(command) = exec.command.take()
+    {
+        let mut args = vec![EXEC_DETACHED_ARG.to_string(), "--".into(), command];
+        args.extend(exec.args.take().unwrap_or_default());
+        exec.command = Some(wrapper.to_string_lossy().into_owned());
+        exec.args = Some(args);
+    }
+    #[cfg(not(unix))]
+    let _ = exec;
+}
+
+/// Run `argv` in a new session with no controlling terminal, replacing this
+/// process. Only returns if the command cannot be started.
+#[cfg(unix)]
+pub fn run_detached(argv: &[std::ffi::OsString]) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+
+    let Some((command, args)) = argv.split_first() else {
+        return std::io::Error::other("no exec plugin command");
+    };
+    // SAFETY: setsid has no preconditions; it fails only when this process
+    // already leads a process group, which leaves the terminal attached.
+    if unsafe { libc::setsid() } == -1 {
+        return std::io::Error::last_os_error();
+    }
+    std::process::Command::new(command).args(args).exec()
+}
+
+/// Why a connection could not be made, as the UI needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectError {
+    pub message: String,
+    /// The exec auth plugin wanted terminal input; see [`ExecNeedsInput`].
+    pub needs_input: bool,
+}
+
+impl From<&anyhow::Error> for ConnectError {
+    fn from(error: &anyhow::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            needs_input: exec_needs_input(error.as_ref()).is_some(),
+        }
+    }
+}
+
+impl From<String> for ConnectError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            needs_input: false,
+        }
+    }
+}
+
+impl From<&str> for ConnectError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Run the exec auth plugin of `context` (the current context when `None`)
+/// attached to the terminal, so it can prompt for an MFA code or a login.
+/// Its credential output goes to /dev/null: the plugin is expected to cache what
+/// it obtained, as the AWS CLI does for assumed roles, so the next detached
+/// run succeeds without input. Call only while sofka is not drawing.
+pub async fn authenticate_interactively(context: Option<&str>) -> Result<()> {
+    let kubeconfig = Kubeconfig::read().context("reading kubeconfig")?;
+    let options = KubeConfigOptions {
+        context: context.map(str::to_string),
+        cluster: None,
+        user: None,
+    };
+    let config = kubeconfig::from_custom(kubeconfig, &options)
+        .await
+        .context("building config")?;
+    let exec = config
+        .auth_info
+        .exec
+        .context("the context does not use an exec auth plugin")?;
+    run_exec_interactively(&exec).await
+}
+
+async fn run_exec_interactively(exec: &kube::config::ExecConfig) -> Result<()> {
+    if exec.interactive_mode == Some(kube::config::ExecInteractiveMode::Never) {
+        anyhow::bail!("the kubeconfig sets interactiveMode: Never for this exec plugin");
+    }
+    let command = exec
+        .command
+        .as_deref()
+        .context("the exec auth plugin has no command")?;
+    let mut spec = serde_json::json!({ "interactive": true });
+    if exec.provide_cluster_info
+        && let Some(cluster) = &exec.cluster
+    {
+        spec["cluster"] = serde_json::to_value(cluster)?;
+    }
+    let info = serde_json::json!({
+        "apiVersion": exec.api_version,
+        "kind": "ExecCredential",
+        "spec": spec,
+    });
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(exec.args.iter().flatten())
+        .envs(
+            exec.env
+                .iter()
+                .flatten()
+                .filter_map(|var| Some((var.get("name")?, var.get("value")?))),
+        )
+        .env("KUBERNETES_EXEC_INFO", info.to_string())
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+    for name in exec.drop_env.iter().flatten() {
+        cmd.env_remove(name);
+    }
+    let status = cmd
+        .status()
+        .await
+        .with_context(|| format!("running {command}"))?;
+    if !status.success() {
+        anyhow::bail!("{} exited with {status}", exec_command_line(exec));
+    }
+    Ok(())
+}
+
 /// What a failed watch request ran into, judged from the error's source
 /// chain rather than its text.
 fn watch_failure(error: &watcher::Error) -> WatchFailure {
+    if exec_needs_input(error).is_some() {
+        return WatchFailure::NeedsInput;
+    }
     if credentials_refused(error) {
         return WatchFailure::CredentialsRefused;
     }
@@ -1894,27 +2188,169 @@ pub(crate) mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn watch_auth_failure_has_a_login_hint() {
+    fn exec_run_failure(stderr: &str) -> kube::runtime::watcher::Error {
         use std::os::unix::process::ExitStatusExt;
 
-        let error = kube::runtime::watcher::Error::WatchStartFailed(kube::Error::Auth(
+        kube::runtime::watcher::Error::WatchStartFailed(kube::Error::Auth(
             kube::client::AuthError::AuthExecRun {
                 cmd: "aws".into(),
                 status: std::process::ExitStatus::from_raw(256),
                 out: std::process::Output {
                     status: std::process::ExitStatus::from_raw(256),
                     stdout: vec![],
-                    stderr: b"Error loading SSO Token: Token has expired".to_vec(),
+                    stderr: stderr.as_bytes().to_vec(),
                 },
             },
-        ));
-        assert!(
-            super::exec_auth_message(&error)
-                .unwrap()
-                .contains("aws sso login")
+        ))
+    }
+
+    fn exec_auth_message(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+        super::exec_auth_failure(error, "aws eks get-token --profile 'mfa role'").map(|failure| {
+            match failure {
+                super::ExecAuthFailure::NeedsInput(needs) => needs.to_string(),
+                super::ExecAuthFailure::Message(message) => message,
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_auth_failure_has_a_login_hint() {
+        let error = exec_run_failure("Error loading SSO Token: Token has expired");
+        assert!(exec_auth_message(&error).unwrap().contains("aws sso login"));
+        assert!(exec_auth_message(&std::io::Error::other("connection refused")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mfa_prompt_failure_names_the_command_to_run() {
+        let error = exec_run_failure(
+            "Warning: Password input may be echoed.\nEnter MFA code for arn:aws:iam::1:mfa/me: \nEOF when reading a line",
         );
-        assert!(super::exec_auth_message(&std::io::Error::other("connection refused")).is_none());
+        assert_eq!(
+            exec_auth_message(&error).unwrap(),
+            "MFA code required. Run this in a shell, enter the code, then retry: aws eks get-token --profile 'mfa role'"
+        );
+        let error = exec_run_failure("sh: /dev/tty: Device not configured");
+        assert_eq!(
+            exec_auth_message(&error).unwrap(),
+            "Authentication command needs terminal input. Run this in a shell, then retry: aws eks get-token --profile 'mfa role'"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn needs_input_survives_the_io_error_the_client_layer_wraps_it_in() {
+        let needs = super::ExecNeedsInput {
+            command: "aws eks get-token".into(),
+            mfa: true,
+        };
+        let wrapped = kube::Error::Service(std::io::Error::other(needs.clone()).into());
+        assert_eq!(super::exec_needs_input(&wrapped), Some(&needs));
+        let error = anyhow::Error::new(needs.clone()).context("connecting");
+        assert_eq!(super::exec_needs_input(error.as_ref()), Some(&needs));
+        assert!(super::exec_needs_input(&std::io::Error::other("refused")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_interactive_run_tells_the_plugin_it_may_prompt() {
+        let out = std::env::temp_dir().join(format!("sofka-exec-info-{}", std::process::id()));
+        let exec = |mode: Option<&str>, status: u8| -> kube::config::ExecConfig {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "client.authentication.k8s.io/v1beta1",
+                "command": "sh",
+                "args": ["-c", format!("printf '%s' \"$KUBERNETES_EXEC_INFO $PROFILE\" > \"$OUT\"; exit {status}")],
+                "env": [
+                    {"name": "OUT", "value": out.to_str().unwrap()},
+                    {"name": "PROFILE", "value": "mfa"}
+                ],
+                "interactiveMode": mode
+            }))
+            .unwrap()
+        };
+
+        super::run_exec_interactively(&exec(None, 0)).await.unwrap();
+        let info = std::fs::read_to_string(&out).unwrap();
+        assert!(info.contains(r#""interactive":true"#), "{info}");
+        assert!(
+            info.contains(r#""apiVersion":"client.authentication.k8s.io/v1beta1""#),
+            "{info}"
+        );
+        assert!(info.ends_with(" mfa"), "{info}");
+
+        let error = super::run_exec_interactively(&exec(Some("IfAvailable"), 3))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("OUT="), "{error}");
+        assert!(error.to_string().contains("exit status: 3"), "{error}");
+
+        std::fs::remove_file(&out).unwrap();
+        let error = super::run_exec_interactively(&exec(Some("Never"), 0))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("interactiveMode: Never"),
+            "{error}"
+        );
+        assert!(!out.exists(), "a Never plugin must not run");
+    }
+
+    #[test]
+    fn exec_command_line_quotes_only_words_that_need_it() {
+        let exec: kube::config::ExecConfig = serde_json::from_value(serde_json::json!({
+            "command": "aws",
+            "args": ["eks", "get-token", "--cluster-name", "prod", "--profile", "it's mine", ""]
+        }))
+        .unwrap();
+        assert_eq!(
+            super::exec_command_line(&exec),
+            "aws eks get-token --cluster-name prod --profile 'it'\\''s mine' ''"
+        );
+    }
+
+    #[test]
+    fn exec_command_line_keeps_the_profile_env_and_hides_credentials() {
+        let exec: kube::config::ExecConfig = serde_json::from_value(serde_json::json!({
+            "command": "kubelogin",
+            "args": [
+                "get-token", "--client-secret", "s3cr3t", "--password=hunter2",
+                "--token", "-dashed", "--server-id", "x", "--login=https://me:pw1@idp"
+            ],
+            "env": [
+                {"name": "AWS_PROFILE", "value": "prod admin"},
+                {"name": "AWS_SECRET_ACCESS_KEY", "value": "abc123"},
+                {"name": "HTTPS_PROXY", "value": "http://user:pw2@10.0.0.5:3128"},
+                {"name": "NOTE", "value": "basic admin"}
+            ]
+        }))
+        .unwrap();
+        let line = super::exec_command_line(&exec);
+        assert_eq!(
+            line,
+            "AWS_PROFILE='prod admin' AWS_SECRET_ACCESS_KEY=«redacted» \
+             HTTPS_PROXY='http://«redacted»@10.0.0.5:3128' NOTE='basic «redacted»' \
+             kubelogin get-token --client-secret «redacted» --password=«redacted» --token «redacted» \
+             --server-id x '--login=https://«redacted»@idp'"
+        );
+        for secret in ["s3cr3t", "hunter2", "abc123", "-dashed", "pw1", "pw2"] {
+            assert!(!line.contains(secret), "{line}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mfa_errors_that_asked_for_nothing_are_not_input_requests() {
+        for stderr in [
+            "An error occurred (AccessDenied) when calling the AssumeRole operation: MultiFactorAuthentication failed with invalid MFA one time pass code.",
+            "The mfa_serial in profile prod is not a valid ARN",
+        ] {
+            assert_eq!(
+                exec_auth_message(&exec_run_failure(stderr)).unwrap(),
+                "Authentication command failed. Log in with your credential provider, then retry.",
+                "{stderr}"
+            );
+        }
     }
 
     use super::*;
@@ -2544,6 +2980,7 @@ clusters:
         pub core_ignores_negotiation: bool,
         pub empty_aggregated_groups: bool,
         pub empty_aggregated_core: bool,
+        pub null_verbs: bool,
     }
 
     pub(crate) async fn mock_apiserver_opts(opts: MockOptions) -> String {
@@ -2579,6 +3016,9 @@ clusters:
             let mixed_legacy = r#",{"name":"mixed.example.com","versions":[{"groupVersion":"mixed.example.com/v1","version":"v1"},{"groupVersion":"mixed.example.com/v1alpha1","version":"v1alpha1"}],"preferredVersion":{"groupVersion":"mixed.example.com/v1","version":"v1"}}"#;
             let capi_legacy = r#",{"name":"cluster.x-k8s.io","versions":[{"groupVersion":"cluster.x-k8s.io/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"cluster.x-k8s.io/v1beta1","version":"v1beta1"}}"#;
             let capi_v2 = r#",{"metadata":{"name":"cluster.x-k8s.io"},"versions":[{"version":"v1beta1","freshness":"Current","resources":[{"resource":"machinedeployments","responseKind":{"kind":"MachineDeployment"},"scope":"Namespaced","shortNames":["md","cross"],"verbs":["get","list","watch"]},{"resource":"machinedrainrules","responseKind":{"kind":"MachineDrainRule"},"scope":"Namespaced","verbs":["get","list","watch"]}]}]}"#;
+            // Modeled on KubeVirt: subresources.kubevirt.io sends null verbs and
+            // lists the parent resource that kubevirt.io actually serves.
+            let null_verbs_v2 = r#",{"metadata":{"name":"kubevirt.io"},"versions":[{"version":"v1","resources":[{"resource":"virtualmachineinstances","responseKind":{"group":"kubevirt.io","version":"v1","kind":"VirtualMachineInstance"},"scope":"Namespaced","singularResource":"virtualmachineinstance","shortNames":["vmi"],"verbs":["get","list","watch"]}],"freshness":"Current"}]},{"metadata":{"name":"subresources.kubevirt.io"},"versions":[{"version":"v1","resources":[{"resource":"virtualmachineinstances","responseKind":{"group":"","version":"","kind":""},"scope":"Namespaced","singularResource":"","verbs":null,"subresources":[{"subresource":"console","responseKind":{"group":"","version":"","kind":""},"verbs":null}]}],"freshness":"Current"}]}"#;
             match (path, aggregated) {
                 ("/apis", true) if opts.groups_ignore_negotiation => route(path, false, opts),
                 ("/api", true) if opts.core_ignores_negotiation => route(path, false, opts),
@@ -2605,8 +3045,9 @@ clusters:
                 ("/apis", true) => (
                     "200 OK",
                     format!(
-                        r#"{{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{{}},"items":[{{"metadata":{{"name":"apps"}},"versions":[{{"version":"v1","resources":[{{"resource":"deployments","responseKind":{{"group":"apps","version":"v1","kind":"Deployment"}},"scope":"Namespaced","singularResource":"deployment","verbs":["get","list","watch"]}}],"freshness":"Current"}}]}}{mixed_v2}{capi_v2}{}]}}"#,
-                        if include_broken { broken_v2 } else { "" }
+                        r#"{{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{{}},"items":[{{"metadata":{{"name":"apps"}},"versions":[{{"version":"v1","resources":[{{"resource":"deployments","responseKind":{{"group":"apps","version":"v1","kind":"Deployment"}},"scope":"Namespaced","singularResource":"deployment","verbs":["get","list","watch"]}}],"freshness":"Current"}}]}}{mixed_v2}{capi_v2}{}{}]}}"#,
+                        if include_broken { broken_v2 } else { "" },
+                        if opts.null_verbs { null_verbs_v2 } else { "" }
                     ),
                 ),
                 ("/api", true) => (
@@ -2918,6 +3359,38 @@ clusters:
         let text = format!("{err:#}");
         assert!(text.contains("reading core API group v1"), "{text}");
         assert!(text.contains("expected v1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn aggregated_discovery_tolerates_null_verbs() {
+        let (url, requests) = mock_apiserver_with_requests(MockOptions {
+            supports_aggregated: true,
+            serve_version: true,
+            null_verbs: true,
+            ..MockOptions::default()
+        })
+        .await;
+        let cluster = connect_mock(url).await.expect("connect aggregated");
+        assert!(cluster.discovery_fallback.is_none());
+        assert!(cluster.discovery_warnings.is_empty());
+        assert!(cluster.resolve("deployments").is_some());
+        let vmi = cluster
+            .resolve("virtualmachineinstances")
+            .expect("the listable group owns the bare name");
+        assert_eq!(vmi.ar.group, "kubevirt.io");
+        assert!(
+            cluster
+                .resolve("virtualmachineinstances.subresources.kubevirt.io")
+                .is_none()
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == "/apis/apps/v1"),
+            "aggregated discovery must not fall back to the per-group walk"
+        );
     }
 
     #[tokio::test]

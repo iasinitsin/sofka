@@ -61,6 +61,8 @@ impl App {
             // Helm: release -> every revision, revision -> its values.
             "helm" => self.drill_into_helm_history(&obj),
             "helmhistory" => self.open_helm_values(&obj),
+            // Rollout history: revision -> what rolling back to it changes.
+            crate::rollout::VIEW => self.open_rollout_diff(&obj),
             // A Flux HelmRelease bridges into the same native inspector:
             // enter opens the history of the Helm release it manages.
             "helmreleases" => self.drill_into_helmrelease(&obj),
@@ -71,6 +73,13 @@ impl App {
                 if self.argocd_kind() && self.configured_drill().is_none() =>
             {
                 self.show_argocd(obj)
+            }
+            // flux-operator: what the object applied and what feeds it, in
+            // the GitOps view. A configured drill still wins.
+            "resourcesets" | "fluxinstances"
+                if self.flux_operator_kind() && self.configured_drill().is_none() =>
+            {
+                self.open_gitops()
             }
             // Everything else is configuration: a `[views."…"].drill` opens
             // another kind scoped to this row; failing that, anything that

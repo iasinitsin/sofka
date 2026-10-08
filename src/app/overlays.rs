@@ -121,6 +121,12 @@ impl App {
                 self.pending = Some(Suspend::Shell(argv));
                 self.reload_after_suspend = self.confirm_over_document();
             }
+            ConfirmAction::SecretEdit {
+                kind,
+                name,
+                ns,
+                patch,
+            } => self.apply_secret_edit(kind, name, ns, patch),
             ConfirmAction::Exec { ns, name } => {
                 self.exec_into(ns, name, None);
             }
@@ -144,6 +150,16 @@ impl App {
             }
             ConfirmAction::HelmRollback { ns, name, revision } => {
                 self.do_helm_rollback(ns, name, revision);
+            }
+            ConfirmAction::RolloutUndo {
+                kind,
+                workload,
+                name,
+                uid,
+                revision,
+                rev,
+            } => {
+                self.do_rollout_undo(kind, workload, name, uid, revision, *rev);
             }
             ConfirmAction::ArgocdSyncPrune { targets } => {
                 self.do_argocd_sync(targets, true);
@@ -189,6 +205,9 @@ impl App {
                 claim,
             } => self.do_pvc_shell(ns, pod, container, path, claim),
             ConfirmAction::PvcClean { scope } => self.cleanup_pvc_helpers(scope),
+            ConfirmAction::Authenticate { context, switch } => {
+                self.pending = Some(Suspend::Authenticate { context, switch });
+            }
         }
     }
 
@@ -262,6 +281,13 @@ impl App {
                 }
                 self.mode = self.overlay_return();
                 self.confirm_return = Mode::Table;
+                if matches!(cancelled, Some(ConfirmAction::Authenticate { .. })) {
+                    self.abandon_switch_destination();
+                    // Never connected: the picker is the only useful place to be.
+                    if !self.cluster.connected {
+                        self.open_contexts();
+                    }
+                }
             }
             _ => {}
         }
@@ -285,6 +311,8 @@ impl App {
                     Mode::Contexts
                 } else if self.prompt_over_pvc() {
                     Mode::PvcExplore
+                } else if self.prompt_over_document() {
+                    Mode::Detail
                 } else {
                     Mode::Table
                 };
@@ -319,6 +347,8 @@ impl App {
                     Mode::Contexts
                 } else if self.prompt_over_pvc() {
                     Mode::PvcExplore
+                } else if self.prompt_over_document() {
+                    Mode::Detail
                 } else {
                     Mode::Table
                 };

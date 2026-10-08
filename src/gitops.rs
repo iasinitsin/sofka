@@ -78,12 +78,40 @@ pub fn owner_ref(obj: &DynamicObject) -> Option<FluxRef> {
             namespace: get("helm.toolkit.fluxcd.io/namespace").unwrap_or_default(),
         });
     }
+    if let Some(name) = get("resourceset.fluxcd.controlplane.io/name") {
+        return Some(FluxRef {
+            kind: "ResourceSet".into(),
+            name,
+            namespace: get("resourceset.fluxcd.controlplane.io/namespace").unwrap_or_default(),
+        });
+    }
+    // FluxInstance labels its objects the way `flux-operator trace` reads them.
+    if get("app.kubernetes.io/managed-by").as_deref() == Some("flux-operator")
+        && let Some(name) = get("fluxcd.controlplane.io/name")
+    {
+        return Some(FluxRef {
+            kind: "FluxInstance".into(),
+            name,
+            namespace: get("fluxcd.controlplane.io/namespace").unwrap_or_default(),
+        });
+    }
     None
 }
 
-/// Whether `plural` is a Flux Kustomization/HelmRelease (an owner kind).
-pub fn is_owner_plural(plural: &str) -> bool {
-    matches!(plural, "kustomizations" | "helmreleases")
+/// Whether `group`/`plural` is a Flux kind that applies resources (an owner
+/// kind).
+pub fn is_owner_plural(group: &str, plural: &str) -> bool {
+    matches!(
+        (group, plural),
+        ("kustomize.toolkit.fluxcd.io", "kustomizations")
+            | ("helm.toolkit.fluxcd.io", "helmreleases")
+            | ("fluxcd.controlplane.io", "resourcesets" | "fluxinstances")
+    )
+}
+
+/// flux-operator owners render manifests themselves and have no source.
+fn is_operator_kind(kind: &str) -> bool {
+    matches!(kind, "ResourceSet" | "FluxInstance")
 }
 
 /// The source a Kustomization/HelmRelease reconciles from. Kustomizations use
@@ -110,8 +138,16 @@ pub fn source_ref(owner: &DynamicObject) -> Option<FluxRef> {
 }
 
 /// The `dependsOn` Kustomizations gating `owner` (namespace defaults to the
-/// owner's).
+/// owner's). A ResourceSet's `dependsOn` names arbitrary objects with CEL
+/// readiness checks, which this chain can't judge, so it contributes none.
 pub fn depends_on(owner: &DynamicObject) -> Vec<FluxRef> {
+    if owner
+        .types
+        .as_ref()
+        .is_some_and(|t| is_operator_kind(&t.kind))
+    {
+        return Vec::new();
+    }
     let owner_ns = owner.metadata.namespace.clone().unwrap_or_default();
     owner
         .data
@@ -133,6 +169,84 @@ pub fn depends_on(owner: &DynamicObject) -> Vec<FluxRef> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The ResourceSetInputProviders a ResourceSet reads (`spec.inputsFrom`), by
+/// name with a jump target, or by label selector.
+pub fn input_provider_findings(resourceset: &DynamicObject) -> Vec<Finding> {
+    let Some(refs) = resourceset
+        .data
+        .pointer("/spec/inputsFrom")
+        .and_then(Value::as_array)
+        .filter(|refs| !refs.is_empty())
+    else {
+        return Vec::new();
+    };
+    let namespace = resourceset.metadata.namespace.clone();
+    let mut out = vec![finding(0, Level::Heading, "Input providers")];
+    for r in refs {
+        if let Some(name) = r.get("name").and_then(Value::as_str) {
+            out.push(
+                finding(1, Level::Info, format!("ResourceSetInputProvider/{name}")).with_target(
+                    Target {
+                        plural: "resourcesetinputproviders.fluxcd.controlplane.io".into(),
+                        namespace: namespace.clone(),
+                        name: name.to_string(),
+                    },
+                ),
+            );
+        } else if let Some(selector) = r.get("selector") {
+            out.push(finding(
+                1,
+                Level::Info,
+                format!("selector {}", label_selector(selector)),
+            ));
+        } else {
+            out.push(finding(1, Level::Warn, "invalid input provider reference"));
+        }
+    }
+    out
+}
+
+/// A label selector in `kubectl -l` syntax: `matchLabels` as `k=v`, then
+/// `matchExpressions` as `k in (a,b)`, `k notin (a,b)`, `k`, or `!k`. An
+/// empty selector matches everything.
+fn label_selector(selector: &Value) -> String {
+    let mut parts: Vec<String> = selector
+        .get("matchLabels")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default()))
+        .collect();
+    for e in selector
+        .get("matchExpressions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let key = e.get("key").and_then(Value::as_str).unwrap_or_default();
+        let values = e
+            .get("values")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(match e.get("operator").and_then(Value::as_str) {
+            Some("In") => format!("{key} in ({values})"),
+            Some("NotIn") => format!("{key} notin ({values})"),
+            Some("Exists") => key.to_string(),
+            Some("DoesNotExist") => format!("!{key}"),
+            other => format!("{key} {} ({values})", other.unwrap_or("?")),
+        });
+    }
+    if parts.is_empty() {
+        "(everything)".to_string()
+    } else {
+        parts.join(",")
+    }
 }
 
 /// Show the inventory without reading each managed resource.
@@ -247,8 +361,16 @@ pub fn ready(obj: &DynamicObject) -> Option<(String, String, String)> {
     Some((s("status"), s("reason"), s("message")))
 }
 
+/// Toolkit kinds set `spec.suspend`; flux-operator kinds disable their
+/// reconcile loop with an annotation.
 fn suspended(obj: &DynamicObject) -> bool {
     obj.data.pointer("/spec/suspend").and_then(Value::as_bool) == Some(true)
+        || obj
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("fluxcd.controlplane.io/reconcile"))
+            .is_some_and(|v| v == "disabled")
 }
 
 fn str_at(obj: &DynamicObject, p: &str) -> Option<String> {
@@ -286,7 +408,7 @@ pub fn describe(ev: &Evidence) -> Vec<Finding> {
         out.push(finding(
             1,
             Level::Info,
-            "no kustomize/helm toolkit labels found",
+            "no kustomize/helm toolkit or ResourceSet labels found",
         ));
         return out;
     };
@@ -314,8 +436,11 @@ pub fn describe(ev: &Evidence) -> Vec<Finding> {
     push_flux_object(&mut out, owner, ev.self_is_owner);
 
     // Source block.
-    out.push(finding(0, Level::Heading, "Source"));
+    if !is_operator_kind(&owner.reference.kind) {
+        out.push(finding(0, Level::Heading, "Source"));
+    }
     match &ev.source {
+        None if is_operator_kind(&owner.reference.kind) => {}
         Some(src) => {
             let mut f = finding(1, source_level(src), source_line(src));
             if let Some(t) = src.target() {
@@ -575,6 +700,30 @@ mod tests {
                 "helm.toolkit.fluxcd.io/namespace":"default"}}
         }));
         assert_eq!(owner_ref(&helm).unwrap().kind, "HelmRelease");
+
+        let rset = obj(json!({
+            "apiVersion":"v1","kind":"Service",
+            "metadata":{"name":"s","labels":{"resourceset.fluxcd.controlplane.io/name":"apps",
+                "resourceset.fluxcd.controlplane.io/namespace":"flux-system"}}
+        }));
+        let r = owner_ref(&rset).unwrap();
+        assert_eq!((r.kind.as_str(), r.name.as_str()), ("ResourceSet", "apps"));
+
+        let instance = |managed_by: &str| {
+            obj(json!({
+                "apiVersion":"apps/v1","kind":"Deployment",
+                "metadata":{"name":"source-controller","labels":{
+                    "app.kubernetes.io/managed-by":managed_by,
+                    "fluxcd.controlplane.io/name":"flux",
+                    "fluxcd.controlplane.io/namespace":"flux-system"}}
+            }))
+        };
+        let r = owner_ref(&instance("flux-operator")).unwrap();
+        assert_eq!(
+            (r.kind.as_str(), r.name.as_str(), r.namespace.as_str()),
+            ("FluxInstance", "flux", "flux-system")
+        );
+        assert!(owner_ref(&instance("Helm")).is_none());
 
         // No labels → not managed.
         assert!(owner_ref(&obj(json!({"metadata":{"name":"x"}}))).is_none());

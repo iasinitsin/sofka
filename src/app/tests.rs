@@ -1,4 +1,5 @@
 use super::*;
+use crate::columns::NodeLoad;
 use crate::store::row_key;
 use k8s_openapi::jiff::Timestamp;
 use serde_json::json;
@@ -8,9 +9,11 @@ use tokio::sync::mpsc::{self, Receiver};
 #[cfg(unix)]
 mod clipboard;
 mod credentials;
+mod exec_auth;
 mod flux;
 mod kubeconfig;
 mod label_filter;
+mod log_follow;
 mod namespace_patterns;
 mod node_roles;
 mod oidc;
@@ -21,9 +24,11 @@ mod proxy;
 mod rbac;
 mod restart;
 mod resume;
+mod rollout;
 mod scale;
 mod server_table;
 mod synchronized_output;
+mod update;
 mod watch_status;
 
 fn obj(v: serde_json::Value) -> DynamicObject {
@@ -42,6 +47,7 @@ fn test_app() -> (App, Receiver<Msg>) {
             .stderr(std::process::Stdio::null())
             .spawn()
     };
+    app.update_fetcher = |_force| Box::pin(async { Err("no network in tests".to_string()) });
     (app, rx)
 }
 
@@ -285,6 +291,10 @@ async fn mock_pods_failing_api() -> (String, Arc<std::sync::Mutex<Vec<Instant>>>
     (format!("http://{addr}"), attempts)
 }
 
+fn pod_counts(loads: &HashMap<String, NodeLoad>) -> std::collections::HashMap<String, usize> {
+    loads.iter().map(|(n, l)| (n.clone(), l.pods)).collect()
+}
+
 /// Wait for a `Msg::NodePods` carrying exactly `want`. Publications are
 /// coalesced to one a second, so intermediate states can be skipped — the test
 /// drives one change at a time and waits for each to land.
@@ -293,8 +303,8 @@ async fn await_counts(rx: &mut Receiver<Msg>, want: &[(&str, usize)]) {
         want.iter().map(|(n, c)| ((*n).to_string(), *c)).collect();
     let seen = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if let Msg::NodePods { counts, .. } = rx.recv().await.expect("channel closed")
-                && counts == want
+            if let Msg::NodePods { loads, .. } = rx.recv().await.expect("channel closed")
+                && pod_counts(&loads) == want
             {
                 return;
             }
@@ -433,7 +443,8 @@ async fn node_pods_survives_a_forbidden_watch_without_hammering_the_api() {
     let counts = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let msg = rx.recv().await.expect("channel closed");
-            if let Msg::NodePods { counts, .. } = msg
+            if let Msg::NodePods { loads, .. } = msg
+                && let counts = pod_counts(&loads)
                 && !counts.contains_key("node-a")
                 && counts.get("node-b") == Some(&2)
             {
@@ -3044,6 +3055,42 @@ async fn cordoned_node_statuses_keep_readiness_colors() {
         cell_color(&terminal, status_start, status_end, unknown_y),
         theme::overlay1()
     );
+}
+
+#[tokio::test]
+async fn narrow_header_drops_the_logo_before_the_key_hints() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (width, hints, logo) in [
+        (80, false, true),
+        (91, false, true),
+        (92, true, false),
+        (100, true, false),
+        (117, true, false),
+        (118, true, true),
+        (130, true, true),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for c in "pods".chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, "pods");
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let header: String = (0..8)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .map(|pos| terminal.backend().buffer()[pos].symbol().to_string())
+            .collect();
+        assert_eq!(
+            header.contains("prev logs"),
+            hints,
+            "hints at width {width}"
+        );
+        assert_eq!(header.contains("sofka v"), logo, "logo at width {width}");
+    }
 }
 
 #[tokio::test]
@@ -9769,7 +9816,7 @@ async fn nodes_view_pods_column_counts_and_sorts() {
 
     app.handle_msg(Msg::NodePods {
         generation: app.generation,
-        counts: HashMap::from([("node-b".to_string(), 7)]),
+        loads: HashMap::from([("node-b".to_string(), NodeLoad::with_pods(7))]),
     });
     // node-a has no entry → genuinely zero pods once data exists.
     let (_, rows) = app.snapshot_table();
@@ -9791,6 +9838,115 @@ async fn nodes_view_pods_column_counts_and_sorts() {
         .map(|o| o.metadata.name.clone().unwrap())
         .collect();
     assert_eq!(names, ["node-b", "node-a"]);
+}
+
+#[tokio::test]
+async fn nodes_view_committed_capacity_renders_sorts_and_filters() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        columns = [{ name = "GPU/R", metric = "node-request:nvidia.com/gpu" }]
+        "#,
+    );
+    app.switch_kind("nodes");
+    let node = |name: &str, allocatable: serde_json::Value| {
+        json!({"apiVersion": "v1", "kind": "Node",
+               "metadata": {"name": name, "resourceVersion": "1"},
+               "status": {"allocatable": allocatable}})
+    };
+    apply(
+        &mut app,
+        node(
+            "gpu",
+            json!({"cpu": "4", "memory": "8Gi", "nvidia.com/gpu": "4"}),
+        ),
+    );
+    apply(
+        &mut app,
+        node("small", json!({"cpu": "2", "memory": "4Gi"})),
+    );
+    let cell = |app: &App, name: &str, header: &str| {
+        let (headers, rows) = app.snapshot_table();
+        let col = headers.iter().position(|h| h == header).unwrap();
+        rows.iter().find(|r| r[0] == name).unwrap()[col].clone()
+    };
+    assert_eq!(cell(&app, "gpu", "%CPU/R"), "-");
+
+    let pod = |name: &str, node: &str, resources: serde_json::Value| {
+        obj(json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": name, "namespace": "default"},
+                   "spec": {"nodeName": node, "containers": [{"name": "c", "resources": resources}]}}))
+    };
+    let mut loads = crate::columns::NodeLoads::default();
+    for (name, node, resources) in [
+        (
+            "train",
+            "gpu",
+            json!({"requests": {"cpu": "1", "memory": "2Gi", "nvidia.com/gpu": "2"},
+                   "limits": {"cpu": "3", "nvidia.com/gpu": "2"}}),
+        ),
+        ("web", "small", json!({"requests": {"cpu": "1500m"}})),
+    ] {
+        let pod = pod(name, node, resources);
+        loads.apply(row_key(&pod), &pod);
+    }
+    app.handle_msg(Msg::NodePods {
+        generation: app.generation,
+        loads: loads.snapshot(),
+    });
+
+    assert_eq!(cell(&app, "gpu", "%CPU/R"), "25%");
+    assert_eq!(cell(&app, "gpu", "%MEM/R"), "25%");
+    assert_eq!(cell(&app, "gpu", "GPU/R"), "50%");
+    assert_eq!(cell(&app, "small", "%CPU/R"), "75%");
+    assert_eq!(cell(&app, "small", "%MEM/R"), "0%");
+    assert_eq!(cell(&app, "small", "GPU/R"), "-");
+    assert!(!app.display_headers().iter().any(|h| h == "%CPU/L"));
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(cell(&app, "gpu", "%CPU/L"), "75%");
+    assert_eq!(cell(&app, "small", "%CPU/L"), "0%");
+
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in "%CPU/R".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(row_names(&app), ["gpu", "small"]);
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    assert_eq!(row_names(&app), ["small", "gpu"]);
+
+    type_filter(&mut app, "gpu/r>=50");
+    assert_eq!(row_names(&app), ["gpu"]);
+}
+
+#[test]
+fn node_loads_follow_pod_moves_resizes_and_deletes() {
+    let pod = |node: &str, cpu: &str| {
+        obj(json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": "p", "namespace": "default"},
+                   "spec": {"nodeName": node,
+                            "containers": [{"resources": {"requests": {"cpu": cpu}}}]}}))
+    };
+    let mut loads = crate::columns::NodeLoads::default();
+    let cpu = |loads: &crate::columns::NodeLoads, node: &str| {
+        loads
+            .snapshot()
+            .get(node)
+            .map(|l| (l.pods, l.requests.get("cpu").copied()))
+    };
+    assert!(loads.apply("p".into(), &pod("a", "500m")));
+    assert!(!loads.apply("p".into(), &pod("a", "500m")));
+    assert_eq!(cpu(&loads, "a"), Some((1, Some(500))));
+    assert!(loads.apply("p".into(), &pod("a", "1")));
+    assert_eq!(cpu(&loads, "a"), Some((1, Some(1000))));
+    assert!(loads.apply("p".into(), &pod("b", "1")));
+    assert_eq!(cpu(&loads, "a"), None);
+    assert_eq!(cpu(&loads, "b"), Some((1, Some(1000))));
+    assert!(loads.remove("p"));
+    assert!(loads.snapshot().is_empty());
 }
 
 #[tokio::test]
@@ -9818,7 +9974,10 @@ async fn node_pods_update_invalidates_pods_sorted_rows() {
     // A fresh count snapshot must resort without any other invalidation.
     app.handle_msg(Msg::NodePods {
         generation: app.generation,
-        counts: HashMap::from([("node-a".to_string(), 2), ("node-b".to_string(), 9)]),
+        loads: HashMap::from([
+            ("node-a".to_string(), NodeLoad::with_pods(2)),
+            ("node-b".to_string(), NodeLoad::with_pods(9)),
+        ]),
     });
     let names: Vec<String> = app
         .rows()
@@ -10513,6 +10672,34 @@ fn marked_logs_app() -> (App, Receiver<Msg>) {
     (app, rx)
 }
 
+type TestBody = http_body_util::StreamBody<
+    futures_util::stream::BoxStream<
+        'static,
+        Result<hyper::body::Frame<hyper::body::Bytes>, std::convert::Infallible>,
+    >,
+>;
+
+/// A response body that ends after `text`.
+fn closed_body(text: impl Into<String>) -> TestBody {
+    let frame = Ok(hyper::body::Frame::data(hyper::body::Bytes::from(
+        text.into(),
+    )));
+    http_body_util::StreamBody::new(futures_util::stream::iter([frame]).boxed())
+}
+
+/// A response body that stays open after `text`, as a followed container's
+/// logs and a pod watch do.
+fn open_body(text: impl Into<String>) -> TestBody {
+    let frame = Ok(hyper::body::Frame::data(hyper::body::Bytes::from(
+        text.into(),
+    )));
+    http_body_util::StreamBody::new(
+        futures_util::stream::iter([frame])
+            .chain(futures_util::stream::pending())
+            .boxed(),
+    )
+}
+
 fn select_log_pod(app: &mut App, ns: &str) {
     let index = app
         .rows()
@@ -10542,12 +10729,14 @@ async fn marked_pod_logs_stream_all_containers_and_identify_errors() {
             } else {
                 (200, "2026-09-10T10:00:00Z ready\n".to_owned())
             };
+            let body = if status == 200 {
+                open_body(body)
+            } else {
+                closed_body(body)
+            };
             async move {
                 Ok::<_, std::convert::Infallible>(
-                    http::Response::builder()
-                        .status(status)
-                        .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
-                        .unwrap(),
+                    http::Response::builder().status(status).body(body).unwrap(),
                 )
             }
         }),
@@ -10612,25 +10801,30 @@ async fn log_timestamp_requests_cover_pods_selectors_and_previous_containers() {
         let seen = requests.clone();
         app.cluster.client = kube::Client::new(
             tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let query = request.uri().query().unwrap_or_default();
                 let body = if request.uri().path().ends_with("/log") {
-                    let query = request.uri().query().unwrap();
                     assert!(query.contains("timestamps=true"));
                     seen.fetch_add(1, Ordering::SeqCst);
-                    if query.contains("container=sidecar") {
-                        "2026-09-10T10:00:00Z first\n".to_owned()
+                    let line = if query.contains("container=sidecar") {
+                        "2026-09-10T10:00:00Z first\n"
                     } else {
-                        "2026-09-10T10:00:01Z second\n".to_owned()
+                        "2026-09-10T10:00:01Z second\n"
+                    };
+                    if query.contains("follow=true") {
+                        open_body(line)
+                    } else {
+                        closed_body(line)
                     }
+                } else if query.contains("watch=true") {
+                    open_body("")
                 } else {
-                    json!({"apiVersion": "v1", "kind": "PodList",
-                        "metadata": {}, "items": [pod]})
-                    .to_string()
+                    closed_body(
+                        json!({"apiVersion": "v1", "kind": "PodList",
+                            "metadata": {"resourceVersion": "1"}, "items": [pod]})
+                        .to_string(),
+                    )
                 };
-                async move {
-                    Ok::<_, std::convert::Infallible>(http::Response::new(
-                        http_body_util::Full::new(hyper::body::Bytes::from(body)),
-                    ))
-                }
+                async move { Ok::<_, std::convert::Infallible>(http::Response::new(body)) }
             }),
             "default",
         );
@@ -11119,6 +11313,9 @@ fn waiting_logs_app(code: u16, reason: &str) -> (App, Receiver<Msg>, Arc<AtomicU
             "status": {"phase": "Pending"}}),
     );
     app.table_state.select(Some(0));
+    let pod = json!({"apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "pending", "namespace": "default"},
+        "status": {"phase": "Pending"}});
     let requests = Arc::new(AtomicU64::new(0));
     let seen = requests.clone();
     let message = if code == 400 && reason != "invalid container" {
@@ -11128,12 +11325,15 @@ fn waiting_logs_app(code: u16, reason: &str) -> (App, Receiver<Msg>, Arc<AtomicU
     };
     app.cluster.client = kube::Client::new(
         tower::service_fn(move |request: http::Request<kube::client::Body>| {
-            assert_eq!(
-                request.uri().path(),
-                "/api/v1/namespaces/default/pods/pending/log"
-            );
-            let attempt = seen.fetch_add(1, Ordering::SeqCst);
-            let (status, body) = if attempt < 2 {
+            let path = request.uri().path();
+            // While the container waits, the stream reads the pod as well.
+            let pod_read = path == "/api/v1/namespaces/default/pods/pending";
+            if !pod_read {
+                assert_eq!(path, "/api/v1/namespaces/default/pods/pending/log");
+            }
+            let (status, body) = if pod_read {
+                (200, pod.to_string())
+            } else if seen.fetch_add(1, Ordering::SeqCst) < 2 {
                 (
                     code,
                     json!({"kind": "Status", "apiVersion": "v1",
@@ -11270,6 +11470,129 @@ async fn namespace_switcher_known_rows_do_not_block_palette_fetch_retry() {
 }
 
 #[tokio::test]
+async fn palette_refetches_namespaces_created_after_launch() {
+    let (mut app, mut rx) = test_app();
+    let (requests, mut request_rx) = mpsc::unbounded_channel();
+    let mut attempts = 0;
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            assert_eq!(request.uri().path(), "/api/v1/namespaces");
+            attempts += 1;
+            requests.send(attempts).unwrap();
+            let mut items = vec![json!({"metadata": {"name": "default"}})];
+            if attempts > 1 {
+                items.push(json!({"metadata": {"name": "fresh"}}));
+            }
+            let body = json!({
+                "kind": "NamespaceList", "apiVersion": "v1", "metadata": {},
+                "items": items
+            });
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            body.to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    app.handle_msg(message);
+    assert_eq!(app.ns_list, ["<all>", "default"]);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+
+    for c in ":pods fre".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    let message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    app.handle_msg(message);
+    assert_eq!(app.ns_list, ["<all>", "default", "fresh"]);
+    let suggestion = app.cmd_suggestions.first().expect("namespace suggestion");
+    assert_eq!(suggestion.kind, SuggestKind::Namespace);
+    assert_eq!(suggestion.label, "fresh");
+}
+
+#[tokio::test]
+async fn palette_drops_namespace_list_from_an_older_fetch() {
+    let (mut app, _rx) = test_app();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    let latest = app.ns_list_request;
+
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        request: latest,
+        list: vec!["<all>".into(), "default".into(), "fresh".into()],
+    });
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        request: latest - 1,
+        list: vec!["<all>".into(), "default".into()],
+    });
+    assert_eq!(app.ns_list, ["<all>", "default", "fresh"]);
+}
+
+#[tokio::test]
+async fn palette_keeps_an_older_namespace_list_when_the_newer_fetch_fails() {
+    let (mut app, _rx) = test_app();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        request: app.ns_list_request - 1,
+        list: vec!["<all>".into(), "default".into(), "fresh".into()],
+    });
+    assert_eq!(app.ns_list, ["<all>", "default", "fresh"]);
+}
+
+#[tokio::test]
+async fn palette_namespace_refresh_keeps_a_navigated_suggestion() {
+    let (mut app, _rx) = test_app();
+    app.ns_list = vec!["<all>".into(), "alpha".into(), "beta".into()];
+    for c in ":pods ".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    let sel = app.cmd_sel;
+    let label = app.cmd_suggestions[sel].label.clone();
+
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        request: app.ns_list_request,
+        list: vec!["<all>".into(), "aaa".into(), "alpha".into(), "beta".into()],
+    });
+    assert_eq!(app.cmd_sel, sel);
+    assert_eq!(app.cmd_suggestions[sel].label, label);
+}
+
+#[tokio::test]
 async fn namespace_switcher_selects_current_and_preserves_cursor_on_refresh() {
     let (mut app, _rx) = test_app();
     app.namespace = "prod".into();
@@ -11284,6 +11607,7 @@ async fn namespace_switcher_selects_current_and_preserves_cursor_on_refresh() {
 
     app.handle_msg(Msg::Namespaces {
         generation: app.generation,
+        request: app.ns_list_request,
         list: vec!["<all>".into(), "alpha".into(), "prod".into()],
     });
     assert_eq!(
@@ -11298,6 +11622,7 @@ async fn namespace_switcher_selects_current_and_preserves_cursor_on_refresh() {
     app.handle_key(press(KeyCode::Up)).unwrap();
     app.handle_msg(Msg::Namespaces {
         generation: app.generation,
+        request: app.ns_list_request,
         list: vec!["<all>".into(), "beta".into(), "gamma".into(), "prod".into()],
     });
     assert_eq!(
@@ -11308,6 +11633,7 @@ async fn namespace_switcher_selects_current_and_preserves_cursor_on_refresh() {
     app.handle_key(press(KeyCode::Char('p'))).unwrap();
     app.handle_msg(Msg::Namespaces {
         generation: app.generation,
+        request: app.ns_list_request,
         list: vec!["<all>".into(), "alpha".into(), "prod".into()],
     });
     assert_eq!(
@@ -11707,6 +12033,7 @@ async fn stale_async_picker_results_are_dropped() {
     app.ns_list = vec!["<all>".into()];
     app.handle_msg(Msg::Namespaces {
         generation: stale,
+        request: app.ns_list_request,
         list: vec!["<all>".into(), "stale".into()],
     });
     assert_eq!(app.ns_list, vec!["<all>".to_string()]);
@@ -11782,6 +12109,7 @@ async fn namespace_switcher_follows_its_inputs() {
     let (mut app, _rx) = test_app();
     app.handle_msg(Msg::Namespaces {
         generation: app.generation,
+        request: app.ns_list_request,
         list: vec!["dev".into(), "prod".into(), "test".into()],
     });
 
@@ -11801,6 +12129,7 @@ async fn namespace_switcher_follows_its_inputs() {
     // prompt a rebuild.
     app.handle_msg(Msg::Namespaces {
         generation: app.generation,
+        request: app.ns_list_request,
         list: vec!["dev".into(), "staging".into()],
     });
     assert_eq!(
@@ -13133,29 +13462,340 @@ async fn edit_from_document_view_respects_read_only_mode() {
 }
 
 #[tokio::test]
-async fn edit_is_unavailable_in_decoded_secret_and_other_documents() {
-    let (mut app, _rx) = test_app();
-    app.switch_kind("secrets");
-    apply(
-        &mut app,
-        json!({"apiVersion": "v1", "kind": "Secret",
-               "metadata": {"name": "creds", "namespace": "default"},
-               "data": {"token": "c2VjcmV0"}}),
-    );
-    app.table_state.select(Some(0));
-    app.handle_key(press(KeyCode::Char('y'))).unwrap();
-    app.handle_key(press(KeyCode::Char('x'))).unwrap();
-    assert!(app.detail.title.contains("decoded"));
-    app.readonly = true;
-    app.handle_key(press(KeyCode::Char('e'))).unwrap();
-    assert!(app.pending.is_none());
-    assert!(!app.flash.contains("read-only"), "{}", app.flash);
-    assert_eq!(app.mode, Mode::Detail);
-
+async fn edit_is_unavailable_in_journal_and_other_documents() {
+    let (mut app, _rx) = app_with_pod();
     app.open_journal();
     app.handle_key(press(KeyCode::Char('e'))).unwrap();
     assert!(app.pending.is_none());
     assert_eq!(app.mode, Mode::Detail);
+}
+
+/// The decoded view of a Secret with a text value, a multiline value, and a
+/// value that is not text.
+fn decoded_secret_app() -> (App, Receiver<Msg>) {
+    use base64::Engine;
+    let b64 = |v: &[u8]| base64::engine::general_purpose::STANDARD.encode(v);
+    let (mut app, rx) = test_app();
+    app.switch_kind("secrets");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Secret",
+               "metadata": {"name": "creds", "namespace": "default", "resourceVersion": "7"},
+               "data": {"token": b64(b"hunter2"), "cert": b64(b"a\nb\n"),
+                        "der": b64(&[0xff, 0x00])}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert!(app.detail.title.contains("decoded"));
+    (app, rx)
+}
+
+/// Press `e` in the decoded view and return the file the editor was given.
+fn open_secret_editor(app: &mut App) -> std::path::PathBuf {
+    press_document_edit(app);
+    std::path::PathBuf::from(edit_argv(app).last().unwrap())
+}
+
+/// Stand in for the editor: replace the file, then return from the suspend.
+fn close_secret_editor(app: &mut App, path: &std::path::Path, text: &str) {
+    if !text.is_empty() {
+        std::fs::write(path, text).unwrap();
+    }
+    app.handle_command_result(None, Ok(()), None);
+    app.after_suspend();
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_opens_the_text_values_as_string_data() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("stringData:"), "{text}");
+    assert!(text.contains("token: hunter2"), "{text}");
+    assert!(text.contains("cert: |"), "{text}");
+    assert!(!text.contains("der:"), "{text}");
+    assert!(text.contains("left unchanged: der"), "{text}");
+    assert_eq!(app.mode, Mode::Detail);
+
+    close_secret_editor(&mut app, &path, "");
+    assert!(!path.exists(), "the decoded values must not stay on disk");
+    assert!(!path.parent().unwrap().exists());
+    assert_eq!(app.flash, "secret not changed");
+    assert!(app.journal.is_empty());
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_confirms_the_changed_keys_then_patches() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    close_secret_editor(
+        &mut app,
+        &path,
+        "stringData:\n  token: s3cret\n  cert: |\n    a\n    b\n  extra: x\n",
+    );
+    assert!(!path.exists());
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(app.confirm_over_document());
+    assert_eq!(
+        app.confirm_label,
+        "Update secret creds in default: change token · add extra?"
+    );
+    let Some(ConfirmAction::SecretEdit { patch, .. }) = &app.confirm_action else {
+        panic!("expected the secret patch");
+    };
+    assert_eq!(
+        patch,
+        &json!({"metadata": {"resourceVersion": "7"},
+                "data": {"token": "czNjcmV0", "extra": "eA=="}})
+    );
+    let screen = screen_text(&mut app, 120, 30);
+    assert!(screen.contains("creds - decoded"), "{screen}");
+
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(app.detail.title.contains("decoded"));
+    assert_eq!(app.journal.len(), 1);
+    assert!(app.flash.contains("updating secret creds"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_reopens_a_document_that_does_not_parse() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    close_secret_editor(&mut app, &path, "stringData:\n  port: 8080\n");
+    assert!(app.flash_err);
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("expected the editor to reopen");
+    };
+    assert_eq!(std::path::Path::new(argv.last().unwrap()), path);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("# error:"), "{text}");
+    assert!(text.contains("port: 8080"), "{text}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the retry file stays private");
+    }
+
+    // Saving the error document unchanged gives up.
+    close_secret_editor(&mut app, &path, "");
+    assert!(app.pending.is_none());
+    assert_eq!(app.flash, "secret not changed");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_will_not_overwrite_a_value_that_is_not_text() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    close_secret_editor(
+        &mut app,
+        &path,
+        "stringData:\n  token: hunter2\n  der: text\n",
+    );
+    assert!(app.confirm_action.is_none());
+    assert!(matches!(app.pending.take(), Some(Suspend::Shell(_))));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("# error: der not text"), "{text}");
+    close_secret_editor(&mut app, &path, "");
+    assert!(app.confirm_action.is_none());
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_refuses_an_emptied_string_data_block() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    close_secret_editor(&mut app, &path, "stringData:\n");
+    assert!(app.confirm_action.is_none());
+    assert!(matches!(app.pending.take(), Some(Suspend::Shell(_))));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("use {} to remove every key"), "{text}");
+
+    // An explicit {} is how every key goes.
+    close_secret_editor(&mut app, &path, "stringData: {}\n");
+    assert_eq!(
+        app.confirm_label,
+        "Update secret creds in default: remove cert, token?"
+    );
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_reopens_a_file_that_is_not_utf8() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    std::fs::write(&path, b"stringData:\n  token: \xff\n").unwrap();
+    close_secret_editor(&mut app, &path, "");
+    assert!(matches!(app.pending.take(), Some(Suspend::Shell(_))));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.starts_with("# error: the file is not valid UTF-8"),
+        "{text}"
+    );
+    assert!(text.contains("token:"), "{text}");
+    close_secret_editor(&mut app, &path, "");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_is_dropped_when_the_editor_fails() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    std::fs::write(&path, "stringData:\n  token: changed\n").unwrap();
+    app.handle_command_result(None, Err(std::io::Error::other("exit status 1")), None);
+    app.after_suspend();
+    assert!(!path.parent().unwrap().exists());
+    assert!(app.confirm_action.is_none());
+    assert!(app.journal.is_empty());
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_respects_read_only_and_guardrails() {
+    let (mut app, _rx) = decoded_secret_app();
+    app.readonly = true;
+    app.handle_key(press(KeyCode::Char('e'))).unwrap();
+    assert!(app.flash.contains("read-only"));
+    assert!(app.document_edit_task.is_none());
+    app.readonly = false;
+
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["secret-edit".into()],
+        resources: vec!["secrets".into()],
+        deny: true,
+        ..Default::default()
+    }];
+    press_document_edit(&mut app);
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["secret-edit".into()],
+        confirmation: Some("type-resource-name".into()),
+        ..Default::default()
+    }];
+    let path = open_secret_editor(&mut app);
+    close_secret_editor(&mut app, &path, "stringData:\n  token: rotated\n");
+    assert_eq!(app.mode, Mode::Prompt);
+    assert!(app.prompt_over_document());
+    assert!(
+        app.prompt_label
+            .starts_with("Update secret creds in default: change token · remove cert?\n\n")
+            && app.prompt_label.ends_with("type 'creds' to confirm:"),
+        "{}",
+        app.prompt_label
+    );
+    assert_eq!(app.popup_scroll, usize::MAX, "opens on the input");
+    for c in "creds".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(app.journal.len(), 1);
+}
+
+#[tokio::test]
+async fn typed_secret_edit_prompt_keeps_the_input_in_view_with_many_keys() {
+    let (mut app, _rx) = decoded_secret_app();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["secret-edit".into()],
+        confirmation: Some("type-resource-name".into()),
+        ..Default::default()
+    }];
+    let path = open_secret_editor(&mut app);
+    let mut doc = String::from("stringData:\n  token: hunter2\n  cert: |\n    a\n    b\n");
+    for i in 0..60 {
+        doc.push_str(&format!("  a-rather-long-key-name-number-{i}: v\n"));
+    }
+    close_secret_editor(&mut app, &path, &doc);
+    assert_eq!(app.mode, Mode::Prompt);
+    assert!(
+        app.prompt_label
+            .contains("a-rather-long-key-name-number-59")
+    );
+    let screen = screen_text(&mut app, 80, 24);
+    assert!(screen.contains("type 'creds' to confirm"), "{screen}");
+    assert!(screen.contains('█'), "{screen}");
+    assert!(screen.contains("apply"), "{screen}");
+}
+
+/// Many long key names on a Flux-managed copy of the decoded Secret.
+fn many_keys_on_a_managed_secret(app: &mut App) {
+    let source = app.document_source.as_mut().unwrap();
+    source.object.metadata.labels = Some(
+        [
+            ("kustomize.toolkit.fluxcd.io/name", "apps"),
+            ("kustomize.toolkit.fluxcd.io/namespace", "flux-system"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    );
+    let path = open_secret_editor(app);
+    let mut doc = String::from("stringData:\n  token: hunter2\n  cert: |\n    a\n    b\n");
+    for i in 0..60 {
+        doc.push_str(&format!("  a-rather-long-key-name-number-{i}: v\n"));
+    }
+    close_secret_editor(app, &path, &doc);
+}
+
+#[tokio::test]
+async fn managed_warning_is_in_view_on_a_long_secret_confirmation() {
+    let (mut app, _rx) = decoded_secret_app();
+    many_keys_on_a_managed_secret(&mut app);
+    assert_eq!(app.mode, Mode::Confirm);
+    let screen = screen_text(&mut app, 80, 24);
+    assert!(screen.contains("Managed by Flux"), "{screen}");
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["secret-edit".into()],
+        confirmation: Some("type-resource-name".into()),
+        ..Default::default()
+    }];
+    many_keys_on_a_managed_secret(&mut app);
+    assert_eq!(app.mode, Mode::Prompt);
+    let screen = screen_text(&mut app, 80, 24);
+    assert!(screen.contains("Managed by Flux"), "{screen}");
+    assert!(screen.contains("type 'creds' to confirm"), "{screen}");
+    assert!(screen.contains('█'), "{screen}");
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_refuses_an_immutable_secret() {
+    let (mut app, _rx) = decoded_secret_app();
+    app.handle_key(press(KeyCode::Char('e'))).unwrap();
+    let mut object = app.document_source.as_ref().unwrap().object.clone();
+    object.data["immutable"] = json!(true);
+    app.document_edit_task.as_ref().unwrap().abort();
+    app.handle_msg(Msg::DocumentEditRead {
+        generation: app.generation,
+        request: app.document_edit_request,
+        result: Ok(Box::new(object)),
+    });
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("immutable"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn decoded_secret_reloads_after_the_update_lands() {
+    let (mut app, _rx) = decoded_secret_app();
+    let claim = app.claim_status("updating secret creds…");
+    app.handle_msg(Msg::SecretEditApplied {
+        generation: app.generation,
+        claim,
+        result: Ok("secret creds updated".into()),
+    });
+    assert_eq!(app.flash, "secret creds updated");
+    assert!(app.document_reload_task.is_some());
+
+    let claim = app.claim_status("updating secret creds…");
+    app.handle_msg(Msg::SecretEditApplied {
+        generation: app.generation,
+        claim,
+        result: Err("secret creds changed since it was read".into()),
+    });
+    assert!(app.flash_err);
 }
 
 #[tokio::test]
@@ -15488,7 +16128,7 @@ async fn user_view_adds_provider_label_columns_to_curated_nodes() {
         app.display_headers().to_vec(),
         [
             "NAME", "STATUS", "ROLES", "TAINTS", "VERSION", "NODEPOOL", "ZONE", "INSTANCE", "TYPE",
-            "AGE", "PODS", "CPU", "MEM", "%CPU", "%MEM"
+            "AGE", "PODS", "CPU", "MEM", "%CPU", "%MEM", "%CPU/R", "%MEM/R"
         ]
     );
 
@@ -19052,6 +19692,7 @@ async fn logs_time_anchors_restream_kubelet_logs() {
     app.logs.source = Some(LogSource::Pod {
         ns: "default".into(),
         name: "web".into(),
+        uid: None,
         containers: vec![],
     });
 
@@ -19618,6 +20259,7 @@ async fn launching_logs_invalidates_the_previous_buffers_index() {
         LogSource::Pod {
             ns: "default".into(),
             name: "new".into(),
+            uid: None,
             containers: Vec::new(),
         },
         "new".into(),
@@ -24282,6 +24924,10 @@ fn explain_selected_with_pure_evidence(app: &mut App) {
         plural: &app.kind_plural,
         obj: source,
         pods: &[],
+        pods_listed: true,
+        related: &[],
+        related_listed: true,
+        storage_classes: None,
         events: &[],
         events_v1: false,
     });
@@ -24721,26 +25367,41 @@ fn health_report_app_with(
         tower::service_fn(move |request: http::Request<kube::client::Body>| {
             assert_eq!(request.method(), http::Method::GET);
             let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
             seen.lock().unwrap().push(path.clone());
-            let (code, response) = replies.lock().unwrap().get(&path).cloned().unwrap_or_else(
-                || {
-                    if path.ends_with("/namespaces") {
-                        (200, json!({"apiVersion":"v1","kind":"NamespaceList","metadata":{},"items":[]}))
-                    } else if path.ends_with("/events") {
-                        (
-                            200,
-                            json!({"apiVersion":"v1","kind":"EventList","metadata":{},"items":[]}),
-                        )
-                    } else if path.ends_with("/pods") {
-                        (
-                            200,
-                            json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}),
-                        )
-                    } else {
-                        panic!("unexpected report GET {path}")
-                    }
-                },
-            );
+            // A `path?query` key answers only requests whose query contains
+            // that part, ahead of a plain `path` key.
+            let reply = {
+                let replies = replies.lock().unwrap();
+                replies
+                    .iter()
+                    .find(|(key, _)| {
+                        key.split_once('?')
+                            .is_some_and(|(p, q)| p == path && query.contains(q))
+                    })
+                    .map(|(_, reply)| reply.clone())
+                    .or_else(|| replies.get(&path).cloned())
+            };
+            let (code, response) = reply.unwrap_or_else(|| {
+                if path.ends_with("/namespaces") {
+                    (
+                        200,
+                        json!({"apiVersion":"v1","kind":"NamespaceList","metadata":{},"items":[]}),
+                    )
+                } else if path.ends_with("/events") {
+                    (
+                        200,
+                        json!({"apiVersion":"v1","kind":"EventList","metadata":{},"items":[]}),
+                    )
+                } else if path.ends_with("/pods") {
+                    (
+                        200,
+                        json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}),
+                    )
+                } else {
+                    panic!("unexpected report GET {path}")
+                }
+            });
             async move {
                 Ok::<_, std::convert::Infallible>(
                     http::Response::builder()
@@ -28597,11 +29258,7 @@ async fn marked_pod_custom_lookback_keeps_each_stream_tail_limit() {
             assert!(request.uri().path().ends_with("/log"));
             tx.try_send(request.uri().query().unwrap_or_default().to_owned())
                 .unwrap();
-            async move {
-                Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(
-                    hyper::body::Bytes::from("line\n"),
-                )))
-            }
+            async move { Ok::<_, std::convert::Infallible>(http::Response::new(open_body("line\n"))) }
         }),
         "default",
     );
@@ -28645,20 +29302,27 @@ async fn log_lookback_keys_keep_tail_limits_in_api_requests() {
             app.cluster.client = kube::Client::new(
                 tower::service_fn(move |request: http::Request<kube::client::Body>| {
                     assert_eq!(request.method(), http::Method::GET);
+                    let query = request.uri().query().unwrap_or_default().to_owned();
                     let response = if request.uri().path().ends_with("/log") {
-                        tx.try_send(request.uri().query().unwrap_or_default().to_owned())
-                            .unwrap();
-                        "line\n".to_owned()
+                        let follow = query.contains("follow=true");
+                        tx.try_send(query).unwrap();
+                        if follow {
+                            open_body("line\n")
+                        } else {
+                            closed_body("line\n")
+                        }
                     } else {
                         assert_eq!(request.uri().path(), "/api/v1/namespaces/default/pods");
-                        json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[pod]})
-                            .to_string()
+                        if query.contains("watch=true") {
+                            open_body("")
+                        } else {
+                            closed_body(
+                                json!({"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"1"},"items":[pod]})
+                                    .to_string(),
+                            )
+                        }
                     };
-                    async move {
-                        Ok::<_, std::convert::Infallible>(http::Response::new(
-                            http_body_util::Full::new(hyper::body::Bytes::from(response)),
-                        ))
-                    }
+                    async move { Ok::<_, std::convert::Infallible>(http::Response::new(response)) }
                 }),
                 "default",
             );
@@ -30511,7 +31175,7 @@ async fn configured_node_metrics_filter_and_refresh_by_source() {
     assert!(row_names(&app).is_empty());
     app.handle_msg(Msg::NodePods {
         generation: app.generation,
-        counts: HashMap::from([("node".into(), 3)]),
+        loads: HashMap::from([("node".into(), NodeLoad::with_pods(3))]),
     });
     assert_eq!(row_names(&app), ["node"]);
     let (headers, rows) = app.snapshot_table();
@@ -30519,7 +31183,7 @@ async fn configured_node_metrics_filter_and_refresh_by_source() {
     assert_eq!(rows[0], ["node", "3", "50%", "1.0Gi"]);
     app.handle_msg(Msg::NodePods {
         generation: app.generation,
-        counts: HashMap::new(),
+        loads: HashMap::new(),
     });
     assert!(row_names(&app).is_empty());
 }
@@ -37246,7 +37910,8 @@ async fn log_json_shortcut_formats_records_and_keeps_raw_save() {
     let raw = app.filtered_log_text();
     let generation = app.log_gen;
     app.handle_key(press(KeyCode::Char('J'))).unwrap();
-    assert!(app.logs.json);
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
+    assert_eq!(app.logs.json, JsonView::Pretty);
     assert!(app.logs.display_line(0).starts_with("[ns/pod:app] {\n"));
     assert!(app.logs.display_line(0).contains("    \"items\": [\n"));
     assert!(app.logs.display_line(1).starts_with("[\n"));
@@ -37286,9 +37951,212 @@ async fn log_json_shortcut_formats_records_and_keeps_raw_save() {
     shortcut_log_lines(&mut app, vec![r#"[app] {"new":[3]}"#.into()]);
     assert!(app.logs.display_line(6).starts_with("[app] {\n"));
     app.handle_key(press(KeyCode::Char('J'))).unwrap();
-    assert!(!app.logs.json);
+    assert_eq!(app.logs.json, JsonView::Raw);
     assert_eq!(app.logs.display_line(0), app.logs.view.lines[0]);
     assert_eq!(app.log_gen, generation);
+}
+
+#[tokio::test]
+async fn log_json_view_starts_from_config_and_follows_context_overrides() {
+    let dir = std::env::temp_dir().join(format!("sofka-json-view-{}", std::process::id()));
+    write_config(&dir, "[logs]\njson_view = \"record\"\n");
+    write_config(
+        &dir.join("clusters/test-cluster/prod"),
+        "[logs]\njson_view = \"raw\"\n",
+    );
+    write_config(
+        &dir.join("clusters/test-cluster/typo"),
+        "[logs]\njson_view = \"fancy\"\n",
+    );
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    land_context(&mut app, "dev");
+    assert_eq!(app.logs.json, JsonView::Record);
+
+    app.mode = Mode::Logs;
+    shortcut_log_lines(
+        &mut app,
+        vec![r#"{"level":"info","msg":"ready","port":8080}"#.into()],
+    );
+    assert!(
+        app.logs
+            .display_line(0)
+            .starts_with("INFO  ready port=8080"),
+        "{}",
+        app.logs.display_line(0)
+    );
+
+    // A session choice survives a reload that leaves the value alone.
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
+    assert_eq!(app.logs.json, JsonView::Pretty);
+    palette(&mut app, "reload");
+    assert_eq!(app.logs.json, JsonView::Pretty);
+
+    // A reload that changes the value replaces the session choice and
+    // re-renders the buffered line.
+    write_config(&dir, "[logs]\njson_view = \"raw\"\n");
+    palette(&mut app, "reload");
+    assert_eq!(app.logs.json, JsonView::Raw);
+    assert_eq!(app.logs.display_line(0), app.logs.view.lines[0]);
+    write_config(&dir, "[logs]\njson_view = \"record\"\n");
+    palette(&mut app, "reload");
+    assert_eq!(app.logs.json, JsonView::Record);
+    assert!(
+        app.logs
+            .display_line(0)
+            .starts_with("INFO  ready port=8080")
+    );
+
+    // A context with a different value switches to it, buffered lines too.
+    land_context(&mut app, "prod");
+    assert_eq!(app.logs.json, JsonView::Raw);
+    land_context(&mut app, "dev");
+    assert_eq!(app.logs.json, JsonView::Record);
+    assert!(app.logs.display_line(0).starts_with("INFO  ready"));
+
+    // A context with the same value keeps a `J` choice, buffered lines too.
+    app.mode = Mode::Logs;
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
+    assert_eq!(app.logs.json, JsonView::Pretty);
+    land_context(&mut app, "staging");
+    assert_eq!(app.logs.json, JsonView::Pretty);
+    assert!(app.logs.display_line(0).starts_with("{\n"));
+
+    land_context(&mut app, "typo");
+    assert_eq!(app.logs.json, JsonView::Raw);
+    assert!(
+        app.config_warnings
+            .iter()
+            .any(|w| w.contains("json_view \"fancy\" is not one of raw, record, pretty")),
+        "{:?}",
+        app.config_warnings
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn json_view_config_names_match_the_j_cycle() {
+    let views = [JsonView::Raw, JsonView::Record, JsonView::Pretty];
+    assert_eq!(crate::config::JSON_VIEWS.len(), views.len());
+    for (name, view) in crate::config::JSON_VIEWS.iter().zip(views) {
+        assert_eq!(view.label(), *name);
+        assert_eq!(JsonView::from_config(name), view);
+        let cfg = crate::config::LogsConfig {
+            json_view: (*name).into(),
+            ..Default::default()
+        };
+        assert!(crate::config::logs_warnings(&cfg).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn log_json_shortcut_renders_structured_records_on_one_row() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    let lines = vec![
+        r#"[ns/pod:app] 2026-09-10T10:00:00Z {"level":"info","ts":1757498400.25,"logger":"ctrl","msg":"Reconciling","controller":"x"}"#.into(),
+        r#"{"time":"2026-09-10T10:00:00Z","level":"WARN","msg":"slow request","path":"/api v1","n":3}"#.into(),
+        r#"{"level":50,"time":1757498400000,"msg":"boom","err":{"type":"Error"}}"#.into(),
+        r#"{"record":1}"#.into(),
+        "plain text".into(),
+        r#"{"msg":"crash","level":"error"}"#.into(),
+        r#"{"msg":"panic\nat main.go:1","level":"error"}"#.into(),
+        r#"{"time":"2026\n[other] fake","level":"in\u001bfo","msg":"ok","k\ney":1}"#.into(),
+        r#"{"msg":"ok","flag":"true","count":"3","data":"{}","real":true,"name":"web"}"#.into(),
+        r#"{"lvl":"warn","msg":"stall"}"#.into(),
+        r#"[app] {"msg":"request error: connection refused"}"#.into(),
+    ];
+    shortcut_log_lines(&mut app, lines);
+    let raw = app.filtered_log_text();
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
+    assert_eq!(app.logs.json, JsonView::Record);
+    assert_eq!(app.flash, "JSON view: record");
+    assert_eq!(
+        app.logs.display_line(0),
+        "[ns/pod:app] 2025-09-10T10:00:00.25Z INFO  Reconciling controller=x logger=ctrl"
+    );
+    assert_eq!(
+        app.logs.display_line(1),
+        r#"2026-09-10T10:00:00Z WARN  slow request n=3 path="/api v1""#
+    );
+    assert_eq!(
+        app.logs.display_line(2),
+        r#"2025-09-10T10:00:00Z ERROR boom err={"type":"Error"}"#
+    );
+    assert_eq!(app.logs.display_line(3), app.logs.view.lines[3]);
+    assert_eq!(app.logs.display_line(4), "plain text");
+    assert_eq!(app.logs.display_line(5), "ERROR crash");
+    assert_eq!(app.logs.display_line(6), r#"ERROR "panic\nat main.go:1""#);
+    assert_eq!(
+        app.logs.display_line(7),
+        r#""2026\n[other] fake" "IN\u001bFO" ok "k\ney"=1"#
+    );
+    assert_eq!(
+        app.logs.display_line(8),
+        r#"ok count="3" data="{}" flag="true" name=web real=true"#
+    );
+    assert_eq!(app.logs.display_line(9), "WARN  stall");
+    assert_eq!(
+        app.logs.display_line(10),
+        "[app] request error: connection refused"
+    );
+    assert_eq!(app.logs.refresh_index(0).total_rows(), 11);
+    assert_eq!(app.filtered_log_text(), raw);
+
+    app.logs.set_filter(r#""controller":"x""#.into());
+    assert_eq!(app.logs.refresh_index(0).matched_lines(), 1);
+    app.logs.set_filter(String::new());
+
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert!(
+        app.logs
+            .display_line(0)
+            .starts_with("[ns/pod:app] 2026-09-10T10:00:00Z 2025-09-10T10:00:00.25Z INFO ")
+    );
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+
+    app.compact = true;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let color_of = |word: &str| {
+        (0..buffer.area.height)
+            .find_map(|y| {
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                row.find(word).map(|x| buffer[(x as u16, y)].fg)
+            })
+            .unwrap()
+    };
+    assert_eq!(color_of("crash"), crate::theme::red());
+    assert_eq!(color_of("boom"), crate::theme::red());
+    assert_eq!(color_of("stall"), crate::theme::peach());
+    assert_eq!(color_of("connection refused"), crate::theme::red());
+
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
+    assert_eq!(app.logs.json, JsonView::Pretty);
+    assert_eq!(app.flash, "JSON view: pretty");
+    assert!(app.logs.display_line(1).starts_with("{\n"));
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
+    assert_eq!(app.logs.json, JsonView::Raw);
+    assert_eq!(app.flash, "JSON view: raw");
+    assert_eq!(app.logs.display_line(1), app.logs.view.lines[1]);
+}
+
+#[tokio::test]
+async fn log_json_record_view_does_not_depend_on_the_pretty_cache() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    let line = r#"{"msg":"hi","a":{"b":[1,2,3]}}"#;
+    app.logs.json_budget = line.len() + 20;
+    shortcut_log_lines(&mut app, vec![line.into()]);
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
+    assert_eq!(app.logs.display_line(0), r#"hi a={"b":[1,2,3]}"#);
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
+    assert_eq!(app.logs.json, JsonView::Pretty);
+    assert_eq!(app.logs.display_line(0), line);
 }
 
 #[tokio::test]
@@ -37308,6 +38176,7 @@ async fn log_json_shortcut_formats_primitive_arrays_with_trailing_whitespace() {
         records.iter().map(|(raw, _)| (*raw).into()).collect(),
     );
     let raw_lines = app.logs.view.lines.clone();
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
     app.handle_key(press(KeyCode::Char('J'))).unwrap();
     for (i, (_, pretty)) in records.iter().enumerate() {
         assert_eq!(app.logs.display_line(i), *pretty);
@@ -37332,6 +38201,7 @@ async fn log_json_shortcut_keeps_scroll_follow_wrap_and_record_limits() {
             .map(|i| format!(r#"{{"record":{i},"message":"long message for wrapping"}}"#))
             .collect(),
     );
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
     app.handle_key(press(KeyCode::Char('J'))).unwrap();
     let mut terminal = Terminal::new(TestBackend::new(24, 12)).unwrap();
     for width in [24, 8] {
@@ -37364,7 +38234,7 @@ async fn log_json_shortcut_keeps_scroll_follow_wrap_and_record_limits() {
     shortcut_log_lines(&mut app, vec![large.clone()]);
     assert_eq!(app.logs.display_line(29), large);
     app.logs.clear_lines();
-    assert!(app.logs.json);
+    assert_eq!(app.logs.json, JsonView::Record);
     assert_eq!(app.logs.json_budget, logs::JSON_CACHE_LIMIT);
 }
 
@@ -37380,6 +38250,7 @@ async fn log_json_full_buffer_performance_and_cache_limits() {
             .collect(),
     );
     let start = std::time::Instant::now();
+    app.handle_key(press(KeyCode::Char('J'))).unwrap();
     app.handle_key(press(KeyCode::Char('J'))).unwrap();
     let toggle = start.elapsed();
     assert_eq!(app.logs.view.lines.len(), 100_000);
@@ -37754,4 +38625,261 @@ async fn httproute_paths_render_and_filter_through_keys() {
     let cache = app.table_cell_cache();
     let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
     assert_eq!(cells[2], "Prefix /api, Exact /health, Prefix /billing");
+}
+
+async fn explain_with(
+    plural: &str,
+    resource: serde_json::Value,
+    read_path: &str,
+    replies: Vec<(&str, serde_json::Value)>,
+) -> App {
+    let (mut app, rx) = test_app();
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    let (mut app, mut rx, responses, _) = health_report_app_with(app, rx, plural, resource.clone());
+    {
+        let mut responses = responses.lock().unwrap();
+        responses.insert(read_path.into(), (200, resource));
+        for (path, body) in replies {
+            responses.insert(path.into(), (200, body));
+        }
+    }
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    app
+}
+
+fn explain_texts(app: &App) -> Vec<String> {
+    app.explain_items.iter().map(|f| f.text.clone()).collect()
+}
+
+#[tokio::test]
+async fn explain_on_a_pending_claim_reads_its_class_and_the_pods_that_use_it() {
+    let pvc = json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "data", "namespace": "default", "uid": "pvc-uid"},
+        "spec": {"storageClassName": "local", "accessModes": ["ReadWriteOnce"]},
+        "status": {"phase": "Pending"}});
+    let pod = |name: &str, claim: &str| {
+        json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {"volumes": [{"name": "v", "persistentVolumeClaim": {"claimName": claim}}]},
+            "status": {"phase": "Pending", "conditions": [{"type": "PodScheduled",
+                "status": "False", "reason": "Unschedulable"}]}})
+    };
+    let app = explain_with(
+        "persistentvolumeclaims",
+        pvc,
+        "/api/v1/namespaces/default/persistentvolumeclaims/data",
+        vec![
+            (
+                "/apis/storage.k8s.io/v1/storageclasses",
+                json!({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClassList",
+                    "metadata": {}, "items": [{"metadata": {"name": "local"},
+                    "provisioner": "rancher.io/local-path",
+                    "volumeBindingMode": "WaitForFirstConsumer"}]}),
+            ),
+            (
+                "/api/v1/namespaces/default/pods",
+                json!({"apiVersion": "v1", "kind": "PodList", "metadata": {},
+                    "items": [pod("db-0", "data"), pod("other", "logs")]}),
+            ),
+        ],
+    )
+    .await;
+    let texts = explain_texts(&app);
+    assert_eq!(texts[0], "PersistentVolumeClaim/data is Pending");
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("pod that uses it to be scheduled"))
+    );
+    assert!(texts.iter().any(|t| t.starts_with("Pod/db-0")));
+    assert!(!texts.iter().any(|t| t.starts_with("Pod/other")));
+}
+
+#[tokio::test]
+async fn explain_on_a_cronjob_reads_the_jobs_it_owns() {
+    let cron = json!({"apiVersion": "batch/v1", "kind": "CronJob",
+        "metadata": {"name": "report", "namespace": "default", "uid": "cron-uid"},
+        "spec": {"schedule": "@hourly"}});
+    let job = |name: &str, owner: &str, created: &str| {
+        json!({"apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": name, "namespace": "default", "creationTimestamp": created,
+                "ownerReferences": [{"apiVersion": "batch/v1", "kind": "CronJob",
+                    "name": "x", "uid": owner}]},
+            "spec": {"selector": {"matchLabels": {"job-name": name}}},
+            "status": {"conditions": [{"type": "Failed", "status": "True",
+                "reason": "BackoffLimitExceeded"}]}})
+    };
+    let app = explain_with(
+        "cronjobs",
+        cron,
+        "/apis/batch/v1/namespaces/default/cronjobs/report",
+        vec![(
+            "/apis/batch/v1/namespaces/default/jobs",
+            json!({"apiVersion": "batch/v1", "kind": "JobList", "metadata": {},
+                "items": [job("report-1", "cron-uid", "2026-10-06T10:00:00Z"),
+                          job("unrelated", "other-uid", "2026-10-06T11:00:00Z")]}),
+        )],
+    )
+    .await;
+    let texts = explain_texts(&app);
+    assert_eq!(texts[0], "CronJob/report: the last run failed");
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("Job/report-1") && t.contains("BackoffLimitExceeded"))
+    );
+    assert!(!texts.iter().any(|t| t.contains("unrelated")));
+}
+
+#[tokio::test]
+async fn explain_on_a_node_lists_its_unhealthy_pods() {
+    let node = json!({"apiVersion": "v1", "kind": "Node",
+        "metadata": {"name": "worker", "uid": "node-uid"},
+        "spec": {"unschedulable": true},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]}});
+    let pod = |name: &str, node: &str| {
+        json!({"metadata": {"name": name, "namespace": "apps"}, "spec": {"nodeName": node},
+            "status": {"phase": "Running", "containerStatuses": [{"name": "app",
+                "ready": false, "restartCount": 4,
+                "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}})
+    };
+    let list = |pod: serde_json::Value| json!({"apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": [pod]});
+    let app = explain_with(
+        "nodes",
+        node,
+        "/api/v1/nodes/worker",
+        vec![
+            // Only a query scoped to this node gets this node's pods.
+            (
+                "/api/v1/pods?fieldSelector=spec.nodeName%3Dworker",
+                list(pod("crashy", "worker")),
+            ),
+            ("/api/v1/pods", list(pod("elsewhere", "other"))),
+        ],
+    )
+    .await;
+    let texts = explain_texts(&app);
+    assert_eq!(texts[0], "Node/worker is Ready");
+    assert!(
+        texts
+            .iter()
+            .any(|t| t == "cordoned: new pods are not scheduled here")
+    );
+    assert!(texts.iter().any(|t| t.starts_with("Pod/crashy")));
+    assert!(!texts.iter().any(|t| t.contains("elsewhere")));
+}
+
+#[tokio::test]
+async fn explain_on_a_job_ignores_pods_it_does_not_own() {
+    let job = json!({"apiVersion": "batch/v1", "kind": "Job",
+        "metadata": {"name": "migrate", "namespace": "default", "uid": "job-uid"},
+        "spec": {"manualSelector": true, "selector": {"matchLabels": {"app": "db"}}},
+        "status": {"active": 1}});
+    let pod = |name: &str, owner: &str| {
+        json!({"metadata": {"name": name, "namespace": "default",
+                "ownerReferences": [{"apiVersion": "batch/v1", "kind": "Job",
+                    "name": "x", "uid": owner}]},
+            "status": {"phase": "Running", "containerStatuses": [{"name": "app",
+                "ready": false, "restartCount": 0,
+                "state": {"waiting": {"reason": "ImagePullBackOff"}}}]}})
+    };
+    let app = explain_with(
+        "jobs",
+        job,
+        "/apis/batch/v1/namespaces/default/jobs/migrate",
+        vec![(
+            "/api/v1/namespaces/default/pods",
+            json!({"apiVersion": "v1", "kind": "PodList", "metadata": {},
+                "items": [pod("migrate-a", "job-uid"), pod("db-0", "sts-uid")]}),
+        )],
+    )
+    .await;
+    let texts = explain_texts(&app);
+    assert!(texts.iter().any(|t| t.starts_with("Pod/migrate-a")));
+    assert!(!texts.iter().any(|t| t.contains("db-0")));
+}
+
+#[test]
+fn events_without_a_uid_match_the_namespace_too() {
+    let pod = obj(json!({"metadata": {"name": "web", "namespace": "apps"}}));
+    let node = obj(json!({"metadata": {"name": "worker"}}));
+    let event = |ns: &str| {
+        obj(json!({"metadata": {"name": format!("e-{ns}")},
+            "involvedObject": {"kind": "Pod", "name": "web", "namespace": ns}}))
+    };
+    let all = [event("apps"), event("other")];
+    let kept = super::explain::filter_events(&all, &node, &[pod], false);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].metadata.name.as_deref(), Some("e-apps"));
+}
+
+#[tokio::test]
+async fn enter_on_a_cronjob_run_opens_that_job() {
+    let cron = json!({"apiVersion": "batch/v1", "kind": "CronJob",
+        "metadata": {"name": "report", "namespace": "default", "uid": "cron-uid"},
+        "spec": {"schedule": "@hourly"}});
+    let mut app = explain_with(
+        "cronjobs",
+        cron,
+        "/apis/batch/v1/namespaces/default/cronjobs/report",
+        vec![(
+            "/apis/batch/v1/namespaces/default/jobs",
+            json!({"apiVersion": "batch/v1", "kind": "JobList", "metadata": {},
+                "items": [{"metadata": {"name": "report-1", "namespace": "default",
+                    "creationTimestamp": "2026-10-06T10:00:00Z",
+                    "ownerReferences": [{"apiVersion": "batch/v1", "kind": "CronJob",
+                        "name": "report", "uid": "cron-uid"}]}}]}),
+        )],
+    )
+    .await;
+    let line = app
+        .explain_items
+        .iter()
+        .position(|f| f.text.starts_with("Job/report-1"))
+        .unwrap();
+    app.explain_state.select(Some(line));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "jobs");
+    assert_eq!(app.fields.as_deref(), Some("metadata.name=report-1"));
+}
+
+#[tokio::test]
+async fn explain_without_a_pods_kind_does_not_claim_a_claim_is_unused() {
+    let (mut app, rx) = test_app();
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    app.cluster.unregister_kind("", "Pod");
+    let pvc = json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "data", "namespace": "default", "uid": "pvc-uid"},
+        "spec": {"storageClassName": "local"}, "status": {"phase": "Pending"}});
+    let (mut app, mut rx, responses, _) =
+        health_report_app_with(app, rx, "persistentvolumeclaims", pvc.clone());
+    {
+        let mut responses = responses.lock().unwrap();
+        responses.insert(
+            "/api/v1/namespaces/default/persistentvolumeclaims/data".into(),
+            (200, pvc),
+        );
+        responses.insert(
+            "/apis/storage.k8s.io/v1/storageclasses".into(),
+            (
+                200,
+                json!({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClassList",
+                    "metadata": {}, "items": [{"metadata": {"name": "local"},
+                    "provisioner": "rancher.io/local-path",
+                    "volumeBindingMode": "WaitForFirstConsumer"}]}),
+            ),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    let texts = explain_texts(&app);
+    assert!(
+        texts.iter().any(|t| t.contains("pods could not be listed")),
+        "{texts:?}"
+    );
+    assert!(!texts.iter().any(|t| t.contains("and no pod does")));
 }
