@@ -102,6 +102,29 @@ pub fn input_arg(value: &str, inputs: &BTreeMap<String, String>) -> String {
         .unwrap_or_else(|| value.into())
 }
 
+/// Single pass over `value`, so text inserted for one token is never rescanned.
+/// Earlier entries win when one token is a prefix of another.
+pub fn replace_placeholders(value: &str, tokens: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        match tokens.iter().find(|(token, _)| rest.starts_with(token)) {
+            Some((token, replacement)) => {
+                out.push_str(replacement);
+                rest = &rest[token.len()..];
+            }
+            None => {
+                out.push('$');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn available(plugin: &Plugin) -> Result<(), String> {
     let missing: Vec<_> = plugin
         .requires
@@ -978,6 +1001,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replace_placeholders_does_not_rescan_inserted_values() {
+        let tokens = [
+            ("$NAMESPACE", "ns"),
+            ("$NS", "ns"),
+            ("$CONTEXT", "prod-$SKIN"),
+            ("$SKIN", "nord"),
+        ];
+        assert_eq!(replace_placeholders("$CONTEXT", &tokens), "prod-$SKIN");
+        assert_eq!(
+            replace_placeholders("$NAMESPACE/$NS/$FOO/$", &tokens),
+            "ns/ns/$FOO/$"
+        );
+    }
+
+    #[test]
     fn windows_executable_lookup_adds_a_suffix_only_when_needed() {
         let dir = std::env::temp_dir().join(format!("sofka-exe-lookup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1486,9 +1524,10 @@ default = "false"
 
     #[tokio::test]
     async fn capture_stops_chatty_processes_before_unbounded_allocation() {
-        let error = execute(job("/bin/sh", &["-c", "head -c 1100000 /dev/zero"]))
-            .await
-            .unwrap_err();
+        let error =
+            execute_with_activity(job("/bin/sh", &["-c", "head -c 1100000 /dev/zero"]), None)
+                .await
+                .unwrap_err();
         assert!(error.to_string().contains("exceeds 1 MiB"));
     }
 
@@ -1518,7 +1557,9 @@ default = "false"
         assert!(snapshot.lines.iter().map(String::len).sum::<usize>() <= 64 * 1024);
         for redirection in ["", ">&2"] {
             let script = format!("head -c 1048577 /dev/zero {redirection}");
-            let error = execute(job("/bin/sh", &["-c", &script])).await.unwrap_err();
+            let error = execute_with_activity(job("/bin/sh", &["-c", &script]), None)
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("exceeds 1 MiB"));
         }
     }
@@ -1558,7 +1599,7 @@ default = "false"
         command.directory = Some(dir.clone());
         command.request =
             Some(serde_json::json!({"schema_version":1,"object":{"metadata":{"name":"pod"}}}));
-        let output = execute(command).await.unwrap();
+        let output = execute_with_activity(command, None).await.unwrap();
         assert!(output.status.success());
         let text = String::from_utf8(output.stdout).unwrap();
         let (cwd, json) = text.split_once('\n').unwrap();
@@ -1583,10 +1624,13 @@ default = "false"
             remote: 80,
             local: None,
         });
-        let output = tokio::time::timeout(std::time::Duration::from_secs(3), execute(command))
-            .await
-            .unwrap()
-            .unwrap();
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            execute_with_activity(command, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(output.status.success());
         let request: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(request["forward"]["local_port"], 32123);
@@ -1602,7 +1646,7 @@ default = "false"
             remote: 443,
             local: Some(32124),
         });
-        let output = execute(command).await.unwrap();
+        let output = execute_with_activity(command, None).await.unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&output.stdout).unwrap()["forward"]["local_port"],
             32124
@@ -1625,9 +1669,12 @@ default = "false"
             ],
         );
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(150), execute(command))
-                .await
-                .is_err()
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                execute_with_activity(command, None)
+            )
+            .await
+            .is_err()
         );
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         assert!(!marker.exists(), "a descendant survived cancellation");

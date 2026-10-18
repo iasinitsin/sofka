@@ -474,8 +474,10 @@ async fn run_main(args: Args) -> Result<()> {
     app.hide_header = cfg.hide_header;
     app.compact = cfg.compact_mode;
     app.detail.wrap = cfg.detail_wrap;
+    app.rbac.rule_list = cfg.rbac_rule_list;
     app.terminal_title = cfg.terminal_title.unwrap_or(true);
     app.update_check = cfg.update_check.unwrap_or(true);
+    app.save_dir = cfg.save_dir.clone();
     app.load_cached_release(&sofka::update::cache_path());
     // The last namespace picked per context persists too, so a relaunch (or
     // a `:ctx` switch back) lands where you left off.
@@ -528,6 +530,7 @@ async fn run_main(args: Args) -> Result<()> {
     let (user_views, view_warnings) = views::compile(&cfg.views);
     for w in &view_warnings {
         eprintln!("warning: {w}");
+        config_warnings.push(w.clone());
     }
     app.user_views = user_views;
     let (thresholds, threshold_warnings) = thresholds::compile(&cfg.thresholds);
@@ -546,6 +549,13 @@ async fn run_main(args: Args) -> Result<()> {
         eprintln!("warning: {w}");
     }
     app.log_provider = log_provider;
+    let (log_link, link_warnings) = providers::compile_link(cfg.providers.logs.as_ref());
+    for w in &link_warnings {
+        eprintln!("warning: {w}");
+    }
+    config_warnings.extend(link_warnings);
+    app.log_link = log_link;
+    app.log_provider_configured = cfg.providers.logs.is_some();
     let (metrics_provider, metrics_warnings) =
         providers::compile_metrics(cfg.providers.metrics.as_ref());
     for w in &metrics_warnings {

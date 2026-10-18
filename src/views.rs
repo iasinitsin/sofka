@@ -199,15 +199,41 @@ pub const BUILTIN_DRILLS: &[&str] = &[
     "helmhistory",
     "helmreleases",
     "rollouthistory",
+    "ns-resources",
 ];
 
 /// The plural a view key names: the last segment of `apiVersion/plural`,
-/// `group/plural`, or a bare plural, without any `@namespace` suffix. A key
-/// that is a lowercased kind (`pod`) isn't a plural and won't match anything
-/// here.
+/// `group/plural`, or a bare plural, without any `:layout` or `@namespace`
+/// suffix. A key that is a lowercased kind (`pod`) isn't a plural and won't
+/// match anything here.
 pub(crate) fn key_plural(key: &str) -> &str {
     let last = key.rsplit('/').next().unwrap_or(key);
-    last.split('@').next().unwrap_or(last)
+    let last = last.split('@').next().unwrap_or(last);
+    last.split(':').next().unwrap_or(last)
+}
+
+/// The named layout a view key selects (`pods:images@prod` → `images`), if any.
+pub(crate) fn key_layout(key: &str) -> Option<&str> {
+    let base = key.split('@').next().unwrap_or(key);
+    base.split_once(':').map(|(_, layout)| layout)
+}
+
+/// Split a resource argument into the resource and the named layout it
+/// selects: `pods:images` → (`pods`, `images`).
+pub fn split_layout(resource: &str) -> (&str, Option<&str>) {
+    match resource.split_once(':') {
+        Some((resource, layout)) => (resource, Some(layout)),
+        None => (resource, None),
+    }
+}
+
+/// Layout names `-o` and `:layout` accept besides the configured ones.
+pub const RESERVED_LAYOUTS: &[&str] = &["default", "wide"];
+
+fn valid_layout_name(name: &str) -> bool {
+    !name.is_empty()
+        && !RESERVED_LAYOUTS.contains(&name.to_lowercase().as_str())
+        && !name.contains(|c: char| c.is_whitespace() || matches!(c, '@' | ':' | '/'))
 }
 
 /// The namespace a view key is qualified with (`pods@prod` → `prod`), if any.
@@ -305,6 +331,35 @@ pub fn compile(
     let mut views = HashMap::new();
     let mut warnings = Vec::new();
     for (key, cfg) in raw {
+        for field in cfg.unknown_fields.keys() {
+            warnings.push(format!("views.\"{key}\": unknown key '{field}' ignored"));
+        }
+        let resource = key.split_once('@').map_or(key.as_str(), |(r, _)| r);
+        let layout = resource.split_once(':').map(|(_, layout)| layout);
+        if let Some(layout) = layout
+            && !valid_layout_name(layout)
+        {
+            warnings.push(format!(
+                "views.\"{key}\": invalid layout name '{layout}' (must not be empty, \
+                 default, or wide, or contain spaces, '@', ':' or '/'); view ignored"
+            ));
+            continue;
+        }
+        if layout.is_some() {
+            for (field, set) in [
+                ("drill", cfg.drill.is_some()),
+                ("refs", !cfg.refs.is_empty()),
+                ("children", !cfg.children.is_empty()),
+                ("node", cfg.node.is_some()),
+            ] {
+                if set {
+                    warnings.push(format!(
+                        "views.\"{key}\": {field} is ignored on a named layout; \
+                         set it on the base view"
+                    ));
+                }
+            }
+        }
         if let Some((resource, namespace)) = key.split_once('@')
             && (resource.is_empty()
                 || namespace.is_empty()
@@ -321,8 +376,18 @@ pub fn compile(
             continue;
         }
         let mut columns = Vec::new();
-        for c in &cfg.columns {
+        for (i, c) in cfg.columns.iter().enumerate() {
             let header = c.name.trim().to_uppercase();
+            let label = if header.is_empty() {
+                format!("#{}", i + 1)
+            } else {
+                header.clone()
+            };
+            for field in c.unknown_fields.keys() {
+                warnings.push(format!(
+                    "views.\"{key}\": column {label}: unknown key '{field}' ignored"
+                ));
+            }
             if header.is_empty() {
                 warnings.push(format!("views.\"{key}\": column with empty name skipped"));
                 continue;
@@ -486,7 +551,12 @@ pub fn compile(
             .sort
             .as_deref()
             .and_then(|s| parse_sort(key, s, &mut warnings));
-        let node = match cfg.node.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        let node = match cfg
+            .node
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| layout.is_none() && !p.is_empty())
+        {
             Some(pointer) if pointer.starts_with('/') => Some(pointer.to_string()),
             Some(pointer) => {
                 warnings.push(format!(
@@ -497,52 +567,62 @@ pub fn compile(
             }
             None => None,
         };
-        let drill = cfg.drill.as_ref().and_then(|d| {
-            let key_lc = key
-                .split_once('@')
-                .map_or(key.as_str(), |(resource, _)| resource)
-                .to_lowercase();
-            let plural = key_plural(&key_lc);
-            let rbac_plural = matches!(
-                plural,
-                "roles" | "clusterroles" | "rolebindings" | "clusterrolebindings"
-            );
-            let rbac_group = key_lc
-                .split_once('/')
-                .is_none_or(|(group, _)| group == "rbac.authorization.k8s.io");
-            if BUILTIN_DRILLS.contains(&plural) && (!rbac_plural || rbac_group) {
-                warnings.push(format!(
-                    "views.\"{key}\": drill is ignored — `enter` on {plural} has a \
-                     built-in drill-down that config doesn't replace"
-                ));
-                return None;
-            }
-            let kind = d.kind.trim();
-            if kind.is_empty() {
-                warnings.push(format!("views.\"{key}\": drill.kind is empty; ignored"));
-                return None;
-            }
-            let labels = d.labels.as_deref().map(str::trim).filter(|l| !l.is_empty());
-            let fields = d.fields.as_deref().map(str::trim).filter(|f| !f.is_empty());
-            for (what, template) in [("labels", labels), ("fields", fields)] {
-                let unknown = template.map(unknown_placeholders).unwrap_or_default();
-                if !unknown.is_empty() {
+        let drill = cfg
+            .drill
+            .as_ref()
+            .filter(|_| layout.is_none())
+            .and_then(|d| {
+                let key_lc = key
+                    .split_once('@')
+                    .map_or(key.as_str(), |(resource, _)| resource)
+                    .to_lowercase();
+                let plural = key_plural(&key_lc);
+                let rbac_plural = matches!(
+                    plural,
+                    "roles" | "clusterroles" | "rolebindings" | "clusterrolebindings"
+                );
+                let rbac_group = key_lc
+                    .split_once('/')
+                    .is_none_or(|(group, _)| group == "rbac.authorization.k8s.io");
+                // `ns-resources` is a synthetic core view (`v1`); a custom
+                // resource sharing its plural is configured by its group.
+                let synthetic = plural != "ns-resources"
+                    || key_lc
+                        .split_once('/')
+                        .is_none_or(|(prefix, _)| prefix == "v1");
+                if BUILTIN_DRILLS.contains(&plural) && (!rbac_plural || rbac_group) && synthetic {
                     warnings.push(format!(
-                        "views.\"{key}\": drill.{what} has unknown placeholder(s) {} \
-                         (only {{name}} and {{namespace}}); ignored",
-                        unknown.join(", ")
+                        "views.\"{key}\": drill is ignored — `enter` on {plural} has a \
+                     built-in drill-down that config doesn't replace"
                     ));
                     return None;
                 }
-            }
-            Some(Drill {
-                kind: kind.to_string(),
-                labels: labels.map(str::to_string),
-                fields: fields.map(str::to_string),
-            })
-        });
+                let kind = d.kind.trim();
+                if kind.is_empty() {
+                    warnings.push(format!("views.\"{key}\": drill.kind is empty; ignored"));
+                    return None;
+                }
+                let labels = d.labels.as_deref().map(str::trim).filter(|l| !l.is_empty());
+                let fields = d.fields.as_deref().map(str::trim).filter(|f| !f.is_empty());
+                for (what, template) in [("labels", labels), ("fields", fields)] {
+                    let unknown = template.map(unknown_placeholders).unwrap_or_default();
+                    if !unknown.is_empty() {
+                        warnings.push(format!(
+                            "views.\"{key}\": drill.{what} has unknown placeholder(s) {} \
+                         (only {{name}} and {{namespace}}); ignored",
+                            unknown.join(", ")
+                        ));
+                        return None;
+                    }
+                }
+                Some(Drill {
+                    kind: kind.to_string(),
+                    labels: labels.map(str::to_string),
+                    fields: fields.map(str::to_string),
+                })
+            });
         let mut refs = Vec::new();
-        for (index, r) in cfg.refs.iter().enumerate() {
+        for (index, r) in cfg.refs.iter().enumerate().filter(|_| layout.is_none()) {
             let path = r.path.trim();
             let kind = r.kind.trim();
             let kind_path = r
@@ -653,6 +733,7 @@ pub fn compile(
         let children = cfg
             .children
             .iter()
+            .filter(|_| layout.is_none())
             .map(|c| c.trim().to_lowercase())
             .filter(|c| !c.is_empty())
             .collect();
@@ -759,6 +840,49 @@ pub fn lookup<'a>(
     lookup_keys(ar, namespace)
         .into_iter()
         .find_map(|k| views.get(&k))
+}
+
+/// Find the view for a resource in a named layout: `key:layout@namespace`
+/// for every key form, then `key:layout`. Without a layout, or when the kind
+/// has no such layout, the default view from [`lookup`]. Only its columns,
+/// `replace`, and `sort` are read; [`drill_for`], [`node_pointer`], and the
+/// adjacent rules resolve from [`lookup_keys`], which never names a layout.
+pub fn lookup_layout<'a>(
+    views: &'a HashMap<String, View>,
+    ar: &ApiResource,
+    namespace: Option<&str>,
+    layout: Option<&str>,
+) -> Option<&'a View> {
+    let Some(layout) = layout else {
+        return lookup(views, ar, namespace);
+    };
+    let keys = lookup_keys(ar, None);
+    let qualified = namespace
+        .filter(|ns| !ns.is_empty())
+        .into_iter()
+        .flat_map(|ns| keys.iter().map(move |key| format!("{key}:{layout}@{ns}")));
+    let plain = keys.iter().map(|key| format!("{key}:{layout}"));
+    qualified
+        .chain(plain)
+        .find_map(|k| views.get(&k))
+        .or_else(|| lookup(views, ar, namespace))
+}
+
+/// The named layouts configured for a resource in any namespace, sorted.
+pub fn layouts_for(views: &HashMap<String, View>, ar: &ApiResource) -> Vec<String> {
+    let keys = lookup_keys(ar, None);
+    let mut names: Vec<String> = views
+        .keys()
+        .filter_map(|key| {
+            let layout = key_layout(key)?;
+            let base = key.split_once('@').map_or(key.as_str(), |(base, _)| base);
+            let base = base.strip_suffix(layout)?.strip_suffix(':')?;
+            keys.iter().any(|k| k == base).then(|| layout.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Resolve a JSON Pointer against the object as served by the API:
@@ -1552,6 +1676,56 @@ mod tests {
     }
 
     #[test]
+    fn unknown_view_and_column_keys_warn() {
+        let (views, warnings) = compile_toml(
+            r#"
+            [views."v1/pods"]
+            columns = [{ name = "NODE", path = "/spec/nodeName", fromat = "image-tag" }]
+
+            [views."v1/pods".images]
+            replace = true
+            "#,
+        );
+        assert_eq!(views["v1/pods"].columns.len(), 1);
+        assert_eq!(
+            warnings,
+            [
+                "views.\"v1/pods\": unknown key 'images' ignored",
+                "views.\"v1/pods\": column NODE: unknown key 'fromat' ignored",
+            ]
+        );
+
+        let cfg: crate::config::Config = serde_yaml::from_str(
+            "views:\n  pods:\n    colums: []\n    columns:\n      - name: NODE\n        path: /spec/nodeName\n        width: 12\n",
+        )
+        .unwrap();
+        let (views, warnings) = compile(&cfg.views);
+        assert_eq!(views["pods"].columns.len(), 1);
+        assert_eq!(warnings, ["views.\"pods\": unknown key 'colums' ignored"]);
+    }
+
+    #[test]
+    fn misspelled_column_name_key_is_reported_by_position() {
+        let (views, warnings) = compile_toml(
+            r#"
+            [views.pods]
+            columns = [
+                { name = "NODE", path = "/spec/nodeName" },
+                { naem = "IP", path = "/status/podIP" },
+            ]
+            "#,
+        );
+        assert_eq!(views["pods"].columns.len(), 1);
+        assert_eq!(
+            warnings,
+            [
+                "views.\"pods\": column #2: unknown key 'naem' ignored",
+                "views.\"pods\": column with empty name skipped",
+            ]
+        );
+    }
+
+    #[test]
     fn default_replaces_missing_and_null_values() {
         let (views, warnings) = compile_toml(
             r#"
@@ -1784,6 +1958,131 @@ mod tests {
     }
 
     #[test]
+    fn named_layouts_compile_without_kind_settings() {
+        let (views, warnings) = compile_toml(
+            r#"
+            [views."pods:images"]
+            replace = true
+            sort = "IMAGE:desc"
+            node = "/spec/nodeName"
+            children = ["configmaps"]
+            columns = [{ name = "IMAGE", path = "/spec/containers/0/image" }]
+            [views."pods:images".drill]
+            kind = "secrets"
+
+            [views."pods:images@matlab"]
+            columns = [{ name = "IMAGE", path = "/spec/containers/0/image" }]
+
+            [views."pods:default"]
+            columns = [{ name = "X", path = "/x" }]
+            [views."pods:wide"]
+            columns = [{ name = "X", path = "/x" }]
+            [views."pods:"]
+            columns = [{ name = "X", path = "/x" }]
+            [views."pods:a b"]
+            columns = [{ name = "X", path = "/x" }]
+            [views."pods:a:b"]
+            columns = [{ name = "X", path = "/x" }]
+            [views."pods:Default"]
+            columns = [{ name = "X", path = "/x" }]
+            [views."pods:WIDE"]
+            columns = [{ name = "X", path = "/x" }]
+            [views."pods:images/tags"]
+            columns = [{ name = "X", path = "/x" }]
+            "#,
+        );
+        let view = &views["pods:images"];
+        assert!(view.replace);
+        assert_eq!(view.sort, Some(("IMAGE".into(), true)));
+        assert_eq!(view.columns.len(), 1);
+        assert!(view.node.is_none() && view.drill.is_none() && view.children.is_empty());
+        for field in ["drill", "children", "node"] {
+            assert!(
+                warnings.iter().any(|w| w
+                    == &format!(
+                        "views.\"pods:images\": {field} is ignored on a named layout; set it on the base view"
+                    )),
+                "{field}: {warnings:?}"
+            );
+        }
+        assert!(views.contains_key("pods:images@matlab"));
+        for key in [
+            "pods:default",
+            "pods:wide",
+            "pods:",
+            "pods:a b",
+            "pods:a:b",
+            "pods:Default",
+            "pods:WIDE",
+            "pods:images/tags",
+        ] {
+            assert!(!views.contains_key(key), "{key}");
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with(&format!("views.\"{key}\": invalid layout name"))),
+                "{key}: {warnings:?}"
+            );
+        }
+        assert_eq!(warnings.len(), 11, "{warnings:?}");
+    }
+
+    #[test]
+    fn named_layout_lookup_tries_namespace_then_plain_then_default() {
+        let ar = ApiResource {
+            group: "".into(),
+            version: "v1".into(),
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            plural: "pods".into(),
+        };
+        let view = |label: &str| View {
+            sort: Some((label.to_string(), false)),
+            ..Default::default()
+        };
+        let mut views: HashMap<String, View> = [
+            "v1/pods",
+            "pods:images",
+            "pod:images@matlab",
+            "v1/pods:images@other",
+            "pods:slim@matlab",
+            "deployments:apps",
+        ]
+        .into_iter()
+        .map(|key| (key.to_string(), view(key)))
+        .collect();
+        let found = |views: &HashMap<String, View>, ns: Option<&str>, layout: Option<&str>| {
+            lookup_layout(views, &ar, ns, layout)
+                .and_then(|v| v.sort.clone())
+                .map(|(key, _)| key)
+        };
+        assert_eq!(
+            found(&views, Some("matlab"), Some("images")).as_deref(),
+            Some("pod:images@matlab")
+        );
+        assert_eq!(
+            found(&views, Some("dev"), Some("images")).as_deref(),
+            Some("pods:images")
+        );
+        assert_eq!(
+            found(&views, None, Some("images")).as_deref(),
+            Some("pods:images")
+        );
+        assert_eq!(
+            found(&views, None, Some("slim")).as_deref(),
+            Some("v1/pods")
+        );
+        assert_eq!(found(&views, None, None).as_deref(), Some("v1/pods"));
+        assert_eq!(layouts_for(&views, &ar), ["images", "slim"]);
+        views.remove("pods:slim@matlab");
+        assert_eq!(layouts_for(&views, &ar), ["images"]);
+        assert_eq!(key_plural("v1/pods:images@matlab"), "pods");
+        assert_eq!(key_layout("v1/pods:images@matlab"), Some("images"));
+        assert_eq!(key_layout("v1/pods@matlab"), None);
+        assert_eq!(key_namespace("pods:images@matlab"), Some("matlab"));
+    }
+
+    #[test]
     fn namespace_view_keys_use_two_precedence_groups() {
         let ar = ApiResource {
             group: "example.com".into(),
@@ -1876,6 +2175,19 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("drill is ignored"))
         );
+    }
+
+    #[test]
+    fn ns_resources_drill_is_builtin_only_for_the_synthetic_view() {
+        let ignored = |key: &str| {
+            let (_, warnings) = compile_toml(&format!(
+                "[views.\"{key}\"]\ndrill = {{ kind = \"secrets\" }}\n"
+            ));
+            warnings.iter().any(|w| w.contains("drill is ignored"))
+        };
+        assert!(ignored("ns-resources"));
+        assert!(ignored("v1/ns-resources"));
+        assert!(!ignored("example.com/ns-resources"));
     }
 
     #[test]

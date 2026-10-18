@@ -36,13 +36,19 @@ impl RenderCell<'_> {
         self
     }
 
-    fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer, row: Style, selected: bool) {
+    fn render(
+        &self,
+        area: Rect,
+        buf: &mut ratatui::buffer::Buffer,
+        row: Style,
+        selected: Option<Style>,
+    ) {
         use ratatui::widgets::Widget;
         buf.set_style(area, row);
         buf.set_style(area, self.style);
         (&self.content).render(area, buf);
-        if selected {
-            buf.set_style(area, theme::selected_row());
+        if let Some(selected) = selected {
+            buf.set_style(area, selected);
         }
     }
 }
@@ -386,6 +392,8 @@ fn draw_base(frame: &mut Frame, app: &mut App) {
         Mode::Fleet => draw_fleet(frame, app, chunks[1]),
         Mode::Find => draw_find(frame, app, chunks[1]),
         Mode::PvcExplore => draw_pvc_explore(frame, app, chunks[1]),
+        Mode::Dir => draw_dir(frame, app, chunks[1]),
+        Mode::Confirm | Mode::Prompt if app.over_dir_browser() => draw_dir(frame, app, chunks[1]),
         // A transfer confirmation or a guardrail prompt raised from the PVC
         // browser keeps the two panes underneath it, so you can still see what
         // is being copied where. Only that dialog: drawing an unrelated one
@@ -445,6 +453,7 @@ fn draw_base(frame: &mut Frame, app: &mut App) {
             Mode::Fleet => draw_fleet(frame, app, chunks[1]),
             Mode::Find => draw_find(frame, app, chunks[1]),
             Mode::PvcExplore => draw_pvc_explore(frame, app, chunks[1]),
+            Mode::Dir => draw_dir(frame, app, chunks[1]),
             Mode::Containers => {
                 draw_table(frame, app, chunks[1]);
                 draw_containers(frame, app, chunks[1]);
@@ -570,6 +579,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         app.namespace_label()
     };
     let mut kind = app.resource_title();
+    if let Some(layout) = app.active_layout() {
+        kind = format!("{kind}:{layout}");
+    }
     if let Some(scope) = &app.scope_label {
         kind = format!("{kind}  ‹ {scope}");
     }
@@ -649,27 +661,27 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         // the right-aligned block stays coherent.
         let logo = vec![
             Line::from(Span::styled(
-                "  /\\        /\\ ",
+                "  /\\       /\\  ",
                 Style::default().fg(theme::overlay1()),
             )),
             Line::from(Span::styled(
-                " /  \\______/  \\",
+                " /  \\_____/  \\ ",
                 Style::default().fg(theme::overlay1()),
             )),
             Line::from(Span::styled(
-                "( -        -  )",
+                "(  -       -  )",
                 Style::default().fg(theme::green()),
             )),
             Line::from(Span::styled(
-                " \\     ᴥ      /",
+                " \\     ᴥ     / ",
                 Style::default().fg(theme::maroon()),
             )),
             Line::from(Span::styled(
-                "  \\    \\__/   /",
+                "  \\   \\_/   /  ",
                 Style::default().fg(theme::overlay1()),
             )),
             Line::from(Span::styled(
-                "   '--------'  ",
+                "   '-------'   ",
                 Style::default().fg(theme::overlay1()),
             )),
             Line::from(Span::styled(format!("   sofka v{VERSION}"), theme::dim())),
@@ -726,6 +738,9 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
         app.namespace_label()
     };
     let mut kind = app.resource_title();
+    if let Some(layout) = app.active_layout() {
+        kind = format!("{kind}:{layout}");
+    }
     if let Some(scope) = &app.scope_label {
         kind = format!("{kind} ‹ {scope}");
     }
@@ -772,6 +787,8 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
         ("● refresh", theme::sky())
     } else if app.resource_refresh_available() {
         ("○ stopped", theme::overlay1())
+    } else if app.ns_resources_active() && app.mode == Mode::Table && app.store.synced {
+        ("○ snapshot", theme::overlay1())
     } else {
         sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
     };
@@ -1029,6 +1046,17 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
                 ],
             ),
             hint_line(app, &[(Action::Delete, "delete")]),
+        ],
+        "certificatesigningrequests" => vec![
+            hint_line(
+                app,
+                &[
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                    (Action::Approve, "approve"),
+                ],
+            ),
+            hint_line(app, &[(Action::Deny, "deny"), (Action::Delete, "delete")]),
         ],
         "namespaces" => vec![
             hint_line(
@@ -1426,11 +1454,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let now = crate::columns::now_secs();
     app.ensure_table_cell_cache_at(&visible_objects, now);
     let cell_cache = app.table_cell_cache();
+    // Decided once per frame so an unfiltered table never asks per cell.
+    let highlight = app.filter_highlights();
 
     let rows: Vec<Vec<RenderCell>> = visible_objects
         .iter()
         .map(|obj| {
-            let row_key = crate::store::row_key(obj);
+            let row_key = app.key_of(obj);
             let marked_row = !app.marked.is_empty() && app.marked.contains(&row_key);
             let pf_ns = obj.metadata.namespace.as_deref().unwrap_or_default();
             let pf_name = obj.metadata.name.as_deref().unwrap_or_default();
@@ -1462,7 +1492,8 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             // blue), but a handful of columns keep their own visibility
             // treatment on top: STATUS gets a semantic badge, RESTARTS/CPU/MEM
             // flag outliers, AGE is dimmed (rarely the interesting signal),
-            // and NAME highlights the active text filter's matched chars.
+            // and every text cell highlights the active text filter's matched
+            // chars on top of its own style.
             let status_val = style_idx
                 .and_then(|i| cells.get(i))
                 .map(TableCellText::as_str)
@@ -1487,27 +1518,27 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 .enumerate()
                 .map(|(i, c)| {
                     let align = align_of(i);
-                    if marked_row {
-                        if i == name_col {
-                            render_name_cell(app, c.as_str(), theme::mark(), forwarded).style(
+                    if i == name_col && (marked_row || Some(i) != style_idx) {
+                        let base = if marked_row { theme::mark() } else { row_color };
+                        let cell = render_name_cell(app, c.as_str(), base, forwarded);
+                        return if marked_row {
+                            cell.style(
                                 Style::default()
                                     .fg(theme::mark())
                                     .add_modifier(Modifier::BOLD),
                             )
                         } else {
-                            c.into_cell_aligned(align).style(
-                                Style::default()
-                                    .fg(theme::mark())
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                        }
+                            cell
+                        };
+                    }
+                    let style = if marked_row {
+                        Style::default()
+                            .fg(theme::mark())
+                            .add_modifier(Modifier::BOLD)
                     } else if Some(i) == style_idx {
-                        c.into_cell_aligned(align)
-                            .style(Style::default().fg(status_badge))
-                    } else if i == name_col {
-                        render_name_cell(app, c.as_str(), row_color, forwarded)
+                        Style::default().fg(status_badge)
                     } else if Some(i) == age_idx {
-                        c.into_cell_aligned(align).style(theme::dim())
+                        theme::dim()
                     } else if Some(i) == restarts_idx {
                         let n: i64 = c.as_str().trim().parse().unwrap_or(0);
                         let color = thresholds
@@ -1515,7 +1546,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                             .severity(n)
                             .map(theme::severity_fg)
                             .unwrap_or(row_color);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
+                        Style::default().fg(color)
                     } else if let Some(metric) = metric_columns[i] {
                         let value = app.metric_value(obj, metric);
                         let color = if metric.percentage() {
@@ -1533,11 +1564,19 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                                 .map(theme::severity_fg)
                                 .unwrap_or(row_color)
                         };
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
+                        Style::default().fg(color)
                     } else {
-                        c.into_cell_aligned(align)
-                            .style(Style::default().fg(row_color))
+                        Style::default().fg(row_color)
+                    };
+                    let matched = highlight
+                        .then(|| app.filter_match_indices(c.as_str()))
+                        .flatten()
+                        .filter(|idx| !idx.is_empty());
+                    match matched {
+                        Some(idx) => highlighted_cell(c.as_str(), &idx, align),
+                        None => c.into_cell_aligned(align),
                     }
+                    .style(style)
                 })
                 .collect();
             render_cells
@@ -1582,6 +1621,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let render_selected = selected
         .filter(|_| count > 0)
         .map(|i| i.saturating_sub(offset));
+    let selected_marked = render_selected
+        .and_then(|i| visible_objects.get(i))
+        .is_some_and(|obj| app.marked.contains(&app.key_of(obj)));
     app.record_table_hit(
         inner.y,
         inner.y.saturating_add(1),
@@ -1610,6 +1652,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             viewport,
             offset: col_offset,
             selected: render_selected,
+            selected_marked,
         },
         inner,
     );
@@ -1706,6 +1749,7 @@ struct ScrollingTable<'a> {
     viewport: TableViewport,
     offset: usize,
     selected: Option<usize>,
+    selected_marked: bool,
 }
 
 impl ratatui::widgets::Widget for ScrollingTable<'_> {
@@ -1718,6 +1762,11 @@ impl ratatui::widgets::Widget for ScrollingTable<'_> {
             .unwrap_or(0);
         // Reuse one row of storage. Long values do not allocate a full table.
         let mut source = ratatui::buffer::Buffer::empty(Rect::new(0, 0, max_width, 1));
+        let selected_style = if self.selected_marked {
+            theme::selected_marked_row()
+        } else {
+            theme::selected_row()
+        };
         for (y, cells) in std::iter::once(self.header)
             .chain(self.rows)
             .take(usize::from(area.height))
@@ -1728,7 +1777,7 @@ impl ratatui::widgets::Widget for ScrollingTable<'_> {
             let style = if y == 0 {
                 theme::header_row()
             } else if selected {
-                theme::selected_row()
+                selected_style
             } else {
                 Style::default()
             };
@@ -1742,7 +1791,12 @@ impl ratatui::widgets::Widget for ScrollingTable<'_> {
                     source.set_style(source.area, Style::default().bg(bg));
                 }
                 let cell_area = Rect::new(0, 0, self.widths[index], 1);
-                cells[index].render(cell_area, &mut source, style, selected);
+                cells[index].render(
+                    cell_area,
+                    &mut source,
+                    style,
+                    selected.then_some(selected_style),
+                );
                 let source_end = source_start + (end - start);
                 let mut x = 0;
                 while x < source_end {
@@ -1907,17 +1961,40 @@ fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Rend
         spans.push(Span::styled(name.to_string(), Style::default().fg(base)));
         return RenderCell::from(Line::from(spans));
     };
-    let matched: std::collections::HashSet<usize> = matched.iter().copied().collect();
-    let plain = Style::default().fg(base);
+    let mut spans = marker;
+    push_match_spans(&mut spans, name, &matched, Style::default().fg(base));
+    RenderCell::from(Line::from(spans))
+}
+
+/// A non-NAME table cell with the active row filter's matched characters
+/// highlighted. Unmatched characters carry no style of their own, so the
+/// column's style set on the cell (STATUS badge, outlier colors, dimmed AGE,
+/// row tint) still shows through, and the highlight is layered on top.
+fn highlighted_cell(
+    text: &str,
+    matched: &[usize],
+    align: Option<Alignment>,
+) -> RenderCell<'static> {
+    let mut spans = Vec::new();
+    push_match_spans(&mut spans, text, matched, Style::default());
+    let line = Line::from(spans);
+    match align {
+        Some(align) => RenderCell::from(Text::from(line).alignment(align)),
+        None => RenderCell::from(line),
+    }
+}
+
+/// Append `text` to `spans` in runs, styling the chars at `matched` (ascending
+/// char positions) bold yellow and the rest `plain`.
+fn push_match_spans(spans: &mut Vec<Span<'static>>, text: &str, matched: &[usize], plain: Style) {
     let hl = Style::default()
         .fg(theme::yellow())
         .add_modifier(Modifier::BOLD);
-
-    let mut spans = marker;
+    let mut next = matched.iter().copied().peekable();
     let mut run = String::new();
     let mut run_matched = false;
-    for (i, ch) in name.chars().enumerate() {
-        let is_match = matched.contains(&i);
+    for (i, ch) in text.chars().enumerate() {
+        let is_match = next.next_if_eq(&i).is_some();
         if !run.is_empty() && is_match != run_matched {
             spans.push(Span::styled(
                 std::mem::take(&mut run),
@@ -1930,7 +2007,6 @@ fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Rend
     if !run.is_empty() {
         spans.push(Span::styled(run, if run_matched { hl } else { plain }));
     }
-    RenderCell::from(Line::from(spans))
 }
 
 fn draw_scrollable(
@@ -2080,17 +2156,23 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
                 continue;
             };
             let l = app.logs.display_line(buf_idx);
-            let record_color = app.logs.record_severity(buf_idx).map(severity_color);
+            let severity = app.logs.record_severity(buf_idx);
+            let record = app.logs.record_parts(buf_idx).zip(severity);
             let mut offset = 0;
             for part in l.split('\n') {
                 if row + offset >= scroll + inner_h {
                     break;
                 }
-                let line = render_log_line_in(
-                    part,
-                    highlight,
-                    record_color.unwrap_or_else(|| log_level_color(part)),
-                );
+                let line = match record {
+                    Some(((body, parts), severity)) if part.len() == l.len() => {
+                        render_record_line(part, body, parts, highlight, severity)
+                    }
+                    _ => render_log_line_in(
+                        part,
+                        highlight,
+                        severity.map_or_else(|| log_level_color(part), severity_color),
+                    ),
+                };
                 let parts = if wrap {
                     wrap_line(line, inner_w)
                 } else {
@@ -2289,6 +2371,122 @@ fn render_log_line_in(line: &str, needle: &str, base: Color) -> Line<'static> {
     Line::from(spans)
 }
 
+/// A record view row: the source and timestamp prefixes as on raw lines, then
+/// each part of the record in its kind's style. WARN and ERROR rows tint the
+/// message, logger and values; the structure (time, keys, separator) stays
+/// dim. Search matches are highlighted across part boundaries, so `n=3`
+/// matches a key and its value.
+fn render_record_line(
+    line: &str,
+    body: usize,
+    parts: &[crate::app::RecordSpan],
+    needle: &str,
+    severity: crate::logfilter::Severity,
+) -> Line<'static> {
+    use crate::app::RecordPart;
+    let mut styled = Vec::with_capacity(parts.len() + 2);
+    let prefix = &line[..body.min(line.len())];
+    let mut start = 0;
+    if let Some((end, color)) = source_prefix(prefix) {
+        styled.push((
+            0..end,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+        start = end;
+    }
+    if let Some(len) = leading_timestamp(&prefix[start..]) {
+        styled.push((start..start + len, theme::dim()));
+    }
+    let tint = match severity {
+        crate::logfilter::Severity::Error => Some(theme::red()),
+        crate::logfilter::Severity::Warning => Some(theme::peach()),
+        _ => None,
+    };
+    let fg = |color: Color| Style::default().fg(tint.unwrap_or(color));
+    for (range, kind) in parts {
+        let range = body + range.start..body + range.end;
+        let Some(text) = line.get(range.clone()) else {
+            continue;
+        };
+        let style = match kind {
+            RecordPart::Time | RecordPart::Separator | RecordPart::Key | RecordPart::Null => {
+                theme::dim()
+            }
+            RecordPart::Level => record_level_style(text),
+            RecordPart::Logger => fg(theme::teal()),
+            RecordPart::Message => fg(theme::text()).add_modifier(Modifier::BOLD),
+            RecordPart::Text | RecordPart::Json => fg(theme::text()),
+            RecordPart::Quoted => fg(theme::green()),
+            RecordPart::Number => fg(theme::peach()),
+            RecordPart::Bool => fg(theme::mauve()),
+        };
+        styled.push((range, style));
+    }
+    Line::from(styled_spans(line, &styled, needle))
+}
+
+/// The level token in its own color: ERROR red, WARN peach, INFO green, DEBUG
+/// blue and TRACE dim.
+fn record_level_style(level: &str) -> Style {
+    let level = level.to_ascii_lowercase();
+    let color = match crate::logfilter::parse_level(&level) {
+        crate::logfilter::Severity::Error => theme::red(),
+        crate::logfilter::Severity::Warning => theme::peach(),
+        crate::logfilter::Severity::Debug if level.starts_with("trace") => theme::overlay1(),
+        crate::logfilter::Severity::Debug => theme::blue(),
+        crate::logfilter::Severity::Other if level.starts_with("info") => theme::green(),
+        crate::logfilter::Severity::Other => theme::text(),
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+/// Spans for `text` from sorted, non-overlapping styled byte ranges; the gaps
+/// between them use the default text color. Case-insensitive matches of
+/// `needle` are highlighted on top, even where they cross a range boundary.
+fn styled_spans(
+    text: &str,
+    styled: &[(std::ops::Range<usize>, Style)],
+    needle: &str,
+) -> Vec<Span<'static>> {
+    let plain = Style::default().fg(theme::text());
+    let mut runs = Vec::with_capacity(styled.len() * 2 + 1);
+    let mut at = 0;
+    for (range, style) in styled {
+        if range.start < at || range.end > text.len() {
+            continue;
+        }
+        if range.start > at {
+            runs.push((at..range.start, plain));
+        }
+        runs.push((range.clone(), *style));
+        at = range.end;
+    }
+    if at < text.len() {
+        runs.push((at..text.len(), plain));
+    }
+    let matches = match_ranges(text, needle);
+    let hl = Style::default()
+        .bg(theme::yellow())
+        .fg(theme::crust())
+        .add_modifier(Modifier::BOLD);
+    let mut spans = Vec::with_capacity(runs.len() + matches.len() * 2);
+    let mut matches = matches.into_iter().peekable();
+    for (range, style) in runs {
+        let mut at = range.start;
+        while at < range.end {
+            while matches.next_if(|m| m.end <= at).is_some() {}
+            let (end, style) = match matches.peek() {
+                Some(m) if m.start <= at => (m.end.min(range.end), hl),
+                Some(m) => (m.start.min(range.end), style),
+                None => (range.end, style),
+            };
+            spans.push(Span::styled(text[at..end].to_string(), style));
+            at = end;
+        }
+    }
+    spans
+}
+
 #[cfg(test)]
 fn render_log_line(line: &str, needle: &str) -> Line<'static> {
     render_log_line_in(line, needle, log_level_color(line))
@@ -2418,25 +2616,12 @@ fn push_highlighted(spans: &mut Vec<Span<'static>>, text: &str, needle: &str, ba
         }
         return;
     }
-    // Lowercasing is not always length-preserving (e.g. Turkish İ, German ß),
-    // so match on the same string we slice to keep byte offsets valid and avoid
-    // panicking on a non-char-boundary index for multi-byte log lines.
-    let hay = text.to_lowercase();
-    let pat = needle.to_lowercase();
-    if text.len() != hay.len() {
-        // Offsets from `hay` wouldn't be valid in `text`; skip highlighting
-        // rather than risk slicing mid-character.
-        spans.push(Span::styled(text.to_string(), base));
-        return;
-    }
     let hl = Style::default()
         .bg(theme::yellow())
         .fg(theme::crust())
         .add_modifier(Modifier::BOLD);
     let mut idx = 0;
-    while let Some(pos) = hay[idx..].find(&pat) {
-        let start = idx + pos;
-        let end = start + pat.len();
+    for std::ops::Range { start, end } in match_ranges(text, needle) {
         if start > idx {
             spans.push(Span::styled(text[idx..start].to_string(), base));
         }
@@ -2446,6 +2631,45 @@ fn push_highlighted(spans: &mut Vec<Span<'static>>, text: &str, needle: &str, ba
     if idx < text.len() {
         spans.push(Span::styled(text[idx..].to_string(), base));
     }
+}
+
+/// Byte ranges in `text` of case-insensitive, non-overlapping matches of
+/// `needle`. Lowercasing changes byte lengths per character (`K` shrinks, `İ`
+/// grows), so matching runs on a lowercased copy that maps each character
+/// back to its offset in `text`. A match that starts or ends inside one
+/// character's lowercase form is skipped rather than sliced mid-character.
+fn match_ranges(text: &str, needle: &str) -> Vec<std::ops::Range<usize>> {
+    let pat: String = needle.chars().flat_map(char::to_lowercase).collect();
+    if pat.is_empty() {
+        return Vec::new();
+    }
+    let mut hay = String::with_capacity(text.len());
+    // (offset in `hay`, offset in `text`) at each character start.
+    let mut starts = Vec::with_capacity(text.len() + 1);
+    for (at, c) in text.char_indices() {
+        starts.push((hay.len(), at));
+        hay.extend(c.to_lowercase());
+    }
+    starts.push((hay.len(), text.len()));
+    let original = |at: usize| {
+        starts
+            .binary_search_by_key(&at, |&(hay, _)| hay)
+            .ok()
+            .map(|i| starts[i].1)
+    };
+    let mut matches = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = hay[from..].find(&pat) {
+        let start = from + pos;
+        let end = start + pat.len();
+        if let (Some(text_start), Some(text_end)) = (original(start), original(end)) {
+            matches.push(text_start..text_end);
+            from = end;
+        } else {
+            from = start + hay[start..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    matches
 }
 
 /// A run of text sharing one style, extracted from an ANSI-coded string.
@@ -2810,18 +3034,56 @@ fn wrap_help_span(span: Span<'static>, width: usize, needle: &str) -> Vec<Line<'
     rows
 }
 
-fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
+type HelpSections = Vec<(String, u16)>;
+
+fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSections) {
     let bind = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(k.to_string(), Style::default().fg(theme::yellow())),
             Span::styled(d.to_string(), theme::dim()),
         ])
     };
+    // Config-defined plugins, with their (possibly modified) key chords,
+    // follow the table keys they run from. From a table, the plugins for the
+    // current kind come first.
+    let mut plugin_lines = Vec::new();
+    if !app.plugins.is_empty() {
+        plugin_lines.push(Line::from(""));
+        plugin_lines.push(Line::from(Span::styled("  Plugins", theme::title())));
+        let current = |p: &crate::config::Plugin| {
+            app.help_return == Mode::Table
+                && (p.scopes.is_empty() || p.scopes.contains(&app.kind_plural))
+        };
+        let (first, rest): (Vec<_>, Vec<_>) = app.plugins.iter().partition(|p| current(p));
+        for p in first.into_iter().chain(rest) {
+            let mut bindings = Vec::new();
+            if !p.key.is_empty() {
+                bindings.push(
+                    crate::keys::KeyChord::parse(&p.key)
+                        .map(|c| c.label())
+                        .unwrap_or_else(|_| format!("{}?", p.key)),
+                );
+            }
+            if let Some(command) = &p.palette {
+                bindings.push(format!(":{command}"));
+            }
+            let key = bindings.join(" / ");
+            let scope = if p.scopes.is_empty() {
+                "all resources".to_string()
+            } else {
+                p.scopes.join(", ")
+            };
+            plugin_lines.push(bind(&key, &format!("{} ({scope})", p.name)));
+        }
+    }
     let mut lines = Vec::new();
     let mut previous_scope = "";
     for (scope, action, _) in app.keymap.entries() {
         let owned;
         if scope != previous_scope {
+            if previous_scope == "table" {
+                lines.append(&mut plugin_lines);
+            }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("  Keys: {scope}"),
@@ -2842,6 +3104,8 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
                 Action::Up => "select the previous drain option",
                 _ => action.description(),
             }
+        } else if scope == "rbac" && action == Action::Toggle {
+            "show rules as a resource and verb matrix or as the rule list"
         } else if scope == "table" && action == Action::Describe {
             "describe; experimental native backend: --experimental-describe or experimental.native_describe in config"
         } else if scope == "table" && action == Action::RestartOrRefresh {
@@ -2853,13 +3117,17 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         } else if scope == "port_forward_picker" && action == Action::Edit {
             "edit local port of the selected mapping"
         } else if scope == "logs" && action == Action::Lookback {
-            "set lookback (s/m/h/d); kubelet logs also accept tail"
+            "set lookback (s/m/h/d/w, e.g. 1h30m); kubelet logs also accept tail"
         } else if action == Action::LogMarker {
             "add visual marker at the log tail (excluded from copy/save)"
         } else if action == Action::Fullscreen {
             "toggle fullscreen for text selection (no borders or scrollbars)"
         } else if action == Action::Edit && scope == "detail" {
             "edit the displayed resource in $EDITOR (YAML, describe, decoded Secret)"
+        } else if action == Action::Save && scope == "logs" {
+            "save the shown log lines to a file in save_dir"
+        } else if action == Action::Save {
+            "save the whole document to a file in save_dir"
         } else if action == Action::ManagedFields && scope == "detail" {
             "show or hide managedFields (YAML only; hidden when a document opens)"
         } else if action == Action::AutoRefresh && scope == "detail" {
@@ -2884,6 +3152,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     lines.push(Line::from(
         "  Range selection keeps separate marks; other keys end the range.",
     ));
+    lines.append(&mut plugin_lines);
     lines.push(Line::from(Span::styled(
         "  Commands (enter in the command palette)",
         theme::title(),
@@ -2913,6 +3182,14 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         "cross-context health dashboard for configured contexts",
     ));
     lines.push(bind(
+        ":workloads [ns] · :wk",
+        "deployments, statefulsets, daemonsets, cronjobs, jobs and pods in one table",
+    ));
+    lines.push(bind(
+        ":ns-resources [ns]",
+        "kinds with objects in the namespace and how many; ⏎ opens one · r counts again",
+    ));
+    lines.push(bind(
         ":xray · :diff",
         "hierarchical tree · live-vs-last-applied diff",
     ));
@@ -2922,7 +3199,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     ));
     lines.push(bind(":events", "browse all events"));
     lines.push(bind(":pf", "view/stop background port-forwards"));
-    lines.push(bind(":skin", "switch color skin live"));
+    lines.push(bind(":skin", "preview and switch color skin"));
     lines.push(bind(
         ":mouse",
         "switch mouse capture on/off for text selection",
@@ -2945,7 +3222,12 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     ));
     lines.push(bind(
         "Enter on RBAC roles/bindings",
-        "show rules; r refreshes; Esc returns",
+        &format!(
+            "show rules; {} switches matrix and list; {} refreshes; {} returns",
+            app.keymap.label("rbac", Action::Toggle),
+            app.keymap.label("rbac", Action::Refresh),
+            app.keymap.label("rbac", Action::Back),
+        ),
     ));
     lines.push(bind(
         ":can-i",
@@ -2958,6 +3240,10 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     lines.push(bind(
         ":resource @context [namespace]",
         "switch context and resource (select to fill context, then add namespace)",
+    ));
+    lines.push(bind(
+        ":resource -o layout · :layout [name]",
+        "open with a named column layout · switch the current kind's layout or pick one",
     ));
     lines.push(bind(":rightsize", "historical right-sizing: P50/P95/P99 usage → suggested requests + patch (needs [providers.metrics])"));
     lines.push(bind(
@@ -2993,6 +3279,14 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         "capture the current view (text/json/yaml) · browse saved snapshots",
     ));
     lines.push(bind(
+        ":notify [note]",
+        "toggle watch notifications on the selection · note prefixes its messages",
+    ));
+    lines.push(bind(
+        ":dir [path]",
+        "browse local manifests · a diffs then applies · d deletes their resources",
+    ));
+    lines.push(bind(
         ":pvc-clean",
         "delete helper pods left behind by a session that exited uncleanly (:pvc-cleanup)",
     ));
@@ -3008,31 +3302,6 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         "Esc / Ctrl+C (activity)",
         "hide without cancelling / cancel the focused plugin",
     ));
-    // Config-defined plugins, with their (possibly modified) key chords.
-    if !app.plugins.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("  Plugins", theme::title())));
-        for p in &app.plugins {
-            let mut bindings = Vec::new();
-            if !p.key.is_empty() {
-                bindings.push(
-                    crate::keys::KeyChord::parse(&p.key)
-                        .map(|c| c.label())
-                        .unwrap_or_else(|_| format!("{}?", p.key)),
-                );
-            }
-            if let Some(command) = &p.palette {
-                bindings.push(format!(":{command}"));
-            }
-            let key = bindings.join(" / ");
-            let scope = if p.scopes.is_empty() {
-                "all resources".to_string()
-            } else {
-                p.scopes.join(", ")
-            };
-            lines.push(bind(&key, &format!("{} ({scope})", p.name)));
-        }
-    }
     lines.push(Line::from(Span::styled(
         "  Node drain controls",
         theme::title(),
@@ -3091,6 +3360,14 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         app.keymap.label("help", Action::Close),
         "close help and return to the previous screen",
     ));
+    lines.push(bind(
+        &format!(
+            "{} / {}",
+            app.keymap.label("help", Action::NextSection),
+            app.keymap.label("help", Action::PreviousSection)
+        ),
+        "jump to the next / previous section",
+    ));
     let key_width = lines
         .iter()
         .filter(|line| line.spans.len() == 2)
@@ -3099,13 +3376,16 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         .unwrap_or(14)
         .min(width.saturating_sub(4) / 2)
         .max(1);
-    // Keep section headings with matching entries so each binding has context.
+    let is_section = |line: &Line| line.spans.len() == 1 && line.spans[0].style == theme::title();
+    // Keep section headings with matching entries so each binding has context,
+    // and a whole section when its heading matches.
     let needle = app.help_filter.to_lowercase();
     let (lines, title) = if needle.is_empty() {
         (lines, " Help ".to_string())
     } else {
         let mut shown = Vec::new();
         let mut heading = None;
+        let mut whole_section = false;
         let mut matches = 0;
         for line in lines {
             let text = line_text(&line);
@@ -3113,16 +3393,21 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
                 continue;
             }
             let matched = text.to_lowercase().contains(&needle);
+            if is_section(&line) {
+                whole_section = matched;
+            }
             let binding = if line.spans.len() != 2 {
                 heading = Some(line);
                 None
             } else {
                 Some(line)
             };
-            if matched {
-                matches += 1;
+            if matched || whole_section {
+                if matched {
+                    matches += 1;
+                }
                 if let Some(heading) = heading.take() {
-                    if !shown.is_empty() {
+                    if !shown.is_empty() && (is_section(&heading) || !whole_section) {
                         shown.push(Line::default());
                     }
                     shown.push(heading);
@@ -3135,42 +3420,63 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         let title = format!(" Help · /{} [{}] ", app.help_filter, matches);
         (shown, title)
     };
-    let lines: Vec<Line> = lines
-        .into_iter()
-        .flat_map(|line| {
-            if line.spans.len() != 2 {
-                return wrap_line(highlight_matches(line, &app.help_filter), width);
+    let mut sections = Vec::new();
+    let mut wrapped: Vec<Line> = Vec::new();
+    for line in lines {
+        if is_section(&line) {
+            let row = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
+            sections.push((line_text(&line).trim().to_string(), row));
+        }
+        wrapped.extend(help_rows(line, key_width, width, &app.help_filter));
+    }
+    (wrapped, title, sections)
+}
+
+fn help_rows(
+    line: Line<'static>,
+    key_width: usize,
+    width: usize,
+    filter: &str,
+) -> Vec<Line<'static>> {
+    if line.spans.len() != 2 {
+        return wrap_line(highlight_matches(line, filter), width);
+    }
+    let mut spans = line.spans.into_iter();
+    let keys = wrap_help_span(spans.next().unwrap(), key_width, filter);
+    let descriptions = wrap_help_span(
+        spans.next().unwrap(),
+        width.saturating_sub(key_width + 4).max(1),
+        filter,
+    );
+    (0..keys.len().max(descriptions.len()))
+        .map(|i| {
+            let mut row = vec![Span::raw("  ")];
+            let used = keys.get(i).map_or(0, Line::width);
+            if let Some(key) = keys.get(i) {
+                row.extend(key.spans.clone());
             }
-            let mut spans = line.spans.into_iter();
-            let keys = wrap_help_span(spans.next().unwrap(), key_width, &app.help_filter);
-            let descriptions = wrap_help_span(
-                spans.next().unwrap(),
-                width.saturating_sub(key_width + 4).max(1),
-                &app.help_filter,
-            );
-            (0..keys.len().max(descriptions.len()))
-                .map(|i| {
-                    let mut row = vec![Span::raw("  ")];
-                    let used = keys.get(i).map_or(0, Line::width);
-                    if let Some(key) = keys.get(i) {
-                        row.extend(key.spans.clone());
-                    }
-                    row.push(Span::raw(" ".repeat(key_width.saturating_sub(used) + 2)));
-                    if let Some(description) = descriptions.get(i) {
-                        row.extend(description.spans.clone());
-                    }
-                    Line::from(row)
-                })
-                .collect()
+            row.push(Span::raw(" ".repeat(key_width.saturating_sub(used) + 2)));
+            if let Some(description) = descriptions.get(i) {
+                row.extend(description.spans.clone());
+            }
+            Line::from(row)
         })
-        .collect();
-    (lines, title)
+        .collect()
 }
 
 pub(crate) struct HelpCache {
     key: u64,
+    width: usize,
     lines: Vec<Line<'static>>,
     title: String,
+    sections: HelpSections,
+}
+
+impl HelpCache {
+    /// Section headings and the rendered row each one starts on.
+    pub(crate) fn sections(&self) -> &[(String, u16)] {
+        &self.sections
+    }
 }
 
 fn help_cache_key(app: &App, width: usize) -> u64 {
@@ -3188,6 +3494,7 @@ fn help_cache_key(app: &App, width: usize) -> u64 {
     for (scope, action, _) in app.keymap.entries() {
         (scope, action.name(), app.keymap.label(scope, action)).hash(&mut hash);
     }
+    (app.help_return == Mode::Table, &app.kind_plural).hash(&mut hash);
     app.plugins.len().hash(&mut hash);
     for plugin in &app.plugins {
         (&plugin.key, &plugin.palette, &plugin.scopes, &plugin.name).hash(&mut hash);
@@ -3203,20 +3510,50 @@ fn help_cache_key(app: &App, width: usize) -> u64 {
     hash.finish()
 }
 
+fn update_help_cache(app: &mut App, width: usize) {
+    let key = help_cache_key(app, width);
+    if app.help_cache.as_ref().is_none_or(|cache| cache.key != key) {
+        let (lines, title, sections) = build_help(app, width);
+        app.help_cache = Some(HelpCache {
+            key,
+            width,
+            lines,
+            title,
+            sections,
+        });
+    }
+}
+
+/// Rebuild help at the last drawn width when its content changed since that
+/// frame. Keys queued behind a filter change are handled before the redraw.
+pub(crate) fn refresh_help(app: &mut App) {
+    let Some(width) = app.help_cache.as_ref().map(|cache| cache.width) else {
+        return;
+    };
+    update_help_cache(app, width);
+    let lines = app.help_cache.as_ref().map_or(0, |cache| cache.lines.len());
+    app.help_max_scroll =
+        (lines.min(usize::from(u16::MAX)) as u16).saturating_sub(app.help_viewport_h);
+}
+
 fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
     let width = usize::from(area.width.saturating_sub(2)).max(1);
-    let key = help_cache_key(app, width);
-    if app.help_cache.as_ref().is_none_or(|cache| cache.key != key) {
-        let (lines, title) = build_help(app, width);
-        app.help_cache = Some(HelpCache { key, lines, title });
-    }
+    update_help_cache(app, width);
     let cache = app.help_cache.as_ref().expect("help content is ready");
     // Record the content height for paging and clamp the offset after layout changes.
     let inner_h = area.height.saturating_sub(2);
     app.help_viewport_h = inner_h;
     let max_scroll = (cache.lines.len().min(usize::from(u16::MAX)) as u16).saturating_sub(inner_h);
     app.help_max_scroll = max_scroll;
+    if std::mem::take(&mut app.help_find_section) {
+        let heading = format!("Keys: {}", app.scope_for(app.help_return));
+        app.help_scroll = cache
+            .sections
+            .iter()
+            .find(|(text, _)| *text == heading)
+            .map_or(0, |&(_, row)| row);
+    }
     let scroll = app.help_scroll.min(max_scroll);
     app.help_scroll = scroll;
     let title = &cache.title;
@@ -3518,7 +3855,8 @@ fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Port-forward picker (`f` on a pod/service): lists the object's declared
-/// ports for single-select, plus a "Custom…" entry for manual input.
+/// ports for single-select, plus a "Custom…" entry for manual input. A
+/// mapping whose local port was taken when the picker opened says `in use`.
 fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
     let target = app
@@ -3529,13 +3867,21 @@ fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<Text> = app
         .pf_picker_items
         .iter()
-        .map(|label| {
+        .enumerate()
+        .map(|(i, label)| {
             let color = if *label == "Custom…" {
                 theme::overlay1()
             } else {
                 theme::green()
             };
-            Text::from(Span::styled(label.as_str(), Style::default().fg(color)))
+            let mut spans = vec![Span::styled(label.as_str(), Style::default().fg(color))];
+            if app.pf_picker_in_use.get(i).copied().unwrap_or(false) {
+                spans.push(Span::styled(
+                    "  in use",
+                    Style::default().fg(theme::yellow()),
+                ));
+            }
+            Text::from(Line::from(spans))
         })
         .collect();
     app.picker_page_items = render_popup_list(
@@ -3624,6 +3970,83 @@ fn draw_port_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
         items,
         Span::styled(title, theme::title()),
         &mut app.pf_state,
+    );
+}
+
+fn draw_dir(frame: &mut Frame, app: &mut App, area: Rect) {
+    use crate::app::dir::DirEntryKind;
+    let show_scrollbars = app.scrollbars_visible();
+    let name_w = app
+        .dir
+        .entries
+        .iter()
+        .map(|e| e.name.chars().count() + 1)
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let items: Vec<ListItem> = app
+        .dir
+        .entries
+        .iter()
+        .map(|e| {
+            let name = if e.kind == DirEntryKind::Manifest {
+                e.name.clone()
+            } else {
+                format!("{}/", e.name)
+            };
+            let size = e
+                .size
+                .map(crate::pvcexplore::human_size)
+                .unwrap_or_default();
+            let name_style = if e.kind == DirEntryKind::Manifest {
+                Style::default().fg(theme::text())
+            } else {
+                Style::default().fg(theme::sky())
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{name:<name_w$}  "), name_style),
+                Span::styled(format!("{:<10}", e.kind.label()), theme::dim()),
+                Span::styled(format!("{size:>8}"), theme::dim()),
+            ]))
+        })
+        .collect();
+    let count = format!(" [{}] ", app.dir.entries.len());
+    let room =
+        usize::from(area.width.saturating_sub(4)).saturating_sub(" Dir ".len() + count.len());
+    let path = crate::app::dir::display_path(&app.dir.path);
+    let chars = path.chars().count();
+    let path = if chars > room {
+        let tail: String = path.chars().skip(chars - room.saturating_sub(1)).collect();
+        format!("…{tail}")
+    } else {
+        path
+    };
+    let title = format!(" Dir {path}{count}");
+    app.picker_page_items = usize::from(area.height.saturating_sub(2)).max(1);
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "  no manifests or directories here",
+                theme::dim(),
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(theme::border_focused())
+                    .title(Span::styled(title, theme::title())),
+            ),
+            area,
+        );
+        return;
+    }
+    render_framed_list(
+        frame,
+        show_scrollbars,
+        area,
+        items,
+        Span::styled(title, theme::title()),
+        &mut app.dir.state,
     );
 }
 
@@ -4680,6 +5103,10 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(s.label.clone(), Style::default().fg(theme::mauve())),
                 Span::styled("  ctx", theme::dim()),
             ])),
+            SuggestKind::Layout => Text::from(Line::from(vec![
+                Span::styled(s.label.clone(), Style::default().fg(theme::peach())),
+                Span::styled("  layout", theme::dim()),
+            ])),
             // Saved bookmarks read as a distinct, high-value jump (a ★ tag).
             SuggestKind::Bookmark => Text::from(Line::from(vec![
                 Span::styled(
@@ -5522,6 +5949,17 @@ fn navigation_hint(app: &App, width: u16) -> String {
             Action::PageUp,
             Action::PageDown,
         ][..],
+        "diff" if app.dir.preview.is_some() => &[
+            Action::Apply,
+            Action::Back,
+            Action::Filter,
+            Action::NextMatch,
+            Action::PreviousMatch,
+            Action::Wrap,
+            Action::Copy,
+            Action::PageUp,
+            Action::PageDown,
+        ][..],
         "detail" | "diff" | "events" => &[
             Action::Back,
             Action::Filter,
@@ -5530,8 +5968,18 @@ fn navigation_hint(app: &App, width: u16) -> String {
             Action::Wrap,
             Action::Fullscreen,
             Action::Copy,
+            Action::Save,
             Action::PageUp,
             Action::PageDown,
+        ][..],
+        "dir" => &[
+            Action::Back,
+            Action::Accept,
+            Action::Parent,
+            Action::Edit,
+            Action::Apply,
+            Action::Delete,
+            Action::Refresh,
         ][..],
         "pvc_explore" => &[
             Action::Back,
@@ -5674,7 +6122,7 @@ fn sync_indicator(mode: Mode, doc_filter_return: Mode, synced: bool) -> (&'stati
         Mode::Detail | Mode::Diff | Mode::Explain => true,
         // A directory listing is fetched once by exec, not watched — `r`
         // re-reads it. Calling it live would be a lie.
-        Mode::PvcExplore => true,
+        Mode::PvcExplore | Mode::Dir => true,
         // `/` search over one of those documents — same underlying snapshot.
         Mode::DocFilter => matches!(doc_filter_return, Mode::Detail | Mode::Diff),
         _ => false,
@@ -5698,6 +6146,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         ("● refresh", theme::sky())
     } else if app.resource_refresh_available() {
         ("○ stopped", theme::overlay1())
+    } else if app.ns_resources_active() && app.mode == Mode::Table && app.store.synced {
+        ("○ snapshot", theme::overlay1())
     } else {
         sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
     };
@@ -6171,13 +6621,20 @@ mod tests {
                 }
                 _ => terminal.backend_mut().resize(60, 30),
             }
+            // The scrollbar hides on a timer; a slow run must not let it
+            // vanish between the cached and the fresh draw.
+            app.scrollbar_activity = None;
             let previous_key = app.help_cache.as_ref().unwrap().key;
             terminal.draw(|f| draw(f, &mut app)).unwrap();
             let width = usize::from(terminal.backend().buffer().area.width.saturating_sub(2));
             let cache = app.help_cache.as_ref().unwrap();
             assert_ne!(previous_key, cache.key, "step {step}");
             assert_eq!(
-                (cache.lines.clone(), cache.title.clone()),
+                (
+                    cache.lines.clone(),
+                    cache.title.clone(),
+                    cache.sections.clone()
+                ),
                 build_help(&app, width)
             );
             let cached = terminal.backend().buffer().clone();
@@ -6229,7 +6686,7 @@ mod tests {
                             area,
                             &mut actual,
                             row,
-                            selected,
+                            selected.then(theme::selected_row),
                         );
                         assert_eq!(
                             actual, expected,
@@ -6619,6 +7076,17 @@ mod tests {
         assert_eq!(text.matches("yaml").count(), 1, "{text}");
     }
 
+    #[tokio::test]
+    async fn csr_rows_hint_both_approve_and_deny() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+        app.switch_kind("certificatesigningrequests");
+        let text: Vec<String> = header_hints(&app).iter().map(line_text).collect();
+        let text = text.join("\n");
+        assert!(text.contains("V approve"), "{text}");
+        assert!(text.contains("N deny"), "{text}");
+    }
+
     /// `⏎` on a ResourceSet or FluxInstance opens the GitOps view; the same
     /// plural in another group still opens YAML.
     #[tokio::test]
@@ -6638,6 +7106,39 @@ mod tests {
                 assert_eq!(text.matches("yaml").count(), 1, "{text}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn the_header_names_a_non_default_layout() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+        let cfg: crate::config::Config = toml::from_str(
+            "[views.\"pods:images\"]\ncolumns = [{ name = \"X\", path = \"/x\" }]\n",
+        )
+        .unwrap();
+        app.user_views = crate::views::compile(&cfg.views).0;
+        app.switch_kind("pods");
+        let header = |app: &mut App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let buffer = term.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .find(|line| line.contains("Resource:"))
+                .unwrap_or_default()
+        };
+        assert!(!header(&mut app).contains("pods:"), "{}", header(&mut app));
+        app.switch_kind("pods:images");
+        assert!(
+            header(&mut app).contains("pods:images"),
+            "{}",
+            header(&mut app)
+        );
     }
 
     /// With a configured drill, `⏎` runs the drill, so the hint names its

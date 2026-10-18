@@ -20,17 +20,21 @@ and "no more than 5 at a time" into enforced rules instead of things you have to
 remember.
 
 Each rule matches on `contexts`, `namespaces`, `resources`, and `actions` globs
-(all optional - an omitted glob matches everything). Rules can set `deny`
+(all optional - an omitted glob matches everything). CSRs are cluster-scoped, so a rule
+with `namespaces` still applies to `approve` and `deny`. Rules can set `deny`
 (block the action), `confirmation` (require confirmation), and `max_bulk`
 (a row limit for one action). The gated `actions` are the destructive verbs sofka
-performs directly: `delete`, `force-delete`, `drain`, `restart`, `rollback` (a
+performs directly: `delete`, `force-delete`, `drain`, `approve` and `deny` (CSR
+decisions, matched against `certificatesigningrequests`), `restart`, `rollback` (a
 rollout undo, matched against the workload kind), `shell` (exec),
 `debug`, `node-debug`, `transfer` (a file upload into a pod), `secret-edit`
 (saving values edited in the decoded Secret view), `prune` (an
 Argo CD Application sync with prune, matched against `applications`), `pvc-explore`
 (creating a helper pod to mount an unmounted PVC, and the `:pvc-clean` sweep
 that deletes them - both matched against `persistentvolumeclaims`), and
-`pvc-upload` (a file upload into a volume, matched the same way). The PVC
+`pvc-upload` (a file upload into a volume, matched the same way), and `apply`
+and `delete` from the manifest browser, matched against each rendered object's
+resource and namespace. The PVC
 shell and the PVC upload also pass the `shell` and `transfer` rules for the
 pod they reach the volume through, exactly like `s` and `t` on that pod's row -
 a rule that already blocks shells or uploads in prod is not defeated by

@@ -50,8 +50,9 @@ never by array index, whose order nothing guarantees - renders its `status`
 
 Optional `width` (for fixed columns) and `align` (`left`/`center`/`right`) tune
 the layout. By default columns overlay the curated ones: a matching header
-replaces it in place, new columns go before AGE. Invalid entries are skipped with
-a warning in the app - they never take down the TUI.
+replaces it in place, new columns go before AGE. Invalid entries are skipped
+with a warning in the app; unknown keys are ignored with a warning while the
+rest of the entry still applies. Neither takes down the TUI.
 
 ### Fallback paths
 
@@ -356,6 +357,46 @@ resource commands, bookmarks, and view history. The namespace suffix must
 be a valid namespace name: 1 to 63 lowercase letters, digits, or hyphens,
 with a letter or digit at each end. Invalid suffixes produce a configuration
 warning and the view is ignored.
+
+### Named layouts
+
+Add `:<name>` to a view key to keep another layout for the same kind next to
+the default one:
+
+```toml
+[views."v1/pods:images"]
+replace = true
+columns = [
+  { name = "NAME", builtin = "NAME" },
+  { name = "IMAGE", path = "/spec/containers/0/image" },
+  { name = "TAG", path = "/spec/containers/0/image", format = "image-tag" },
+]
+```
+
+The suffix works on every key form and before a namespace suffix:
+`pods:images@matlab`. With layout `images` active, sofka tries
+`key:images@namespace` for every key form, then `key:images`. A named layout
+sets only `columns`, `replace`, and `sort`, and does not inherit columns from
+the base key. `drill`, `refs`, `children`, and `node` describe the kind, so
+they always come from the base key; setting them on a named layout produces a
+configuration warning and they are ignored. `default` and `wide` are reserved.
+An empty name, or one with spaces, `@`, `:`, or `/`, also produces a
+configuration warning and the view is ignored. Layout names are not
+case-sensitive.
+
+Select a layout with `:pods -o images` or `:pods:images`, or switch the current
+kind with `:layout images`. `:layout` without a name lists the kind's layouts,
+with `default` first. `-o default` returns to the default layout and
+`-o wide` turns on wide mode, the same as `w`. Layout names complete after
+`-o` and `:layout`, and the palette lists `pods:images` entries. Bookmarks
+take a `layout` field. Selecting a layout the kind doesn't have warns in the
+status bar and keeps the current one.
+
+sofka remembers the active layout per kind for the session, and `[`/`]`
+restore it. The header shows a non-default layout as `pods:images`. Wide mode
+works in any layout, and saved sorts stay per kind. `:reload` keeps the active
+layout if it still exists and otherwise falls back to the default with a
+warning.
 
 ### Pods and nodes
 

@@ -5,6 +5,10 @@ pub(super) struct LogLineMeta {
     sort_time: Option<i128>,
     pub(super) pretty: Option<String>,
     record: Option<String>,
+    /// Styled parts of the record row, relative to where its body starts:
+    /// the source and `--timestamps` prefixes come before it.
+    record_parts: Vec<RecordSpan>,
+    record_body_len: usize,
     record_severity: Option<crate::logfilter::Severity>,
     checked_json: bool,
     pub(super) json_charge: usize,
@@ -43,7 +47,7 @@ pub(super) const JSON_CACHE_LIMIT: usize = 8 * 1024 * 1024;
 const JSON_RECORD_LIMIT: usize = 4096;
 
 impl LogLineMeta {
-    fn format_json(&mut self, line: &str, budget: &mut usize) {
+    fn format_json(&mut self, line: &str, budget: &mut usize, time: &RecordTime) {
         if self.checked_json {
             return;
         }
@@ -87,8 +91,8 @@ impl LogLineMeta {
             .timestamp
             .as_ref()
             .map_or(0, |(_, timestamp)| timestamp.len());
-        let mut cache = |text: String| {
-            let charge = text.len() + time_end + timestamp_reserve;
+        let mut cache = |text: String, extra: usize| {
+            let charge = text.len() + time_end + timestamp_reserve + extra;
             if charge > *budget {
                 return None;
             }
@@ -99,15 +103,38 @@ impl LogLineMeta {
         // The input and parser depth limits also bound the temporary output.
         // Each view is charged on its own, so an indented form that does not
         // fit cannot keep a short record row raw.
-        let record = render_record(&value);
-        let record_severity = record.as_ref().and_then(|(_, severity)| *severity);
-        let record = record.and_then(|(text, _)| cache(text));
+        let record = serde_json::from_str(payload)
+            .ok()
+            .and_then(|ordered| render_record(&ordered, time));
+        let record_severity = record.as_ref().and_then(|row| row.severity);
+        let record = record.and_then(|mut row| {
+            row.parts.shrink_to_fit();
+            let parts = row.parts.capacity() * std::mem::size_of::<RecordSpan>();
+            let body_len = row.text.len();
+            Some((cache(row.text, parts)?, (row.parts, body_len)))
+        });
+        let (record, record_parts) = record.unzip();
         let pretty = serde_json::to_string_pretty(&value)
             .ok()
-            .and_then(&mut cache);
+            .and_then(|text| cache(text, 0));
         self.record_severity = record_severity;
         self.record = record;
+        (self.record_parts, self.record_body_len) = record_parts.unwrap_or_default();
         self.pretty = pretty;
+    }
+
+    /// Drop the cached JSON forms so the next [`Self::format_json`] renders
+    /// the line again. Returns the budget they held.
+    fn clear_json(&mut self) -> usize {
+        let charge = self.json_charge;
+        self.pretty = None;
+        self.record = None;
+        self.record_parts = Vec::new();
+        self.record_body_len = 0;
+        self.record_severity = None;
+        self.checked_json = false;
+        self.json_charge = 0;
+        charge
     }
 
     pub(super) fn display(&self, view: JsonView) -> Option<&str> {
@@ -158,21 +185,189 @@ impl JsonView {
     }
 }
 
+/// How record view shows times that are RFC 3339 strings or epoch numbers:
+/// `[logs] record_time_format` in `record_time_zone`. Without a format, epoch
+/// numbers become RFC 3339 and strings stay as the application wrote them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordTime {
+    format: Option<String>,
+    local: bool,
+}
+
+impl RecordTime {
+    /// An invalid format or zone falls back to the default, which
+    /// `config::logs_warnings` reports.
+    pub fn from_config(cfg: &crate::config::LogsConfig) -> Self {
+        Self {
+            format: cfg
+                .record_time_format
+                .clone()
+                .filter(|format| crate::config::check_record_time_format(format).is_ok()),
+            local: cfg.record_time_zone == "local",
+        }
+    }
+
+    fn render(&self, time: jiff::Timestamp) -> Option<String> {
+        let format = self.format.as_deref()?;
+        let zone = if self.local {
+            jiff::tz::TimeZone::system()
+        } else {
+            jiff::tz::TimeZone::UTC
+        };
+        let text = jiff::fmt::strtime::format(format, &time.to_zoned(zone)).ok()?;
+        Some(record_text(&text).into_owned())
+    }
+}
+
 const RECORD_TIME_KEYS: &[&str] = &["time", "ts", "timestamp", "@timestamp"];
 const RECORD_LEVEL_KEYS: &[&str] = &["level", "lvl", "severity"];
 const RECORD_MESSAGE_KEYS: &[&str] = &["msg", "message"];
+/// Only `logger` (zap, logr): `name` is the reconciled object in
+/// controller-runtime logs, and `component` is often a plain field.
+const RECORD_LOGGER_KEYS: &[&str] = &["logger"];
+
+/// What a part of a record row shows. The theme maps each kind to a style;
+/// the cached row text stays plain, so search and the severity filter read it
+/// as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordPart {
+    Time,
+    Level,
+    Logger,
+    Message,
+    Separator,
+    /// A field key and its `=`.
+    Key,
+    /// A bare string value.
+    Text,
+    /// A string value that needs quotes.
+    Quoted,
+    Number,
+    Bool,
+    Null,
+    /// An array or object as compact JSON.
+    Json,
+}
+
+/// The byte range of a styled part of a record row, and its kind.
+pub type RecordSpan = (std::ops::Range<usize>, RecordPart);
+
+/// A rendered record row: its plain text, the byte range of each styled part
+/// within it, and the severity of its level.
+struct RecordRow {
+    text: String,
+    parts: Vec<RecordSpan>,
+    severity: Option<crate::logfilter::Severity>,
+}
+
+impl RecordRow {
+    fn push(&mut self, part: &str, kind: RecordPart) {
+        if !self.text.is_empty() {
+            self.text.push(' ');
+        }
+        let start = self.text.len();
+        self.text.push_str(part);
+        self.parts.push((start..self.text.len(), kind));
+    }
+
+    /// `key=value` for each field, with nested objects flattened into dotted
+    /// keys (`object.kind=Lease`) in their original order. A key segment
+    /// that contains a dot is quoted when its path would read the same as
+    /// another field's (`"a.b"=1 a.b=2`); otherwise `http.method` stays bare.
+    fn push_fields<'a>(&mut self, fields: impl Iterator<Item = &'a (String, Ordered)>) {
+        let mut leaves = Vec::new();
+        let mut left = RECORD_FLATTEN_FIELDS;
+        for (key, value) in fields {
+            record_leaves(vec![key.as_str()], value, 1, &mut left, &mut leaves);
+        }
+        let mut paths: std::collections::HashMap<String, &[&str]> = Default::default();
+        let mut ambiguous = std::collections::HashSet::new();
+        for (path, _) in &leaves {
+            let joined = path.join(".");
+            match paths.get(&joined) {
+                Some(other) if *other != path.as_slice() => {
+                    ambiguous.insert(joined);
+                }
+                Some(_) => {}
+                None => {
+                    paths.insert(joined, path);
+                }
+            }
+        }
+        for (path, value) in &leaves {
+            let quote = ambiguous.contains(&path.join("."));
+            let key = path
+                .iter()
+                .map(|segment| {
+                    if quote && segment.contains('.') {
+                        serde_json::Value::from(*segment).to_string().into()
+                    } else {
+                        record_key(segment)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(".");
+            self.push(&format!("{key}="), RecordPart::Key);
+            let (text, kind) = record_value(value);
+            let start = self.text.len();
+            self.text.push_str(&text);
+            self.parts.push((start..self.text.len(), kind));
+        }
+    }
+}
+
+/// The fields a record row shows for `value` at `path`: a nested object
+/// becomes one field per leaf. Objects deeper than [`RECORD_FLATTEN_DEPTH`],
+/// or past the [`RECORD_FLATTEN_FIELDS`] a record may flatten, stay one
+/// compact JSON field; so do empty objects and arrays.
+fn record_leaves<'a>(
+    path: Vec<&'a str>,
+    value: &'a Ordered,
+    depth: usize,
+    left: &mut usize,
+    out: &mut Vec<(Vec<&'a str>, &'a Ordered)>,
+) {
+    if let Ordered::Object(fields) = value
+        && !fields.is_empty()
+        && depth <= RECORD_FLATTEN_DEPTH
+        && fields.len() <= *left
+    {
+        *left -= fields.len();
+        for (name, value) in fields {
+            let mut path = path.clone();
+            path.push(name);
+            record_leaves(path, value, depth + 1, left, out);
+        }
+        return;
+    }
+    out.push((path, value));
+}
+
+/// How many levels of nested objects record view flattens into dotted keys.
+const RECORD_FLATTEN_DEPTH: usize = 4;
+/// How many fields of nested objects one record row flattens; the rest stay
+/// compact JSON so a large object cannot crowd out the other fields.
+const RECORD_FLATTEN_FIELDS: usize = 64;
 
 /// One-line rendering of a structured log record (zap, slog, logrus, pino):
-/// `time LEVEL message key=value ...`, with the severity of its level if it
-/// has one. `None` when the value is not an object with a level or message
-/// field.
-fn render_record(
-    value: &serde_json::Value,
-) -> Option<(String, Option<crate::logfilter::Severity>)> {
-    let fields = value.as_object()?;
+/// `time LEVEL logger: message › key=value ...`, with the severity of its
+/// level if it has one. `None` when the value is not an object with a level or
+/// message field.
+fn render_record(value: &Ordered, format: &RecordTime) -> Option<RecordRow> {
+    let Ordered::Object(fields) = value else {
+        return None;
+    };
+    // A repeated key keeps its last value in the header, as before; the
+    // earlier entries stay visible as fields.
     let find = |keys: &[&'static str]| {
-        keys.iter()
-            .find_map(|&key| fields.get(key).map(|value| (key, value)))
+        keys.iter().find_map(|&key| {
+            fields
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, (name, _))| name == key)
+                .map(|(index, (_, value))| (index, value))
+        })
     };
     let level = find(RECORD_LEVEL_KEYS);
     let message = find(RECORD_MESSAGE_KEYS);
@@ -180,35 +375,63 @@ fn render_record(
         return None;
     }
     let time = find(RECORD_TIME_KEYS);
-    let mut out = String::new();
-    let mut push = |part: &str| {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(part);
+    let mut row = RecordRow {
+        text: String::new(),
+        parts: Vec::new(),
+        severity: None,
     };
     if let Some((_, time)) = time {
-        push(&record_time(time));
+        row.push(&record_time(time, format), RecordPart::Time);
     }
     let level_name = level.map(|(_, level)| record_level(level));
     if let Some(name) = &level_name {
-        push(&format!("{:<5}", record_text(name)));
+        let name = record_text(name);
+        row.push(&name, RecordPart::Level);
+        // The padding keeps messages aligned but is not part of the level.
+        row.text.extend(std::iter::repeat_n(
+            ' ',
+            5usize.saturating_sub(name.chars().count()),
+        ));
+    }
+    // A logger without a message stays a field, so it is not shown as one.
+    let logger = message
+        .and(find(RECORD_LOGGER_KEYS))
+        .filter(|(_, logger)| logger.as_str().is_some_and(|name| !name.is_empty()));
+    if let Some((_, logger)) = logger {
+        row.push(
+            &format!("{}:", record_text(logger.as_str().unwrap_or_default())),
+            RecordPart::Logger,
+        );
     }
     if let Some((_, message)) = message {
         match message.as_str() {
-            Some(text) => push(&record_text(text)),
-            None => push(&message.to_string()),
+            Some(text) => row.push(&record_text(text), RecordPart::Message),
+            None => row.push(&message.to_string(), RecordPart::Message),
         }
     }
-    let used = [time, level, message].map(|field| field.map(|(key, _)| key));
-    for (key, value) in fields {
-        if used.contains(&Some(key.as_str())) {
-            continue;
-        }
-        push(&format!("{}={}", record_text(key), record_value(value)));
+    let used = [time, level, logger, message].map(|field| field.map(|(index, _)| index));
+    let rest = || {
+        fields
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !used.contains(&Some(*index)))
+            .map(|(_, field)| field)
+    };
+    if message.is_some() && rest().next().is_some() {
+        row.push("›", RecordPart::Separator);
     }
-    let severity = level_name.map(|name| crate::logfilter::parse_level(&name.to_ascii_lowercase()));
-    Some((out, severity))
+    row.push_fields(rest());
+    row.severity = level_name.map(|name| crate::logfilter::parse_level(&name.to_ascii_lowercase()));
+    Some(row)
+}
+
+/// Keys that would read as several tokens, or break `key=value`, are quoted.
+fn record_key(key: &str) -> std::borrow::Cow<'_, str> {
+    if key.contains(|c: char| c.is_whitespace() || matches!(c, '=' | '"')) {
+        serde_json::Value::from(key).to_string().into()
+    } else {
+        record_text(key)
+    }
 }
 
 /// Text with control characters (a multi-line stack trace, terminal escapes)
@@ -222,24 +445,35 @@ fn record_text(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Epoch numbers (zap seconds, pino milliseconds) become RFC 3339; strings
-/// are kept as the application wrote them.
-fn record_time(time: &serde_json::Value) -> String {
+/// are kept as the application wrote them. With a configured format, both
+/// use it when they hold a valid time.
+fn record_time(time: &Ordered, format: &RecordTime) -> String {
     let Some(number) = time.as_f64() else {
-        return time
-            .as_str()
-            .map_or_else(|| time.to_string(), |text| record_text(text).into_owned());
+        let Some(text) = time.as_str() else {
+            return time.to_string();
+        };
+        if format.format.is_none() {
+            return record_text(text).into_owned();
+        }
+        return text
+            .parse()
+            .ok()
+            .and_then(|time| format.render(time))
+            .unwrap_or_else(|| record_text(text).into_owned());
     };
     let micros = if number.abs() >= 1e11 {
         number * 1e3
     } else {
         number * 1e6
     };
-    k8s_openapi::jiff::Timestamp::from_microsecond(micros.round() as i64)
-        .map_or_else(|_| time.to_string(), |time| time.to_string())
+    jiff::Timestamp::from_microsecond(micros.round() as i64).map_or_else(
+        |_| time.to_string(),
+        |time| format.render(time).unwrap_or_else(|| time.to_string()),
+    )
 }
 
 /// Level names in upper case; pino's numeric levels mapped to their names.
-fn record_level(level: &serde_json::Value) -> String {
+fn record_level(level: &Ordered) -> String {
     match level.as_u64() {
         Some(10) => "TRACE".into(),
         Some(20) => "DEBUG".into(),
@@ -256,7 +490,14 @@ fn record_level(level: &serde_json::Value) -> String {
 /// Bare strings stay bare. Strings that would be ambiguous in `key=value`
 /// form or read as another JSON type (`"true"`, `"3"`, `"{}"`), and every
 /// other JSON value, use compact JSON.
-fn record_value(value: &serde_json::Value) -> String {
+fn record_value(value: &Ordered) -> (String, RecordPart) {
+    let kind = match value {
+        Ordered::Object(_) | Ordered::Array(_) => RecordPart::Json,
+        Ordered::Scalar(serde_json::Value::Bool(_)) => RecordPart::Bool,
+        Ordered::Scalar(serde_json::Value::Number(_)) => RecordPart::Number,
+        Ordered::Scalar(serde_json::Value::Null) => RecordPart::Null,
+        Ordered::Scalar(_) => RecordPart::Quoted,
+    };
     match value.as_str() {
         Some(text)
             if !text.is_empty()
@@ -266,10 +507,153 @@ fn record_value(value: &serde_json::Value) -> String {
                     .chars()
                     .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '=')) =>
         {
-            text.to_owned()
+            (text.to_owned(), RecordPart::Text)
         }
-        _ => value.to_string(),
+        _ => (value.to_string(), kind),
     }
+}
+
+/// A JSON value that keeps object fields in the order the application wrote
+/// them. `serde_json::Value` sorts them, and `preserve_order` would change key
+/// order everywhere sofka handles JSON.
+enum Ordered {
+    Object(Vec<(String, Ordered)>),
+    Array(Vec<Ordered>),
+    Scalar(serde_json::Value),
+}
+
+impl Ordered {
+    fn scalar(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Scalar(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        self.scalar()?.as_str()
+    }
+
+    fn as_u64(&self) -> Option<u64> {
+        self.scalar()?.as_u64()
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        self.scalar()?.as_f64()
+    }
+}
+
+/// Compact JSON.
+impl std::fmt::Display for Ordered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&serde_json::to_string(self).map_err(|_| std::fmt::Error)?)
+    }
+}
+
+impl serde::Serialize for Ordered {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self {
+            Self::Object(fields) => {
+                let mut map = serializer.serialize_map(Some(fields.len()))?;
+                for (key, value) in fields {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+            Self::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            Self::Scalar(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Ordered {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = Ordered;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Ordered, E> {
+                Ok(Ordered::Scalar(v.into()))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Ordered, E> {
+                Ok(Ordered::Scalar(v.into()))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Ordered, E> {
+                Ok(Ordered::Scalar(v.into()))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Ordered, E> {
+                Ok(Ordered::Scalar(v.into()))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Ordered, E> {
+                Ok(Ordered::Scalar(v.into()))
+            }
+
+            fn visit_unit<E>(self) -> Result<Ordered, E> {
+                Ok(Ordered::Scalar(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Ordered, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Ordered::Array(items))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Ordered, A::Error> {
+                let mut fields = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    fields.push(entry);
+                }
+                Ok(Ordered::Object(fields))
+            }
+        }
+        deserializer.deserialize_any(Visit)
+    }
+}
+
+fn pod_logs_title(pod: &str, container: Option<&str>) -> String {
+    match container {
+        Some(c) => format!("{pod}:{c} — logs"),
+        None => format!("{pod} — logs"),
+    }
+}
+
+/// Logs for one pod: its annotated default container, else every container.
+pub(super) fn pod_log_source(obj: &DynamicObject) -> (LogSource, String) {
+    let name = obj.metadata.name.clone().unwrap_or_default();
+    let default = annotated_container(obj);
+    let title = pod_logs_title(&name, default.as_deref());
+    let source = LogSource::Pod {
+        ns: obj.metadata.namespace.clone().unwrap_or_default(),
+        name,
+        uid: obj.metadata.uid.clone(),
+        containers: container_names(obj),
+        default,
+        all_containers: false,
+    };
+    (source, title)
 }
 
 pub(super) fn display_height(line: &str, width: usize) -> usize {
@@ -308,6 +692,20 @@ impl LogsView {
         )
     }
 
+    /// Styled parts of the record row shown for line `i`, with the byte
+    /// offset in [`Self::display_line`] where the record body starts.
+    pub fn record_parts(&self, i: usize) -> Option<(usize, &[RecordSpan])> {
+        if self.json != JsonView::Record {
+            return None;
+        }
+        let meta = self.line_meta.get(i)?;
+        let record = meta.record.as_ref()?;
+        Some((
+            record.len().checked_sub(meta.record_body_len)?,
+            &meta.record_parts,
+        ))
+    }
+
     pub(super) fn toggle_json(&mut self) {
         self.set_json(self.json.next());
     }
@@ -316,11 +714,30 @@ impl LogsView {
         if self.json == view {
             return;
         }
+        self.rerender(|logs| logs.json = view);
+    }
+
+    /// Render buffered records again with a new time format, keeping the
+    /// line in view.
+    pub(super) fn set_record_time(&mut self, time: RecordTime) {
+        if self.record_time == time {
+            return;
+        }
+        self.rerender(|logs| {
+            logs.record_time = time;
+            for meta in &mut logs.line_meta {
+                logs.json_budget += meta.clear_json();
+            }
+            logs.json_budget = logs.json_budget.min(JSON_CACHE_LIMIT);
+        });
+    }
+
+    fn rerender(&mut self, change: impl FnOnce(&mut Self)) {
         let scroll = self.view.scroll;
         let shown = self
             .refresh_index(self.last_wrap_width)
             .first_at_row(scroll);
-        self.json = view;
+        change(self);
         self.prepare_json();
         self.view.revision = self.view.revision.wrapping_add(1);
         let width = self.last_wrap_width;
@@ -340,7 +757,7 @@ impl LogsView {
         self.line_meta
             .resize_with(self.view.lines.len(), LogLineMeta::default);
         for (line, meta) in self.view.lines.iter().zip(self.line_meta.iter_mut()) {
-            meta.format_json(line, &mut self.json_budget);
+            meta.format_json(line, &mut self.json_budget, &self.record_time);
         }
     }
 
@@ -354,7 +771,7 @@ impl LogsView {
             line.replace_range(*start..start + timestamp.len(), "");
         }
         if self.json != JsonView::Raw {
-            meta.format_json(&line, &mut self.json_budget);
+            meta.format_json(&line, &mut self.json_budget, &self.record_time);
         }
         // Equal timestamps keep their arrival order. Missing timestamps use
         // the newest known time, or the arrival time if no time is known.
@@ -369,7 +786,7 @@ impl LogsView {
                 .partition_point(|m| m.sort_time <= meta.sort_time)
         };
         if index < self.view.lines.len() {
-            if !self.follow && self.matches(&line) {
+            if !self.follow && self.matches(&line, Some(&meta)) {
                 self.refresh_index(self.last_wrap_width);
                 let mut marker_index = 0;
                 if let Some(shown) = self.index.shown.iter().position(|entry| match entry {
@@ -469,6 +886,7 @@ impl App {
         if cfg.json_view != self.logs_cfg.json_view {
             self.logs.set_json(JsonView::from_config(&cfg.json_view));
         }
+        self.logs.set_record_time(RecordTime::from_config(&cfg));
         self.logs_cfg = cfg;
     }
 
@@ -512,14 +930,15 @@ impl App {
             .drain_front(self.logs.view.lines.len().saturating_sub(cap));
     }
 
-    /// Logs for marked pods or the current selection. Stream every container. For
+    /// Logs for marked pods or the current selection. A pod streams its
+    /// annotated default container, else every container. For
     /// workloads/services: list matching pods and aggregate all their logs.
     pub(super) fn open_logs(&mut self) {
         if self.kind_plural == "pods" && !self.marked.is_empty() {
             let pods: Vec<_> = self
                 .rows()
                 .into_iter()
-                .filter(|obj| self.marked.contains(&row_key(obj)))
+                .filter(|obj| self.marked.contains(&self.key_of(obj)) && self.in_row_focus(obj))
                 .map(|obj| PodLogTarget {
                     ns: obj.metadata.namespace.clone().unwrap_or_default(),
                     name: obj.metadata.name.clone().unwrap_or_default(),
@@ -543,16 +962,8 @@ impl App {
 
         match self.kind_plural.as_str() {
             "pods" => {
-                let containers = container_names(obj);
-                self.launch_logs(
-                    LogSource::Pod {
-                        ns,
-                        name: name.clone(),
-                        uid: obj.metadata.uid.clone(),
-                        containers,
-                    },
-                    format!("{name} — logs"),
-                );
+                let (source, title) = pod_log_source(obj);
+                self.launch_logs(source, title);
             }
             "deployments" | "statefulsets" | "daemonsets" | "replicasets" | "jobs" => {
                 match label_selector(obj, "matchLabels") {
@@ -579,6 +990,13 @@ impl App {
     /// Mirrors [`App::open_logs`], but the backend answers instead of the
     /// kubelet — so it also covers restarted and deleted pods.
     pub(super) fn open_provider_logs(&mut self) {
+        if self.log_provider_invalid() {
+            return;
+        }
+        if let Some(link) = self.active_log_link() {
+            self.open_log_link(&link, None);
+            return;
+        }
         let label = format!("victorialogs ({})", self.provider_lookback_label());
         let Some(obj) = self.selected_ref() else {
             return;
@@ -632,6 +1050,102 @@ impl App {
         }
     }
 
+    /// The link provider `L` uses: the configured one, else Cloud Logging for
+    /// a GKE cluster without a `[providers.logs]` section. A section that
+    /// failed to compile still counts, so a broken config never falls back
+    /// to a backend the user did not pick.
+    fn active_log_link(&self) -> Option<crate::providers::LogLink> {
+        if self.log_provider_configured {
+            return self.log_link.clone();
+        }
+        crate::providers::LogLink::detect(&self.cluster.cluster_name)
+    }
+
+    /// Warn when `[providers.logs]` is present but did not compile, instead
+    /// of falling back to a backend the user did not pick.
+    fn log_provider_invalid(&mut self) -> bool {
+        let invalid =
+            self.log_provider_configured && self.log_link.is_none() && self.log_provider.is_none();
+        if invalid {
+            self.flash_warn("[providers.logs] is invalid, see :config");
+        }
+        invalid
+    }
+
+    /// Open the log UI link for the selected row, or for one container of a
+    /// pod from the container picker.
+    fn open_log_link(
+        &mut self,
+        link: &crate::providers::LogLink,
+        container: Option<(String, String, String)>,
+    ) {
+        let mut target = crate::providers::LinkTarget {
+            context: self.cluster.context.clone(),
+            cluster: self.cluster.cluster_name.clone(),
+            ..Default::default()
+        };
+        if let Some((ns, pod, container)) = container {
+            target.resource = "pods".into();
+            target.namespace = ns;
+            target.name = pod;
+            target.container = Some(container);
+        } else {
+            let Some(obj) = self.selected_ref() else {
+                return;
+            };
+            target.resource = self.kind_plural.clone();
+            target.name = obj.metadata.name.clone().unwrap_or_default();
+            // A namespace row is its own namespace.
+            target.namespace = if self.kind_plural == "namespaces" {
+                target.name.clone()
+            } else {
+                obj.metadata.namespace.clone().unwrap_or_default()
+            };
+            target.selector =
+                crate::providers::link_selector(&self.kind_plural, &obj.data).unwrap_or_default();
+        }
+        match link.url(&target) {
+            Ok(url) => self.open_url(url),
+            Err(e) => self.flash_warn(&e),
+        }
+    }
+
+    /// Open `url` in the browser. Without one (over SSH, or no opener), copy
+    /// it to the clipboard, and show it when that fails too.
+    fn open_url(&mut self, url: String) {
+        #[cfg(test)]
+        self.opened_links.push(url);
+        #[cfg(not(test))]
+        {
+            let claim = self.claim_status("opening logs in the browser…");
+            let tx = self.tx.clone();
+            let generation = self.generation;
+            tokio::spawn(async move {
+                let failure = format!("log link: {url}");
+                let (copied, success) = tokio::task::spawn_blocking(move || {
+                    if open_in_browser(&url) {
+                        (true, "opened logs in the browser".to_string())
+                    } else if copy_to_clipboard(&url) {
+                        (true, format!("no browser, copied log link: {url}"))
+                    } else {
+                        (false, String::new())
+                    }
+                })
+                .await
+                .unwrap_or((false, String::new()));
+                let _ = tx
+                    .send(Msg::ClipboardCopied {
+                        generation,
+                        claim,
+                        copied,
+                        success,
+                        failure,
+                    })
+                    .await;
+            });
+        }
+    }
+
     /// The lookback window shown in provider-view titles: the configured (or
     /// previously discovered) provider's, else the default an autodiscovered
     /// one will use.
@@ -680,6 +1194,13 @@ impl App {
         pod: String,
         container: String,
     ) {
+        if self.log_provider_invalid() {
+            return;
+        }
+        if let Some(link) = self.active_log_link() {
+            self.open_log_link(&link, Some((ns, pod, container)));
+            return;
+        }
         let title = format!(
             "{pod}:{container} — victorialogs ({})",
             self.provider_lookback_label()
@@ -730,6 +1251,33 @@ impl App {
         self.logs.clear_lines();
         self.logs.view.scroll = 0;
         self.restart_log_stream();
+    }
+
+    /// `a`: switch a pod's log view between its annotated default container
+    /// and every container, keeping filter and follow state. A stopped
+    /// stream picks up the switch when it resumes.
+    pub(super) fn toggle_all_containers(&mut self) {
+        let Some(LogSource::Pod {
+            name,
+            default: Some(default),
+            all_containers,
+            ..
+        }) = &mut self.logs.source
+        else {
+            self.flash_warn("no default container to switch from");
+            return;
+        };
+        *all_containers = !*all_containers;
+        let shown = (!*all_containers).then_some(default.as_str());
+        self.logs.view.title = pod_logs_title(name, shown);
+        self.flash = match shown {
+            Some(c) => format!("logs: container {c}"),
+            None => "logs: all containers".into(),
+        };
+        self.flash_err = false;
+        if !self.logs.stopped {
+            self.retail_logs();
+        }
     }
 
     /// Bump the log generation, abort old log tasks, and spawn fresh ones for
@@ -788,7 +1336,13 @@ impl App {
                 name,
                 uid,
                 containers,
+                default,
+                all_containers,
             }) => {
+                let containers = match default {
+                    Some(c) if !all_containers => vec![c],
+                    _ => containers,
+                };
                 if containers.is_empty() {
                     // Unknown container set (e.g. from xray) — stream the default.
                     let instance = log_follow::Instance::Named(uid);
@@ -977,7 +1531,7 @@ impl App {
             match crate::providers::parse_lookback(input) {
                 Ok(secs) => secs,
                 Err(error) => {
-                    self.flash_warn(&format!("lookback: {error}; use s/m/h/d or tail"));
+                    self.flash_warn(&format!("lookback: {error}; use s/m/h/d/w or tail"));
                     return;
                 }
             }

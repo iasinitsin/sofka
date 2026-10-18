@@ -70,6 +70,13 @@ browse other views - "tell me when this rollout finishes" and keep working.
 notifications so events from the previous cluster cannot cross contexts.
 Everything is session-local.
 
+`:notify <note>` adds a note that says why you are watching, prepended to every
+message for that object: `look at this - pod/web: Ready True → False`. The same
+text goes to the status line, the terminal, and `$MESSAGE`, so notifier configs
+need no change. `:notify <note>` on an object that is already watched replaces
+the note and keeps the watch; bare `:notify` still turns it off. Notes longer
+than 80 characters are shortened so the change itself always fits.
+
 ```toml
 [notify]
 bell = true         # ring the terminal bell
@@ -104,15 +111,37 @@ otherwise. Any other value is reported in `:config` and treated as `raw`.
 Record view shows each structured log record (zap, slog, logrus, pino) on one row:
 time, level, message, then the other fields as `key=value`. It reads the time from
 `time`, `ts`, `timestamp`, or `@timestamp`, the level from `level`, `lvl`, or
-`severity`, and the message from `msg` or `message`. Epoch times become RFC 3339.
-Values with control characters, and strings that read as another JSON type
+`severity`, and the message from `msg` or `message`. A `logger` name (zap, logr)
+is shown before the message as `logger: message`. Epoch times become RFC 3339.
+Fields keep the order the application wrote them, and a `›` separates the
+message from them. Nested objects are flattened into dotted keys in their
+original order (`object.kind=Lease`), up to four levels deep and 64 nested
+fields per record. Deeper or larger objects, empty objects, and arrays stay
+compact JSON. A key that contains a dot is quoted when it would read the same as a
+flattened path (`"a.b"=1 a.b=2`). Keys with whitespace, `=`, or `"` are
+quoted (`"worker count"=1`). Values with control characters, and strings that read as another JSON type
 (`"true"`, `"3"`, `"{}"`), are shown as quoted JSON strings, so a record stays on
-one row. Records without a level or message field stay raw. The row color comes
-from the record's level.
+one row. Records without a level or message field stay raw.
+
+Each part of a record row has its own style: the message is bright, keys, the
+time, and the `›` are dim, and the level token takes its level's color. Values
+are colored by type: numbers, booleans, `null`, and quoted strings. WARN and
+ERROR rows also tint the message, logger, and values in the level's color.
+Search highlights matches across a key and its value (`n=3`).
+
+Set `record_time_format` in `[logs]` to a strftime format to shorten record
+times, for example `"%b %d %H:%M:%S%.3f"` for `Oct 08 15:00:20.444`. It applies
+to RFC 3339 strings and epoch numbers; other time strings stay as written.
+`record_time_zone` picks `utc` (the default) or `local`. Without a format, times
+keep their RFC 3339 text. An invalid format or zone is reported in `:config` and
+the default is used. A reload re-renders buffered records.
 
 Only individual JSON objects and arrays are formatted. Other text stays unchanged.
-Source labels and timestamps stay with their record. Filters and severity selection
-use the original record and show all its formatted rows when it matches.
+Source labels and timestamps stay with their record. The `/` filter matches a
+record by its original text or by the formatted row shown for it, so both
+`"level":50` and `ERROR` find it; a leading `!` hides a record when either
+matches. Color codes are ignored when matching. Severity selection uses the
+original record. A matching record shows all its formatted rows.
 Application copy/save keeps its existing raw output. Terminal selection copies the
 displayed text. Configure the key with `json` in `[keys.logs]`.
 
@@ -164,6 +193,8 @@ buffer = 5000      # max lines kept while following (oldest dropped)
 since = "1h"       # optional: only logs newer than this, within the tail limit
 fullscreen = false # open log views fullscreen (F toggles per session)
 json_view = "raw"  # raw, record, or pretty: the JSON view a session starts in
+record_time_format = "%b %d %H:%M:%S%.3f" # optional: strftime for record view times
+record_time_zone = "utc"                  # utc or local
 ```
 
 Press `T` to enter a positive duration such as `90s`, `30m`, `24h`, or `2d`.
@@ -183,7 +214,9 @@ initial lines. Previous-container logs keep their full history.
 In the view, `/` filters with a case-insensitive substring, a `/regex/`, or a
 leading `!` to invert (keep lines that don't match). A malformed regex is flagged
 instead of hiding everything. `z` clears the on-screen buffer while the live
-stream keeps appending. A pod streams every container's logs at once. Full keymap:
+stream keeps appending. A pod streams every container's logs at once, unless a
+`kubectl.kubernetes.io/default-container` annotation names one: then only that
+container streams and `a` switches to every container and back. Full keymap:
 [Logs view](keys.md#logs-view).
 
 For history that outlives the pod, use [VictoriaLogs](providers.md#log-provider-victorialogs).

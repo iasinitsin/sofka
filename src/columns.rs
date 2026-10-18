@@ -180,6 +180,14 @@ const NODE_COLUMNS: &[Column] = &[
     column("AGE", col_age),
 ];
 
+const CSR_COLUMNS: &[Column] = &[
+    column("NAME", col_name),
+    column("SIGNER", col_csr_signer),
+    column("REQUESTOR", col_csr_requestor),
+    status_column("CONDITION", col_csr_condition),
+    column("AGE", col_age),
+];
+
 const NAMESPACE_COLUMNS: &[Column] = &[
     column("NAME", col_name),
     status_column("STATUS", col_namespace_status),
@@ -209,6 +217,7 @@ const JOB_COLUMNS: &[Column] = &[
 
 const CRONJOB_COLUMNS: &[Column] = &[
     column("NAME", col_name),
+    status_column("STATUS", col_cronjob_status),
     column("SCHEDULE", col_cronjob_schedule),
     column("SUSPEND", col_cronjob_suspend),
     column("ACTIVE", col_cronjob_active),
@@ -324,6 +333,23 @@ const FLUX_INPUT_PROVIDER_COLUMNS: &[Column] = &[
 
 const DEFAULT_COLUMNS: &[Column] = &[column("NAME", col_name), column("AGE", col_age)];
 
+/// The `:workloads` view lists several kinds at once; each cell reads the
+/// row's own kind from its `kind` field.
+const WORKLOAD_COLUMNS: &[Column] = &[
+    column("NAME", col_name),
+    column("KIND", col_workload_kind),
+    column("READY", col_workload_ready),
+    status_column("STATUS", col_workload_status),
+    column("AGE", col_age),
+];
+
+/// The `:ns-resources` view: one row per kind with objects in the namespace.
+const NS_RESOURCE_COLUMNS: &[Column] = &[
+    column("KIND", col_ns_resource_kind),
+    column("GROUP", col_ns_resource_group),
+    column("COUNT", col_ns_resource_count),
+];
+
 /// One row per release, at its latest revision — like `helm list`. Backed by
 /// the release storage `Secret`s (see `crate::helm`), not a real discovered
 /// resource kind.
@@ -384,6 +410,7 @@ fn columns_for(group: &str, plural: &str) -> &'static [Column] {
         ("", "services") => SERVICE_COLUMNS,
         ("", "nodes") => NODE_COLUMNS,
         ("", "namespaces") => NAMESPACE_COLUMNS,
+        ("certificates.k8s.io", "certificatesigningrequests") => CSR_COLUMNS,
         ("", "configmaps") => CONFIGMAP_COLUMNS,
         ("", "secrets") => SECRET_COLUMNS,
         ("batch", "jobs") => JOB_COLUMNS,
@@ -407,6 +434,8 @@ fn columns_for(group: &str, plural: &str) -> &'static [Column] {
         ("argoproj.io", "applications") => ARGOCD_APP_COLUMNS,
         ("argoproj.io", "applicationsets") => ARGOCD_APPSET_COLUMNS,
         ("", "helm") => HELM_COLUMNS,
+        ("", "workloads") => WORKLOAD_COLUMNS,
+        ("", "ns-resources") => NS_RESOURCE_COLUMNS,
         ("", "helmhistory") => HELM_HISTORY_COLUMNS,
         ("apps", crate::rollout::VIEW) => ROLLOUT_HISTORY_COLUMNS,
         _ => DEFAULT_COLUMNS,
@@ -945,6 +974,9 @@ fn is_numeric_header(group: &str, plural: &str, header: &str) -> bool {
         .iter()
         .any(|flux| cols.as_ptr() == flux.as_ptr());
     }
+    if header == "COUNT" && plural == "ns-resources" {
+        return true;
+    }
     // Inventory and input counts, named generically enough that only the
     // flux-operator kinds' own columns are known to hold numbers.
     if matches!(header, "RESOURCES" | "INPUTS") {
@@ -1267,6 +1299,39 @@ fn col_node_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Borrowed(node_status(ctx.data))
 }
 
+fn col_csr_signer<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "signerName"]).unwrap_or_default())
+}
+
+fn col_csr_requestor<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "username"]).unwrap_or_default())
+}
+
+fn col_csr_condition<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(csr_condition(ctx.data))
+}
+
+/// What `kubectl get csr` prints: the condition types in order, `Pending`
+/// when there are none, and `,Issued` once the signer has set a certificate.
+pub(crate) fn csr_condition(data: &Value) -> String {
+    let mut types = csr_condition_types(data).collect::<Vec<_>>().join(",");
+    if types.is_empty() {
+        types.push_str("Pending");
+    }
+    if sget(data, &["status", "certificate"]).is_some_and(|c| !c.is_empty()) {
+        types.push_str(",Issued");
+    }
+    types
+}
+
+pub(crate) fn csr_condition_types(data: &Value) -> impl Iterator<Item = &str> {
+    data.pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("type").and_then(Value::as_str))
+}
+
 fn col_node_roles<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Owned(node_roles(ctx.obj, ctx.node_roles.as_deref()))
 }
@@ -1337,23 +1402,123 @@ fn col_secret_data<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 }
 
 fn col_job_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
-    let d = ctx.data;
-    if ctx.obj.metadata.deletion_timestamp.is_some() {
-        "Terminating".into()
+    job_status(ctx.obj).into()
+}
+
+fn job_status(obj: &DynamicObject) -> &'static str {
+    let d = &obj.data;
+    if obj.metadata.deletion_timestamp.is_some() {
+        "Terminating"
     } else if condition_is(d, "Failed", "True") || condition_is(d, "FailureTarget", "True") {
-        "Failed".into()
+        "Failed"
     } else if condition_is(d, "Complete", "True") {
-        "Completed".into()
+        "Completed"
     } else if condition_is(d, "SuccessCriteriaMet", "True") {
-        "Completing".into()
+        "Completing"
     } else if d.pointer("/spec/suspend").and_then(Value::as_bool) == Some(true)
         || condition_is(d, "Suspended", "True")
     {
-        "Suspended".into()
+        "Suspended"
     } else if iget(d, &["status", "active"]) > 0 {
-        "Running".into()
+        "Running"
     } else {
-        "Pending".into()
+        "Pending"
+    }
+}
+
+/// Whether [`object_faulted`] judges this kind.
+pub fn has_faults_rule(group: &str, plural: &str) -> bool {
+    matches!(
+        (group, plural),
+        (
+            "apps" | "extensions",
+            "deployments" | "daemonsets" | "replicasets"
+        ) | ("apps", "statefulsets")
+            | ("batch", "jobs" | "cronjobs")
+            | ("kustomize.toolkit.fluxcd.io", "kustomizations")
+            | ("helm.toolkit.fluxcd.io", "helmreleases")
+            | (
+                "source.toolkit.fluxcd.io",
+                "gitrepositories" | "helmrepositories" | "ocirepositories" | "buckets"
+            )
+            | (
+                "fluxcd.controlplane.io",
+                "resourcesets" | "fluxinstances" | "resourcesetinputproviders"
+            )
+            | ("argoproj.io", "applications" | "applicationsets")
+    )
+}
+
+/// Whether an object needs attention, for the `Ctrl+Z` faults filter:
+/// a controller that is not fully ready, a Job that has not run cleanly,
+/// a CronJob that is suspended or whose last run did not succeed, a Flux
+/// object that is suspended or not `Ready`, or an Argo CD Application or
+/// ApplicationSet that is not healthy and synced. `None` for kinds the
+/// filter does not cover; pods have their own rules.
+pub fn object_faulted(group: &str, plural: &str, obj: &DynamicObject) -> Option<bool> {
+    let d = &obj.data;
+    let terminating = obj.metadata.deletion_timestamp.is_some();
+    let counts = match (group, plural) {
+        ("apps" | "extensions", "deployments") => WorkloadCounts::deployment(d),
+        ("apps", "statefulsets") => WorkloadCounts::statefulset(d),
+        ("apps" | "extensions", "daemonsets") => WorkloadCounts::daemonset(d),
+        ("apps" | "extensions", "replicasets") => WorkloadCounts::replicaset(d),
+        ("batch", "jobs") => {
+            return Some(!matches!(
+                job_status(obj),
+                "Running" | "Completing" | "Completed"
+            ));
+        }
+        ("batch", "cronjobs") => return Some(cronjob_faulted(obj)),
+        ("kustomize.toolkit.fluxcd.io", _)
+        | ("helm.toolkit.fluxcd.io", _)
+        | ("source.toolkit.fluxcd.io", _) => {
+            return Some(
+                terminating || bget(d, &["spec", "suspend"]) || ready_condition(d).0 != "True",
+            );
+        }
+        ("fluxcd.controlplane.io", _) => {
+            return Some(
+                terminating || flux_operator_disabled(obj) || ready_condition(d).0 != "True",
+            );
+        }
+        ("argoproj.io", "applications") => {
+            return Some(
+                terminating
+                    || sget(d, &["status", "health", "status"]) != Some("Healthy")
+                    || sget(d, &["status", "sync", "status"]) != Some("Synced"),
+            );
+        }
+        ("argoproj.io", "applicationsets") => {
+            return Some(terminating || crate::argocd::applicationset_status(obj) != "Synced");
+        }
+        _ => return None,
+    };
+    Some(
+        terminating
+            || !matches!(
+                workload_status(obj, counts).as_str(),
+                "Ready" | "ScaledDown"
+            ),
+    )
+}
+
+/// A CronJob is faulted when it is suspended, terminating, or its last
+/// scheduled run finished without succeeding. A run still active is not
+/// judged yet.
+fn cronjob_faulted(obj: &DynamicObject) -> bool {
+    matches!(cronjob_status(obj), "Terminating" | "Suspended" | "Failed")
+}
+
+/// The last scheduled run finished without a success after it.
+fn cronjob_last_run_failed(d: &Value) -> bool {
+    match (
+        timestamp_secs(d, &["status", "lastScheduleTime"]),
+        timestamp_secs(d, &["status", "lastSuccessfulTime"]),
+    ) {
+        (Some(scheduled), Some(succeeded)) => succeeded < scheduled,
+        (Some(_), None) => true,
+        (None, _) => false,
     }
 }
 
@@ -1367,6 +1532,78 @@ fn col_job_completions<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 
 fn col_job_duration<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Owned(job_duration(ctx.data, ctx.now))
+}
+
+fn workload_kind(obj: &DynamicObject) -> &str {
+    obj.types.as_ref().map_or("", |t| t.kind.as_str())
+}
+
+fn ns_resource_field<'a>(ctx: &CellContext<'a>, field: &str) -> Cow<'a, str> {
+    Cow::Borrowed(ctx.data[field].as_str().unwrap_or(""))
+}
+
+fn col_ns_resource_kind<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    ns_resource_field(ctx, "kind")
+}
+
+fn col_ns_resource_group<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    ns_resource_field(ctx, "group")
+}
+
+fn col_ns_resource_count<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    ns_resource_field(ctx, "count")
+}
+
+fn col_workload_kind<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(workload_kind(ctx.obj))
+}
+
+fn col_workload_ready<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    let d = ctx.data;
+    match workload_kind(ctx.obj) {
+        "Pod" => Cow::Owned(ctx.pod().0.clone()),
+        "Deployment" | "StatefulSet" => col_deploy_ready(ctx),
+        "DaemonSet" => Cow::Owned(format!(
+            "{}/{}",
+            iget(d, &["status", "numberReady"]),
+            iget(d, &["status", "desiredNumberScheduled"])
+        )),
+        "Job" => col_job_completions(ctx),
+        _ => Cow::Borrowed(""),
+    }
+}
+
+fn col_workload_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    match workload_kind(ctx.obj) {
+        "Pod" => Cow::Owned(ctx.pod().1.clone()),
+        "Deployment" => col_deploy_status(ctx),
+        "StatefulSet" => col_sts_status(ctx),
+        "DaemonSet" => col_ds_status(ctx),
+        "Job" => col_job_status(ctx),
+        "CronJob" => Cow::Borrowed(cronjob_status(ctx.obj)),
+        _ => Cow::Borrowed(""),
+    }
+}
+
+fn col_cronjob_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(cronjob_status(ctx.obj))
+}
+
+/// A CronJob's state, from the same evidence as its faults rule, so a row
+/// the faults filter keeps is never tinted healthy.
+fn cronjob_status(obj: &DynamicObject) -> &'static str {
+    let d = &obj.data;
+    if obj.metadata.deletion_timestamp.is_some() {
+        "Terminating"
+    } else if bget(d, &["spec", "suspend"]) {
+        "Suspended"
+    } else if count_arr(d, &["status", "active"]) > 0 {
+        "Running"
+    } else if cronjob_last_run_failed(d) {
+        "Failed"
+    } else {
+        "Scheduled"
+    }
 }
 
 fn col_cronjob_schedule<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
@@ -1554,14 +1791,15 @@ fn col_flux_exported_inputs<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 /// flux-operator kinds pause through `fluxcd.controlplane.io/reconcile:
 /// disabled` rather than `spec.suspend`.
 fn col_flux_operator_suspended<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
-    let disabled = ctx
-        .obj
-        .metadata
+    Cow::Owned(flux_operator_disabled(ctx.obj).to_string())
+}
+
+fn flux_operator_disabled(obj: &DynamicObject) -> bool {
+    obj.metadata
         .annotations
         .as_ref()
         .and_then(|a| a.get("fluxcd.controlplane.io/reconcile"))
-        .is_some_and(|v| v == "disabled");
-    Cow::Owned(disabled.to_string())
+        .is_some_and(|v| v == "disabled")
 }
 
 fn col_argocd_sync<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
@@ -2395,11 +2633,70 @@ fn event_message(d: &Value) -> Cow<'_, str> {
     let message = sget(d, &["message"])
         .or_else(|| sget(d, &["note"]))
         .unwrap_or_default();
-    if message.contains(['\n', '\r']) {
+    let message = if message.contains(['\n', '\r']) {
         Cow::Owned(message.replace(['\n', '\r'], " "))
     } else {
         Cow::Borrowed(message)
+    };
+    match humanize_byte_counts(&message) {
+        Some(humanized) => Cow::Owned(humanized),
+        None => message,
     }
+}
+
+/// Rewrite every standalone `<digits> bytes` in `text` into a binary unit
+/// scaled to the value (`80474558 bytes` → `76.7 MiB`). Counts below 1 KiB
+/// stay as they are. Returns `None` when nothing changed.
+fn humanize_byte_counts(text: &str) -> Option<String> {
+    const SUFFIX: &str = " bytes";
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit()
+            || text[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| is_word_char(c) || c == '.')
+        {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let end = i + SUFFIX.len();
+        if !text[i..].starts_with(SUFFIX) || text[end..].chars().next().is_some_and(is_word_char) {
+            continue;
+        }
+        let Ok(count) = text[start..i].parse::<u64>() else {
+            continue;
+        };
+        if count < 1024 {
+            continue;
+        }
+        let mut value = count as f64 / 1024.0;
+        let mut unit = 0;
+        while (value * 10.0).round() >= 10240.0 && unit + 1 < UNITS.len() {
+            value /= 1024.0;
+            unit += 1;
+        }
+        out.push_str(&text[copied..start]);
+        out.push_str(&format!("{value:.1} {}", UNITS[unit]));
+        copied = end;
+        i = end;
+    }
+    (copied > 0).then(|| {
+        out.push_str(&text[copied..]);
+        out
+    })
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 fn event_count(d: &Value) -> i64 {
@@ -2581,7 +2878,7 @@ pub fn fmt_mem(bytes: i64) -> String {
         return "-".into();
     }
     let mi = bytes as f64 / (1024.0 * 1024.0);
-    if mi >= 1024.0 {
+    if mi.round() >= 1024.0 {
         format!("{:.1}Gi", mi / 1024.0)
     } else {
         format!("{:.0}Mi", mi)
@@ -2637,6 +2934,13 @@ mod tests {
         assert_eq!(parse_mem_bytes("1Mi"), 1024 * 1024);
         assert_eq!(parse_mem_bytes("1Gi"), 1024 * 1024 * 1024);
         assert_eq!(fmt_mem(parse_mem_bytes("512Mi")), "512Mi");
+    }
+
+    #[test]
+    fn fmt_mem_promotes_to_gi_when_mi_rounds_to_1024() {
+        assert_eq!(fmt_mem(1024 * 1024 * 1024 - 1), "1.0Gi");
+        assert_eq!(fmt_mem(1_073_293_248), "1.0Gi");
+        assert_eq!(fmt_mem(1_073_217_535), "1023Mi");
     }
 
     #[test]
@@ -3257,6 +3561,7 @@ mod tests {
             headers("batch", "cronjobs"),
             vec![
                 "NAME",
+                "STATUS",
                 "SCHEDULE",
                 "SUSPEND",
                 "ACTIVE",
@@ -3264,10 +3569,11 @@ mod tests {
                 "AGE"
             ]
         );
-        assert_eq!(cells[1], "*/15 * * * *");
-        assert_eq!(cells[2], "false");
-        assert_eq!(cells[3], "1");
-        assert_eq!(cells[4], "<none>");
+        assert_eq!(cells[1], "Running");
+        assert_eq!(cells[2], "*/15 * * * *");
+        assert_eq!(cells[3], "false");
+        assert_eq!(cells[4], "1");
+        assert_eq!(cells[5], "<none>");
     }
 
     #[test]
@@ -3302,6 +3608,41 @@ mod tests {
         assert_eq!(cells[5], "Back-off restarting failed container");
         assert_eq!(cells[6], "7");
         assert_eq!(status_idx, None);
+    }
+
+    #[test]
+    fn humanize_byte_counts_scales_each_value() {
+        assert_eq!(
+            humanize_byte_counts("Image size: 80474558 bytes.").as_deref(),
+            Some("Image size: 76.7 MiB.")
+        );
+        assert_eq!(
+            humanize_byte_counts("2048 bytes then 3221225472 bytes").as_deref(),
+            Some("2.0 KiB then 3.0 GiB")
+        );
+        assert_eq!(
+            humanize_byte_counts("1048575 bytes then 1073741823 bytes").as_deref(),
+            Some("1.0 MiB then 1.0 GiB")
+        );
+        assert_eq!(
+            humanize_byte_counts("1048524 bytes").as_deref(),
+            Some("1023.9 KiB")
+        );
+        assert_eq!(humanize_byte_counts("wrote 512 bytes"), None);
+        assert_eq!(humanize_byte_counts("v1.80474558 bytes"), None);
+        assert_eq!(humanize_byte_counts("x80474558 bytes"), None);
+        assert_eq!(humanize_byte_counts("80474558 bytesize"), None);
+        assert_eq!(humanize_byte_counts("80474558 Bytes"), None);
+        assert_eq!(humanize_byte_counts("café2048 bytes"), None);
+        assert_eq!(humanize_byte_counts("buffer_2048 bytes"), None);
+        assert_eq!(humanize_byte_counts("2048 bytes_suffix"), None);
+        assert_eq!(humanize_byte_counts("2048 bytesé"), None);
+        assert_eq!(
+            humanize_byte_counts("é 2048 bytes é").as_deref(),
+            Some("é 2.0 KiB é")
+        );
+        assert_eq!(humanize_byte_counts("99999999999999999999 bytes"), None);
+        assert_eq!(humanize_byte_counts("no counts here"), None);
     }
 
     #[test]

@@ -283,16 +283,16 @@ impl App {
             }
             (Some(Action::Down), _) => list_step(&mut self.sort_picker_state, len, true),
             (Some(Action::Up), _) => list_step(&mut self.sort_picker_state, len, false),
-            (Some(Action::PageDown), _) => list_page(
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => list_page(
                 &mut self.sort_picker_state,
                 len,
-                self.picker_page_items,
+                a.page_size(self.picker_page_items),
                 true,
             ),
-            (Some(Action::PageUp), _) => list_page(
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => list_page(
                 &mut self.sort_picker_state,
                 len,
-                self.picker_page_items,
+                a.page_size(self.picker_page_items),
                 false,
             ),
             (Some(Action::Accept), _) => {
@@ -308,7 +308,7 @@ impl App {
                 self.sort_picker_filter.pop();
                 self.select_best_sort_match();
             }
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 self.sort_picker_filter.push(c);
                 self.select_best_sort_match();
             }
@@ -440,16 +440,16 @@ impl App {
             }
             (Some(Action::Down), _) => list_step(&mut self.copy_picker_state, len, true),
             (Some(Action::Up), _) => list_step(&mut self.copy_picker_state, len, false),
-            (Some(Action::PageDown), _) => list_page(
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => list_page(
                 &mut self.copy_picker_state,
                 len,
-                self.picker_page_items,
+                a.page_size(self.picker_page_items),
                 true,
             ),
-            (Some(Action::PageUp), _) => list_page(
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => list_page(
                 &mut self.copy_picker_state,
                 len,
-                self.picker_page_items,
+                a.page_size(self.picker_page_items),
                 false,
             ),
             (Some(Action::Accept), _) => {
@@ -465,7 +465,7 @@ impl App {
                 self.copy_picker_filter.pop();
                 self.select_best_copy_match();
             }
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 self.copy_picker_filter.push(c);
                 self.select_best_copy_match();
             }
@@ -539,12 +539,18 @@ impl App {
             }
             (Some(Action::Down), _) => list_step(&mut self.ns_state, len, true),
             (Some(Action::Up), _) => list_step(&mut self.ns_state, len, false),
-            (Some(Action::PageDown), _) => {
-                list_page(&mut self.ns_state, len, self.picker_page_items, true)
-            }
-            (Some(Action::PageUp), _) => {
-                list_page(&mut self.ns_state, len, self.picker_page_items, false)
-            }
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => list_page(
+                &mut self.ns_state,
+                len,
+                a.page_size(self.picker_page_items),
+                true,
+            ),
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => list_page(
+                &mut self.ns_state,
+                len,
+                a.page_size(self.picker_page_items),
+                false,
+            ),
             (Some(Action::Accept), _) => {
                 let filtered = self.filtered_namespaces();
                 let has_real_match = filtered.iter().any(|n| n != "<all>");
@@ -565,7 +571,7 @@ impl App {
                 self.ns_filter.pop();
                 self.select_best_namespace_match();
             }
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 self.ns_filter.push(c);
                 self.select_best_namespace_match();
             }
@@ -588,6 +594,9 @@ impl App {
     }
 
     pub(super) fn set_namespace(&mut self, sel: String) {
+        if self.ns_resources_active() && self.ns_resources_refuses(&sel) {
+            return;
+        }
         let normalized = normalize_ns(&sel);
         if namespace_patterns::is_pattern(&normalized) {
             self.resolve_namespace_pattern(normalized, NamespacePatternAction::Select);
@@ -712,17 +721,23 @@ impl App {
                 (Some(Action::Accept), _) => self.switch_selected_context(),
                 (Some(Action::Down), _) => list_step(&mut self.ctx_state, len, true),
                 (Some(Action::Up), _) => list_step(&mut self.ctx_state, len, false),
-                (Some(Action::PageDown), _) => {
-                    list_page(&mut self.ctx_state, len, self.picker_page_items, true)
-                }
-                (Some(Action::PageUp), _) => {
-                    list_page(&mut self.ctx_state, len, self.picker_page_items, false)
-                }
+                (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => list_page(
+                    &mut self.ctx_state,
+                    len,
+                    a.page_size(self.picker_page_items),
+                    true,
+                ),
+                (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => list_page(
+                    &mut self.ctx_state,
+                    len,
+                    a.page_size(self.picker_page_items),
+                    false,
+                ),
                 (Some(Action::Backspace), _) => {
                     self.ctx_filter.pop();
                     self.select_best_context_match();
                 }
-                (None, KeyCode::Char(c)) => {
+                (None, KeyCode::Char(c)) if key.is_text() => {
                     self.ctx_filter.push(c);
                     self.select_best_context_match();
                 }
@@ -754,14 +769,20 @@ impl App {
             }
             (Some(Action::Down), _) => list_step(&mut self.ctx_state, len, true),
             (Some(Action::Up), _) => list_step(&mut self.ctx_state, len, false),
-            (Some(Action::PageDown), _) => {
-                list_page(&mut self.ctx_state, len, self.picker_page_items, true)
-            }
-            (Some(Action::PageUp), _) => {
-                list_page(&mut self.ctx_state, len, self.picker_page_items, false)
-            }
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => list_page(
+                &mut self.ctx_state,
+                len,
+                a.page_size(self.picker_page_items),
+                true,
+            ),
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => list_page(
+                &mut self.ctx_state,
+                len,
+                a.page_size(self.picker_page_items),
+                false,
+            ),
             (Some(Action::Accept), _) => self.switch_selected_context(),
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 self.ctx_filtering = true;
                 self.ctx_filter.push(c);
                 self.select_best_context_match();
@@ -938,6 +959,7 @@ impl App {
         self.hide_header = resolved.config.hide_header;
         self.terminal_title = resolved.config.terminal_title.unwrap_or(true);
         self.update_check = resolved.config.update_check.unwrap_or(true);
+        self.save_dir = resolved.config.save_dir;
         self.plugins = resolved.config.plugins;
         self.bookmarks = resolved.config.bookmarks;
         self.workspaces = resolved.config.workspaces;
@@ -967,9 +989,14 @@ impl App {
         let (node_roles, role_warnings) = resolved.config.node_roles.compile();
         self.node_roles = Arc::new(node_roles);
         plugin_warnings.extend(role_warnings);
-        let (log_provider, provider_warnings) =
+        let (log_provider, mut provider_warnings) =
             crate::providers::compile(resolved.config.providers.logs.as_ref());
         self.log_provider = log_provider;
+        let (log_link, link_warnings) =
+            crate::providers::compile_link(resolved.config.providers.logs.as_ref());
+        self.log_link = log_link;
+        self.log_provider_configured = resolved.config.providers.logs.is_some();
+        provider_warnings.extend(link_warnings);
         let (metrics_provider, _mw) =
             crate::providers::compile_metrics(resolved.config.providers.metrics.as_ref());
         self.metrics_provider = metrics_provider;
@@ -993,6 +1020,7 @@ impl App {
             &cluster.default_namespace,
         );
         self.cluster = *cluster;
+        self.prune_layouts();
         plugin_warnings.extend(self.configure_keys(&resolved.config.keys));
         self.stack.clear();
         // View history references the old cluster's kinds and namespaces.
@@ -1000,6 +1028,7 @@ impl App {
         self.history_pos = 0;
         self.kind = None;
         self.kind_plural.clear();
+        self.workloads = None;
         self.labels = None;
         self.fields = None;
         self.owner = None;
@@ -1025,6 +1054,7 @@ impl App {
             .cloned();
         // Keep `:config` in sync with the layers just resolved for this context.
         self.config_warnings = resolved.warnings;
+        self.config_warnings.extend(view_warnings);
         self.config_warnings.extend(plugin_warnings);
         self.config_warnings.extend(threshold_warnings);
         // Explicit destinations take priority over the previous resource type.

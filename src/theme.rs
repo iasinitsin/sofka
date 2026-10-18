@@ -22,12 +22,13 @@
 //!
 //! [`init`] installs the resolved palette once at startup; every color accessor
 //! (`text()`, `peach()`, …) and semantic style (`title()`, `selected_row()`, …)
-//! reads from it. Swatches not yet wired into a view are kept for completeness.
-#![allow(dead_code)]
+//! reads from it. All 25 palette fields remain available for config overrides.
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(test))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use ratatui::style::{Color, Modifier, Style};
@@ -37,7 +38,7 @@ macro_rules! palette_swatches {
     ($($idx:expr => $field:ident),+ $(,)?) => {
         /// A full 25-swatch palette. Field names double as the override keys
         /// accepted under `[skin.colors]` in config.
-        #[derive(Debug, Clone, Copy)]
+        #[derive(Debug, Clone, Copy, PartialEq)]
         pub struct Palette {
             $(pub $field: Color,)+
         }
@@ -256,16 +257,21 @@ fn catppuccin_mocha() -> Palette {
     builtin("catppuccin-mocha").expect("mocha built-in")
 }
 
-fn catppuccin_latte() -> Palette {
-    builtin("catppuccin-latte").expect("latte built-in")
-}
-
 /// Best-effort dark/light detection via an OSC 11 background-color query.
 /// `None` means the terminal didn't answer (unsupported, `TERM=dumb`, piped
 /// output, or the query timed out) — callers should treat that as "assume
 /// dark" rather than blocking or erroring.
 fn detect_terminal_mode() -> Option<ThemeMode> {
     terminal_colorsaurus::theme_mode(QueryOptions::default()).ok()
+}
+
+/// The built-in name of the palette `resolve_skin` draws for `name`.
+pub fn canonical_skin_name(name: &str) -> &'static str {
+    let palette = builtin(&name.trim().to_ascii_lowercase()).unwrap_or_else(catppuccin_mocha);
+    BUILTIN_NAMES
+        .iter()
+        .find(|n| builtin(n) == Some(palette))
+        .expect("every built-in palette is listed in BUILTIN_NAMES")
 }
 
 /// The skin used when config names none: auto-detected from the terminal's
@@ -341,7 +347,8 @@ pub fn validate_skin(name: Option<&str>, colors: &HashMap<String, String>) -> Ve
 /// Parse `#rrggbb` (or `rrggbb`) into a `Color::Rgb`. Returns `None` for any
 /// other length or non-hex content.
 fn parse_hex(s: &str) -> Option<Color> {
-    let s = s.trim().trim_start_matches('#');
+    let s = s.trim();
+    let s = s.strip_prefix('#').unwrap_or(s);
     if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -378,16 +385,32 @@ thread_local! {
     static CACHED: Cell<(u64, Palette)> = Cell::new((0, catppuccin_mocha()));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests run on parallel threads of one process, so each test thread gets
+    /// its own active palette and background flag: a test that switches skins
+    /// can't repaint a frame another test is asserting on.
+    static TEST_PALETTE: Cell<Option<Palette>> = const { Cell::new(None) };
+    static TEST_BACKGROUND: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Install the active palette. If called after startup, replaces the active
 /// palette so `:skin` can update colors without restarting the TUI.
 pub fn init(p: Palette) {
     if ACTIVE.set(RwLock::new(p)).is_err() {
-        set(p);
+        set_shared(p);
     }
     EPOCH.fetch_add(1, Ordering::Release);
 }
 
 pub fn set(p: Palette) {
+    #[cfg(test)]
+    TEST_PALETTE.with(|c| c.set(Some(p)));
+    #[cfg(not(test))]
+    set_shared(p);
+}
+
+fn set_shared(p: Palette) {
     let lock = ACTIVE.get_or_init(|| RwLock::new(catppuccin_mocha()));
     match lock.write() {
         Ok(mut active) => *active = p,
@@ -405,6 +428,16 @@ pub fn snapshot() -> Palette {
 }
 
 fn palette() -> Palette {
+    // Never the shared palette in tests: the cache test below rewrites it.
+    #[cfg(test)]
+    return TEST_PALETTE
+        .with(|c| c.get())
+        .unwrap_or_else(catppuccin_mocha);
+    #[cfg(not(test))]
+    shared_palette()
+}
+
+fn shared_palette() -> Palette {
     let epoch = EPOCH.load(Ordering::Acquire);
     CACHED.with(|c| {
         let (cached_epoch, cached) = c.get();
@@ -430,6 +463,7 @@ fn load_active() -> Palette {
 /// Whether views are filled with the skin's own background (`base`) rather than
 /// left transparent. Independent of the active palette so it survives a live
 /// `:skin`/context switch.
+#[cfg(not(test))]
 static BACKGROUND: AtomicBool = AtomicBool::new(false);
 
 /// Enable (or disable) painting the palette's `base` swatch as the app
@@ -438,13 +472,20 @@ static BACKGROUND: AtomicBool = AtomicBool::new(false);
 /// background color: pair it with a per-context skin override to make e.g. a
 /// light prod skin visibly glow.
 pub fn set_background(on: bool) {
+    #[cfg(test)]
+    TEST_BACKGROUND.with(|c| c.set(on));
+    #[cfg(not(test))]
     BACKGROUND.store(on, Ordering::Relaxed);
 }
 
 /// The background fill color when enabled, or `None` to leave the terminal
 /// background untouched.
 pub fn background() -> Option<Color> {
-    BACKGROUND.load(Ordering::Relaxed).then(base)
+    #[cfg(test)]
+    let on = TEST_BACKGROUND.with(|c| c.get());
+    #[cfg(not(test))]
+    let on = BACKGROUND.load(Ordering::Relaxed);
+    on.then(base)
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +523,42 @@ pub fn selected_row() -> Style {
         .bg(lavender())
         .fg(base())
         .add_modifier(Modifier::BOLD)
+}
+
+/// Cursor on a marked row: the mark color as the bar, like k9s, so marking
+/// the row under the cursor shows without moving away from it. The text takes
+/// whichever of `base` and `text` reads better on the mark color, since some
+/// skins (gruvbox-light) put `base` and the mark color close together.
+pub fn selected_marked_row() -> Style {
+    let bg = mark();
+    let fg = if contrast(base(), bg) >= contrast(text(), bg) {
+        base()
+    } else {
+        text()
+    };
+    Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD)
+}
+
+/// WCAG contrast ratio between two colors; 1.0 when either is not RGB.
+fn contrast(a: Color, b: Color) -> f64 {
+    fn luminance(color: Color) -> Option<f64> {
+        let Color::Rgb(r, g, b) = color else {
+            return None;
+        };
+        let channel = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        Some(0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b))
+    }
+    match (luminance(a), luminance(b)) {
+        (Some(a), Some(b)) => (a.max(b) + 0.05) / (a.min(b) + 0.05),
+        _ => 1.0,
+    }
 }
 
 /// Sort-indicator arrow in the header: k9s `header.sorterColor` (sky).
@@ -646,10 +723,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn marked_cursor_row_text_is_readable_in_every_builtin_skin() {
+        for name in BUILTIN_NAMES {
+            set(builtin(name).unwrap());
+            let style = selected_marked_row();
+            let ratio = contrast(style.fg.unwrap(), style.bg.unwrap());
+            assert!(ratio >= 2.5, "{name}: {ratio:.2}");
+        }
+        // gruvbox-light's `base` is cream on its cream mark color.
+        set(builtin("gruvbox-light").unwrap());
+        assert_eq!(selected_marked_row().fg, Some(text()));
+    }
+
+    #[test]
     fn all_builtins_parse() {
         for name in BUILTIN_NAMES {
             assert!(builtin(name).is_some(), "missing built-in {name}");
         }
+    }
+
+    #[test]
+    fn canonical_skin_name_follows_resolve_skin() {
+        assert_eq!(canonical_skin_name(" Nord "), "nord");
+        assert_eq!(canonical_skin_name("gruvbox"), "gruvbox-dark");
+        assert_eq!(canonical_skin_name("typo"), "catppuccin-mocha");
     }
 
     /// The per-thread palette cache must not outlive a `:skin` change. This is
@@ -661,17 +758,27 @@ mod tests {
         let dawn = builtin("rose-pine-dawn").unwrap();
         assert_ne!(mocha.base, dawn.base, "test needs two distinct palettes");
 
-        set(mocha);
-        assert_eq!(base(), mocha.base);
-        // Warm the cache on several swatches, not just one.
-        let _ = (text(), red(), green());
+        // The shared, cached palette that production reads; test builds
+        // route `set`/accessors to a per-thread copy instead.
+        set_shared(mocha);
+        assert_eq!(shared_palette().base, mocha.base);
+        // Warm the cache several times, not just once.
+        let _ = (shared_palette(), shared_palette());
 
-        set(dawn);
-        assert_eq!(base(), dawn.base, "stale palette served after :skin");
-        assert_eq!(text(), dawn.text);
+        set_shared(dawn);
+        assert_eq!(
+            shared_palette().base,
+            dawn.base,
+            "stale palette served after :skin"
+        );
+        assert_eq!(shared_palette().text, dawn.text);
 
-        set(mocha);
-        assert_eq!(base(), mocha.base, "stale palette served on switch back");
+        set_shared(mocha);
+        assert_eq!(
+            shared_palette().base,
+            mocha.base,
+            "stale palette served on switch back"
+        );
     }
 
     #[test]
@@ -709,6 +816,8 @@ mod tests {
         assert_eq!(parse_hex("1e1e2e"), Some(Color::Rgb(30, 30, 46)));
         assert_eq!(parse_hex("#fff"), None);
         assert_eq!(parse_hex("#gggggg"), None);
+        assert_eq!(parse_hex("##010203"), None);
+        assert_eq!(parse_hex("###010203"), None);
     }
 
     #[test]

@@ -224,6 +224,8 @@ pub enum Mode {
     /// Split-pane PVC browser (`x` on a PVC): local files on the left, the
     /// volume's contents on the right.
     PvcExplore,
+    /// Local manifest browser (`:dir [path]`).
+    Dir,
     /// Port-forward target picker (`f` on a pod/service): lists the object's
     /// declared ports for single-select, plus a "Custom…" entry that falls
     /// through to the typed prompt.
@@ -343,6 +345,12 @@ enum ConfirmAction {
         /// Flux or a controller (shown in the dialog).
         managed: Option<String>,
     },
+    /// Approve or deny these CSRs through the `approval` subresource.
+    CsrDecision {
+        kind: Kind,
+        approve: bool,
+        objs: Vec<DynamicObject>,
+    },
     /// Edit a Flux-managed object (`kubectl edit`) after warning that the edit
     /// will be reverted on the next reconcile.
     Edit { argv: Vec<String> },
@@ -403,6 +411,11 @@ enum ConfirmAction {
     /// Uninstall one or more Helm releases (`helm uninstall`), `(name, ns)`
     /// per release — bulk when marked, like [`ConfirmAction::Delete`].
     HelmUninstall { targets: Vec<(String, String)> },
+    /// `kubectl apply` or `delete` a rendered manifest snapshot (`:dir`).
+    Manifest {
+        verb: dir::DirVerb,
+        plan: dir::DirPlan,
+    },
     /// Launch a privileged node debug pod (`kubectl debug node/<node>`) after
     /// previewing the host access it grants.
     NodeDebug {
@@ -486,12 +499,15 @@ struct PodLogTarget {
 enum LogSource {
     /// The marked pods captured when the log view opens.
     Pods(Vec<PodLogTarget>),
-    /// Every container of one pod.
+    /// One pod: only its annotated default container until `a` switches to
+    /// every container; every container when the pod has no annotation.
     Pod {
         ns: String,
         name: String,
         uid: Option<String>,
         containers: Vec<String>,
+        default: Option<String>,
+        all_containers: bool,
     },
     /// All pods matching a label selector (aggregated workload logs).
     Selector { ns: String, labels: String },
@@ -514,7 +530,7 @@ enum PromptKind {
     Scale {
         targets: Vec<(String, String)>,
     },
-    PortForward {
+    PortForwardRemote {
         ns: String,
         name: String,
     },
@@ -617,6 +633,8 @@ pub struct Scrollable {
     pub title: String,
     /// Mask sensitive header and status values while this document is visible.
     pub redact_header: bool,
+    /// The document is YAML, so `ctrl-s` saves it as `.yaml`.
+    pub yaml: bool,
     pub lines: VecDeque<String>,
     /// Vertical scroll offset in rendered display rows. `usize` on purpose: a
     /// paused wrapped log buffer can far exceed `u16`.
@@ -707,6 +725,8 @@ pub enum SuggestKind {
     Bookmark,
     /// A saved workspace — Enter opens it (lands on its first view).
     Workspace,
+    /// A named layout for `:layout <name>` or `:<kind> -o <name>`.
+    Layout,
 }
 
 /// A built-in palette action, plus the names/aliases that select it. The first
@@ -747,6 +767,7 @@ enum PaletteAction {
     Rightsize,
     PvcExplore,
     PvcClean,
+    Dir,
     Find,
     Diff,
     RolloutHistory,
@@ -755,10 +776,37 @@ enum PaletteAction {
     ProviderLogs,
     Skin,
     Helm,
+    Workloads,
+    NsResources,
     Notify,
     Reload,
+    Layout,
     ConfigInfo,
     PluginActivity,
+}
+
+impl PaletteAction {
+    /// Commands that act on the selected row, and so in the workloads view
+    /// run with that row's kind.
+    fn acts_on_row(self) -> bool {
+        matches!(
+            self,
+            PaletteAction::Xray
+                | PaletteAction::Explain
+                | PaletteAction::Timeline
+                | PaletteAction::Gitops
+                | PaletteAction::Argocd
+                | PaletteAction::Adjacent
+                | PaletteAction::Debug
+                | PaletteAction::Bundle
+                | PaletteAction::BundleSave
+                | PaletteAction::Rightsize
+                | PaletteAction::Diff
+                | PaletteAction::RolloutHistory
+                | PaletteAction::Notify
+                | PaletteAction::ProviderLogs
+        )
+    }
 }
 
 const PALETTE_COMMANDS: &[PaletteCommand] = &[
@@ -777,6 +825,14 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Helm,
         names: &["helm", "hm"],
+    },
+    PaletteCommand {
+        action: PaletteAction::Workloads,
+        names: workloads::NAMES,
+    },
+    PaletteCommand {
+        action: PaletteAction::NsResources,
+        names: ns_resources::NAMES,
     },
     PaletteCommand {
         action: PaletteAction::Pulse,
@@ -859,6 +915,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
         names: &["notify", "bell"],
     },
     PaletteCommand {
+        action: PaletteAction::Dir,
+        names: &["dir"],
+    },
+    PaletteCommand {
         action: PaletteAction::Find,
         names: &["find", "fd"],
     },
@@ -885,6 +945,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Reload,
         names: &["reload"],
+    },
+    PaletteCommand {
+        action: PaletteAction::Layout,
+        names: &["layout"],
     },
     PaletteCommand {
         action: PaletteAction::ConfigInfo,
@@ -1304,6 +1368,7 @@ pub struct LogsView {
     pub timestamps: bool,
     pub json: logs::JsonView,
     json_budget: usize,
+    record_time: logs::RecordTime,
     pub stopped: bool,
     /// Fullscreen (`F`, k9s): the pane takes the whole frame with no header,
     /// borders, or status line, so terminal text selection copies clean lines.
@@ -1344,6 +1409,7 @@ impl Default for LogsView {
             timestamps: false,
             json: logs::JsonView::Raw,
             json_budget: logs::JSON_CACHE_LIMIT,
+            record_time: logs::RecordTime::default(),
             stopped: false,
             fullscreen: false,
             since_anchor: None,
@@ -1412,7 +1478,7 @@ impl LogsView {
                 .iter()
                 .take(count)
                 .enumerate()
-                .filter(|(_, line)| self.matches(line))
+                .filter(|(i, line)| self.matches(line, self.line_meta.get(*i)))
                 .map(|(i, _)| logs::display_height(self.display_line(i), self.last_wrap_width))
                 .sum();
             self.view.scroll = self.view.scroll.saturating_sub(rows + removed_markers);
@@ -1439,8 +1505,9 @@ impl LogsView {
     }
 
     /// Whether the line passes both active filters.
-    pub fn matches(&self, line: &str) -> bool {
-        self.matcher.matches(line)
+    fn matches(&self, line: &str, meta: Option<&logs::LogLineMeta>) -> bool {
+        self.matcher
+            .matches_shown(line, meta.and_then(|meta| meta.display(self.json)))
             && (!self.warnings_only || crate::logfilter::is_warning_or_error(line))
     }
 
@@ -1495,7 +1562,8 @@ impl LogsView {
             let Some(line) = view.lines.get(i) else {
                 break;
             };
-            if !matcher.matches(line)
+            let shown = line_meta.get(i).and_then(|m| m.display(*json));
+            if !matcher.matches_shown(line, shown)
                 || (*warnings_only && !crate::logfilter::is_warning_or_error(line))
             {
                 continue;
@@ -1734,7 +1802,7 @@ struct CopyEntryMemo {
     value: Rc<Vec<(String, String)>>,
 }
 
-/// Names are only inserted when they are drawn, so this holds a screenful in
+/// Cell texts are only inserted when they are drawn, so this holds a screenful in
 /// practice. The bound is here for the pathological case — a session left on
 /// one filter while rows churn through it — and clearing costs one redraw's
 /// worth of rematching.
@@ -1861,6 +1929,7 @@ struct ViewEntry {
     kind_plural: String,
     namespace: String,
     filter: String,
+    layout: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1920,6 +1989,7 @@ struct Frame {
     filter: String,
     scope_label: Option<String>,
     selected: Option<usize>,
+    workloads: Option<workloads::WorkloadsView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2027,6 +2097,17 @@ pub struct App {
     pub col_scroll_max: usize,
     pub filter: String,
     pub faults_only: bool,
+    /// Set while the `:workloads` view is open.
+    workloads: Option<workloads::WorkloadsView>,
+    ns_resources: ns_resources::State,
+    /// The kind of the workloads row the running action started on. Dialogs
+    /// and prompts it opens act on this kind, never on whatever row the
+    /// cursor sits on by the time they are answered.
+    workload_focus: Option<Kind>,
+    /// Marked workloads rows of other kinds the running action leaves out.
+    workload_skipped: usize,
+    /// Appended to the delete confirmation each time it is rebuilt.
+    confirm_note: String,
     /// Parsed form of `filter`, refreshed lazily when the string changes so
     /// neither row matching nor rendering reparses it per frame.
     filter_cache: RefCell<FilterCache>,
@@ -2113,6 +2194,8 @@ pub struct App {
     pub help_return: Mode,
     /// First visible line of the help view (`?`).
     pub help_scroll: u16,
+    /// Scroll to the `help_return` view's section on the next render.
+    pub help_find_section: bool,
     /// Maximum help offset, calculated during rendering.
     pub help_max_scroll: u16,
     /// Number of visible help content rows, recorded during rendering.
@@ -2224,6 +2307,7 @@ pub struct App {
     pub find_items: Vec<crate::store::FindItem>,
     pub find_state: ListState,
     pub find_query: String,
+    find_claim: Option<StatusClaim>,
     /// The last bundle assembled by `:bundle`, previewed in the detail view and
     /// written to disk by `:bundle-save`: `(filename, text)`.
     pub pending_bundle: Option<(String, String)>,
@@ -2282,6 +2366,8 @@ pub struct App {
 
     /// Split-pane PVC browser state (`x` on a PVC row, `:pvc-explore`).
     pub pvc: PvcExplore,
+    /// Local manifest browser state (`:dir`).
+    pub dir: dir::DirBrowser,
     /// `[pvc_explore]` helper-pod defaults.
     pub pvc_cfg: crate::config::PvcExploreConfig,
 
@@ -2303,6 +2389,9 @@ pub struct App {
     /// Port-forward picker (`f`): the declared ports of the selected object,
     /// each as a `LOCAL:REMOTE` string, plus a trailing "Custom…" entry.
     pub pf_picker_items: Vec<String>,
+    /// Whether each declared mapping's local port was already bound on both
+    /// loopback addresses when the picker opened.
+    pub pf_picker_in_use: Vec<bool>,
     pub pf_picker_state: ListState,
     /// The `(ns, name)` target the port-forward picker is acting on.
     pub(super) pf_picker_target: Option<(String, String)>,
@@ -2316,6 +2405,9 @@ pub struct App {
 
     pub skin_list: Vec<String>,
     pub skin_state: ListState,
+    /// Skin name and palette active when the `:skin` picker opened, restored
+    /// when the picker is dismissed without accepting a preview.
+    pub skin_preview_origin: Option<(Option<String>, crate::theme::Palette)>,
     /// Saved snapshots for the `:snapshots` browser: `(path, display label)`,
     /// newest first. Rebuilt each time the browser opens.
     pub snapshot_list: Vec<(std::path::PathBuf, String)>,
@@ -2363,6 +2455,9 @@ pub struct App {
     /// Findings from the explain-unhealthy view, and the row cursor over them
     /// (used to jump to the evidence behind a line).
     pub explain_items: Vec<crate::explain::Finding>,
+    /// Pods gathered with the findings, so `l` on a pod finding can stream
+    /// its default container.
+    explain_pods: Vec<DynamicObject>,
     pub explain_state: ListState,
     explain_selection_lost: bool,
     pub explain_title: String,
@@ -2443,6 +2538,9 @@ pub struct App {
     /// a notify must survive `bump_generation` (view switches) and fire from
     /// anywhere until toggled off or the context changes.
     pub(super) notify_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// The `:notify <text>` note per active watch, same keys as
+    /// [`Self::notify_tasks`]. Prepended to that watch's messages.
+    pub(super) notify_notes: HashMap<String, String>,
     /// Lifecycle shared by notification watchers and their messages. Unlike
     /// the view generation, this advances only when the cluster context changes.
     pub(super) notify_epoch: u64,
@@ -2497,11 +2595,22 @@ pub struct App {
     /// Compiled log provider from `[providers.logs]`, re-resolved on context
     /// switch and `:reload` so each cluster can point at its own backend.
     pub log_provider: Option<crate::providers::LogProvider>,
+    /// A `type = "gcp"` or `type = "link"` log provider: `L` opens the
+    /// selection in a web log UI instead of the logs view.
+    pub log_link: Option<crate::providers::LogLink>,
+    /// Whether the resolved config has a `[providers.logs]` section, valid
+    /// or not. Only an absent section lets `L` detect Cloud Logging on GKE.
+    pub log_provider_configured: bool,
+    /// Log UI links `L` built, in place of opening a browser.
+    #[cfg(test)]
+    pub(super) opened_links: Vec<String>,
     /// Prometheus/VictoriaMetrics backend for right-sizing (`:rightsize`),
     /// resolved to the API-server proxy on first use when autodiscovered.
     pub metrics_provider: Option<crate::providers::MetricsProvider>,
     /// Compiled custom views from config, re-resolved on context switch.
     pub user_views: HashMap<String, crate::views::View>,
+    /// The named layout chosen per kind (by title) this session.
+    layouts: HashMap<String, String>,
     /// Compiled warning/critical coloring thresholds from config, re-resolved
     /// on context switch and `:reload`.
     pub thresholds: crate::thresholds::Compiled,
@@ -2522,6 +2631,8 @@ pub struct App {
     /// Background update checks are allowed (`update_check`). Off until
     /// startup reads the config, so tests never reach the network.
     pub update_check: bool,
+    /// Raw `save_dir` setting for `ctrl-s` saves, resolved when a save runs.
+    pub save_dir: Option<String>,
     /// The latest release the last update check found.
     pub latest_release: Option<crate::update::Release>,
     update_fetcher: UpdateFetcher,
@@ -2584,6 +2695,11 @@ impl App {
             col_scroll_max: 0,
             filter: String::new(),
             faults_only: false,
+            workloads: None,
+            ns_resources: ns_resources::State::default(),
+            workload_focus: None,
+            workload_skipped: 0,
+            confirm_note: String::new(),
             filter_cache: RefCell::new(FilterCache {
                 raw: String::new(),
                 parsed: crate::filter::parse(""),
@@ -2638,6 +2754,7 @@ impl App {
             help_cache: None,
             help_return: Mode::Table,
             help_scroll: 0,
+            help_find_section: false,
             help_max_scroll: 0,
             help_viewport_h: 0,
             doc_filter_return: Mode::Detail,
@@ -2690,6 +2807,7 @@ impl App {
             find_items: Vec::new(),
             find_state: ListState::default(),
             find_query: String::new(),
+            find_claim: None,
             pending_bundle: None,
             journal: crate::journal::Journal::default(),
             watch_errors: 0,
@@ -2711,6 +2829,7 @@ impl App {
             transfer_target: None,
             transfers: Vec::new(),
             pvc: PvcExplore::default(),
+            dir: dir::DirBrowser::default(),
             pvc_cfg: crate::config::PvcExploreConfig::default(),
             confirm_return: Mode::Table,
             auth_offered: None,
@@ -2718,6 +2837,7 @@ impl App {
             pf_spawner: default_pf_spawner,
             forwards_cfg: Vec::new(),
             pf_picker_items: Vec::new(),
+            pf_picker_in_use: Vec::new(),
             pf_picker_state: ListState::default(),
             pf_picker_target: None,
             notify_cfg: crate::config::NotifyConfig::default(),
@@ -2728,6 +2848,7 @@ impl App {
                 .map(|name| (*name).to_string())
                 .collect(),
             skin_state: ListState::default(),
+            skin_preview_origin: None,
             snapshot_list: Vec::new(),
             snapshot_state: ListState::default(),
             skin_colors: HashMap::new(),
@@ -2748,6 +2869,7 @@ impl App {
             xray_items: Vec::new(),
             xray_state: ListState::default(),
             explain_items: Vec::new(),
+            explain_pods: Vec::new(),
             explain_state: ListState::default(),
             explain_selection_lost: false,
             explain_title: String::new(),
@@ -2792,6 +2914,7 @@ impl App {
             timeline: crate::timeline::Timeline::default(),
             table_hit: RefCell::new(None),
             notify_tasks: HashMap::new(),
+            notify_notes: HashMap::new(),
             notify_epoch: 0,
             pending_notify: Vec::new(),
             prev_revisions: PrevRevisions::default(),
@@ -2832,8 +2955,13 @@ impl App {
                 helm_latest: None,
             }),
             log_provider: None,
+            log_link: None,
+            log_provider_configured: false,
+            #[cfg(test)]
+            opened_links: Vec::new(),
             metrics_provider: None,
             user_views: HashMap::new(),
+            layouts: HashMap::new(),
             thresholds: crate::thresholds::Compiled::default(),
             node_roles: Arc::new(crate::config::NodeRoles::default()),
             crd_views: HashMap::new(),
@@ -2844,6 +2972,7 @@ impl App {
             hide_header: false,
             terminal_title: true,
             update_check: false,
+            save_dir: None,
             latest_release: None,
             update_fetcher: default_update_fetcher,
             spec: crate::columns::build_spec("", "", None, None, false),
@@ -2872,11 +3001,25 @@ impl App {
     pub(super) fn overlay_return(&self) -> Mode {
         if self.confirm_return == Mode::PvcExplore && self.pvc.active {
             Mode::PvcExplore
+        } else if self.over_dir_browser() {
+            Mode::Dir
         } else if self.confirm_over_document() {
             Mode::Detail
         } else {
             Mode::Table
         }
+    }
+
+    /// Whether the open dialog belongs to the manifest browser, so the
+    /// renderer keeps the listing underneath it.
+    pub fn over_dir_browser(&self) -> bool {
+        let manifest = |action: &ConfirmAction| matches!(action, ConfirmAction::Manifest { .. });
+        self.confirm_return == Mode::Dir
+            && (self.confirm_action.as_ref().is_some_and(manifest)
+                || matches!(
+                    &self.prompt_kind,
+                    Some(PromptKind::GuardConfirm { action, .. }) if manifest(action)
+                ))
     }
 
     /// Whether the open dialog belongs to the PVC browser, so the renderer
@@ -2921,6 +3064,7 @@ mod credentials;
 mod dashboards;
 mod details;
 mod diagnostics;
+pub mod dir;
 mod drain;
 mod explain;
 mod find;
@@ -2930,16 +3074,18 @@ pub(crate) mod guardrails;
 mod helpers;
 mod input;
 mod journal;
+mod layouts;
 mod lifecycle;
 mod log_follow;
 mod logs;
-pub use logs::JsonView;
+pub use logs::{JsonView, RecordPart, RecordSpan};
 mod metrics_history;
 mod mouse;
 mod namespace_patterns;
 pub use namespace_patterns::NamespacePatternAction;
 mod navigation;
 mod notify;
+pub mod ns_resources;
 mod overlays;
 mod pickers;
 mod plugins;
@@ -2955,6 +3101,7 @@ mod snapshot;
 mod timeline;
 mod transfer;
 mod update;
+mod workloads;
 mod workspaces;
 
 use helpers::*;

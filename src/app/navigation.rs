@@ -55,6 +55,7 @@ impl App {
                 self.open_rbac_object(&obj)
             }
             "pods" => self.open_containers(&obj),
+            ns_resources::VIEW if self.ns_resources_active() => self.drill_into_ns_resource(&obj),
             "cronjobs" => self.drill_into_cronjob_jobs(&obj),
             // enter on a CRD lists its custom resources, not its YAML.
             "customresourcedefinitions" => self.drill_into_crd(&obj),
@@ -263,6 +264,7 @@ impl App {
         self.detail = Scrollable {
             wrap: self.detail.wrap,
             title: format!("{} v{} — values", rel.name, rel.revision),
+            yaml: true,
             lines: yaml.lines().map(String::from).collect(),
             ..Default::default()
         };

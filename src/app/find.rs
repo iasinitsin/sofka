@@ -43,6 +43,7 @@ impl App {
         self.find_state.select(None);
         self.mode = Mode::Find;
         let claim = self.claim_status(format!("finding '{query}'…"));
+        self.find_claim = Some(claim);
 
         let kinds: Vec<(String, ApiResource)> = FIND_KINDS
             .iter()

@@ -166,7 +166,8 @@ dangerous = true          # confirm (showing the exact command) first
 
 - **Placeholders** are substituted as whole arguments, never spliced into a shell
   string: `$NAME`, `$NAMESPACE`/`$NS`, `$CONTEXT`, `$CLUSTER`, `$RESOURCE`
-  (plural), `$GROUP`, `$VERSION`, `$KIND`, `$FILTER`.
+  (plural), `$GROUP`, `$VERSION`, `$KIND`, `$FILTER`, `$SKIN`.
+  `$SKIN` is the active skin name; `[skin.colors]` overrides are not passed on.
 - **`output`** selects `terminal`, `popup`, `background`, or `report`.
   `terminal` is the default. It suspends the TUI for an interactive command.
   On Unix, Ctrl-C interrupts the command. Sofka resumes when the command exits.
@@ -202,7 +203,9 @@ Guardrails match plugin actions with `plugin:<palette>`, or `plugin:<name>` when
 
 On an invalid value (a bad chord, an unknown `output`, a malformed `timeout`)
 sofka disables just that plugin or falls back to the default and shows a warning
-in `:config`. Plugins appear in `?` help with their chord and scope.
+in `:config`. Plugins appear in `?` help with their chord and scope, right after
+the table keys. Opened from a table, help lists the plugins for the current kind
+first.
 
 ## Bookmarks
 
@@ -221,7 +224,11 @@ namespace = "checkout"                   # optional; all/* = all namespaces
 filter = "status!=Running -l app=api"    # optional, same syntax as `/`
 sort = "RESTARTS:desc"                   # optional: COLUMN[:asc|:desc]
 view = "xray"                            # optional: xray | pulse
+layout = "images"                        # optional: a named layout of the resource
 ```
+
+`layout` opens the resource in a [named layout](views.md#named-layouts). If the
+resource has no such layout, the status bar warns and the default layout stays.
 
 ## Workspaces
 

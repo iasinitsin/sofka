@@ -189,6 +189,14 @@ impl App {
     /// Resolve placeholders, then run the plugin — after a confirmation prompt
     /// when it's marked `confirm`/`dangerous`.
     pub(super) fn run_plugin(&mut self, plugin: crate::config::Plugin, arguments: &str) {
+        // `:ns-resources` rows are kinds, not objects a plugin could act on.
+        if self.ns_resources_active() && plugin.target.as_deref() != Some("context") {
+            self.flash_warn(&format!(
+                "plugin '{}' acts on objects; ns-resources rows are kinds",
+                plugin.name
+            ));
+            return;
+        }
         if let Err(e) = crate::plugins::available(&plugin) {
             self.flash_warn(&e);
             return;
@@ -272,6 +280,8 @@ impl App {
         let cluster = self.cluster.cluster_name.clone();
         let res = self.kind_plural.clone();
         let filter = self.filter.clone();
+        let skin =
+            crate::theme::canonical_skin_name(self.active_skin.as_deref().unwrap_or_default());
         let (group, version, kind) = self
             .kind
             .as_ref()
@@ -304,16 +314,22 @@ impl App {
                     if s.starts_with("${input.") {
                         return crate::plugins::input_arg(s, &inputs);
                     }
-                    s.replace("$NAMESPACE", ns)
-                        .replace("$NS", ns)
-                        .replace("$NAME", name)
-                        .replace("$CONTEXT", &ctx)
-                        .replace("$CLUSTER", &cluster)
-                        .replace("$RESOURCE", &res)
-                        .replace("$GROUP", &group)
-                        .replace("$VERSION", &version)
-                        .replace("$KIND", &kind)
-                        .replace("$FILTER", &filter)
+                    crate::plugins::replace_placeholders(
+                        s,
+                        &[
+                            ("$NAMESPACE", ns),
+                            ("$NS", ns),
+                            ("$NAME", name),
+                            ("$CONTEXT", &ctx),
+                            ("$CLUSTER", &cluster),
+                            ("$RESOURCE", &res),
+                            ("$GROUP", &group),
+                            ("$VERSION", &version),
+                            ("$KIND", &kind),
+                            ("$FILTER", &filter),
+                            ("$SKIN", skin),
+                        ],
+                    )
                 };
                 let mut argv = if plugin.shell {
                     vec![

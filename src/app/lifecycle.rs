@@ -55,6 +55,10 @@ impl App {
             self.remember_namespace();
         }
         self.set_root_view(kind);
+        let layout_warning = query
+            .layout
+            .as_deref()
+            .and_then(|layout| self.select_layout(layout).err());
         self.filter = query.filter;
         self.record_history();
         self.start_watch();
@@ -63,6 +67,9 @@ impl App {
             self.kind_plural,
             self.namespace_label()
         ));
+        if let Some(warning) = layout_warning {
+            self.flash_warn(&warning);
+        }
     }
 
     /// Switch the active resource kind by user input. Pushes the current view
@@ -74,8 +81,29 @@ impl App {
     /// Switch kind and (optionally) namespace in one move (`:deploy social`).
     /// `all`/`*` as the namespace selects all namespaces.
     pub fn switch_kind_ns(&mut self, input: &str, ns: Option<&str>) {
+        if let (resource, Some(layout)) = crate::views::split_layout(input) {
+            self.apply_resource_query(crate::filter::ResourceQuery {
+                resource: resource.to_string(),
+                namespace: ns.map(str::to_string),
+                context: None,
+                layout: Some(layout.to_string()),
+                filter: String::new(),
+            });
+            return;
+        }
+        if let Some(ns) = ns
+            && self.ns_resources_active()
+            && self
+                .cluster
+                .resolve(input)
+                .is_some_and(|k| k.ar.plural.eq_ignore_ascii_case("namespaces"))
+            && self.ns_resources_refuses(ns)
+        {
+            return;
+        }
         if let Some(ns) = ns.filter(|ns| namespace_patterns::is_pattern(&normalize_ns(ns)))
-            && self.cluster.resolve(input).is_some()
+            && (self.cluster.resolve(input).is_some()
+                || workloads::NAMES.contains(&input.trim().to_lowercase().as_str()))
         {
             self.resolve_namespace_pattern(
                 normalize_ns(ns),
@@ -112,6 +140,12 @@ impl App {
                 self.record_history();
                 self.start_watch();
             }
+            None if workloads::NAMES.contains(&input.trim().to_lowercase().as_str()) => {
+                self.open_workloads(ns);
+            }
+            None if ns_resources::NAMES.contains(&input.trim().to_lowercase().as_str()) => {
+                self.open_ns_resources(ns);
+            }
             None => {
                 self.flash = format!("No resource matches '{}'", input.trim());
                 self.flash_err = true;
@@ -126,6 +160,7 @@ impl App {
     /// view always starts with its first row selected.
     pub(super) fn set_root_view(&mut self, kind: Kind) {
         self.stack.clear();
+        self.workloads = None;
         self.argocd_return = None;
         self.kind_plural = kind.ar.plural.to_lowercase();
         self.kind = Some(kind);
@@ -148,6 +183,7 @@ impl App {
             return;
         };
         self.stack.clear();
+        self.workloads = None;
         self.kind = Some(secrets);
         self.kind_plural = "helm".into();
         self.labels = Some("owner=helm".into());
@@ -232,12 +268,15 @@ impl App {
     // ----- view history (`[` / `]`) ---------------------------------------
 
     pub(super) fn save_history_filter(&mut self) {
+        let view = self.view_plural().to_string();
+        let layout = self.active_layout().map(str::to_string);
         if self.stack.is_empty()
             && let Some(entry) = self.history.get_mut(self.history_pos)
-            && entry.kind_plural == self.kind_plural
+            && entry.kind_plural == view
             && entry.namespace == self.namespace
         {
             entry.filter = self.filter.clone();
+            entry.layout = layout;
         }
     }
 
@@ -252,6 +291,7 @@ impl App {
             kind_plural: self.kind_plural.clone(),
             namespace: self.namespace.clone(),
             filter: self.filter.clone(),
+            layout: self.active_layout().map(str::to_string),
         };
         if self.history.get(self.history_pos) == Some(&entry) {
             return;
@@ -288,6 +328,36 @@ impl App {
         let Some(entry) = self.history.get(self.history_pos).cloned() else {
             return;
         };
+        if entry.kind_plural == workloads::VIEW && self.cluster.resolve(workloads::VIEW).is_none() {
+            self.namespace = entry.namespace;
+            self.set_workloads_root(workloads::WorkloadsView::default());
+            self.filter = entry.filter;
+            self.flash = format!(
+                "history {}/{}: workloads in {}",
+                self.history_pos + 1,
+                self.history.len(),
+                self.namespace_label()
+            );
+            self.flash_err = false;
+            self.start_watch();
+            return;
+        }
+        if entry.kind_plural == ns_resources::VIEW
+            && self.cluster.resolve(ns_resources::VIEW).is_none()
+        {
+            self.namespace = entry.namespace;
+            self.set_ns_resources_root();
+            self.filter = entry.filter;
+            self.flash = format!(
+                "history {}/{}: resources in {}",
+                self.history_pos + 1,
+                self.history.len(),
+                self.namespace_label()
+            );
+            self.flash_err = false;
+            self.start_watch();
+            return;
+        }
         let Some(kind) = self.cluster.resolve(&entry.kind_plural) else {
             self.flash_warn(&format!("cannot resolve '{}' anymore", entry.kind_plural));
             return;
@@ -295,6 +365,12 @@ impl App {
         self.namespace = entry.namespace;
         let title = kind.title();
         self.set_root_view(kind);
+        let layout_warning = self
+            .select_layout(entry.layout.as_deref().unwrap_or("default"))
+            .err();
+        if layout_warning.is_some() {
+            let _ = self.select_layout("default");
+        }
         self.filter = entry.filter;
         self.flash = format!(
             "history {}/{}: {title} in {}",
@@ -304,6 +380,9 @@ impl App {
         );
         self.flash_err = false;
         self.start_watch();
+        if let Some(warning) = layout_warning {
+            self.flash_warn(&warning);
+        }
     }
 
     pub(super) fn push_frame(&mut self) {
@@ -311,6 +390,7 @@ impl App {
         if self.kind.is_none() {
             return;
         }
+        self.restore_workloads_identity();
         self.stack.push(Frame {
             kind: self.kind.clone(),
             kind_plural: self.kind_plural.clone(),
@@ -322,6 +402,7 @@ impl App {
             filter: self.filter.clone(),
             scope_label: self.scope_label.clone(),
             selected: self.table_state.selected(),
+            workloads: self.workloads.take(),
         });
     }
 
@@ -335,6 +416,7 @@ impl App {
         self.rollout_managed = f.rollout_managed;
         self.filter = f.filter;
         self.scope_label = f.scope_label;
+        self.workloads = f.workloads;
         self.reset_sort();
         self.table_state.select(f.selected.or(Some(0)));
     }
@@ -346,6 +428,49 @@ impl App {
             true
         } else {
             false
+        }
+    }
+
+    /// Fold one watched object into the store. `partition` names the watch
+    /// it came from when the view runs several.
+    pub(super) fn apply_watched(
+        &mut self,
+        partition: Option<&str>,
+        key: String,
+        obj: DynamicObject,
+    ) {
+        // Record state changes against the previous version before it's
+        // overwritten (session-local timeline), and keep that version
+        // for the session diff (`:diff` on objects with no
+        // last-applied annotation).
+        let prev = self.store.latest_in(partition, &key);
+        let kind = self.watched_plural(&key).to_string();
+        self.timeline
+            .observe_as(&self.kind_plural, &kind, &key, prev.map(Arc::as_ref), &obj);
+        if let Some(prev) = prev
+            && prev.metadata.resource_version != obj.metadata.resource_version
+        {
+            // An `Arc` bump, not a deep copy of the object's whole
+            // JSON body — this runs on every changed watch event.
+            self.prev_revisions
+                .insert(&self.kind_plural, &key, Arc::clone(prev));
+        }
+        match self.store.apply_in(partition, key.clone(), obj) {
+            StoreMutation::Inserted => self.invalidate_row(&key),
+            StoreMutation::Updated => self.invalidate_row_contents(&key),
+            StoreMutation::Buffered | StoreMutation::Removed | StoreMutation::Unchanged => {}
+        }
+    }
+
+    fn delete_watched(&mut self, partition: Option<&str>, key: &str) {
+        let kind = self.watched_plural(key).to_string();
+        self.timeline
+            .observe_delete_as(&self.kind_plural, &kind, key);
+        if let Some(obj) = self.store.latest_in(partition, key) {
+            self.server_table.remove(key, obj.metadata.uid.as_deref());
+        }
+        if self.store.remove_in(partition, key) == StoreMutation::Removed {
+            self.invalidate_row(key);
         }
     }
 
@@ -361,6 +486,7 @@ impl App {
         }
         self.namespace_request += 1;
         self.namespace_errors.clear();
+        self.restore_workloads_identity();
         let Some(kind) = self.kind.clone() else {
             return;
         };
@@ -413,7 +539,7 @@ impl App {
         if let Some(cached) = self.view_cache.get(&key) {
             self.store.seed(cached.clone());
         }
-        if self.namespace_is_pattern() && kind.namespaced {
+        if self.namespace_is_pattern() && kind.namespaced && self.workloads.is_none() {
             self.store.set_namespaces(&self.watch_namespaces());
         }
         self.watch_key = Some(key);
@@ -432,7 +558,13 @@ impl App {
         self.apply_remembered_sort();
         self.apply_view_sort();
         self.maybe_fetch_printer_columns(&kind);
-        self.start_namespace_watches(&kind, watch_labels, watch_fields);
+        if self.workloads.is_some() {
+            self.start_workload_watches(watch_labels, watch_fields);
+        } else if self.ns_resources_active() {
+            self.start_ns_resources();
+        } else {
+            self.start_namespace_watches(&kind, watch_labels, watch_fields);
+        }
 
         if self.metrics_columns() {
             self.spawn_metrics_poll();
@@ -503,7 +635,7 @@ impl App {
     }
 
     /// Read CRD columns first, then try server Tables if no columns are available.
-    fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
+    pub(super) fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
         let user_has_columns = self
             .active_user_view()
             .is_some_and(|v| !v.columns.is_empty());
@@ -1037,7 +1169,7 @@ impl App {
             );
         let selected_pod = if preserve_selection {
             self.selected_ref()
-                .map(|o| (crate::store::row_key(o), o.metadata.uid.clone()))
+                .map(|o| (self.key_of(o), o.metadata.uid.clone()))
         } else {
             None
         };
@@ -1093,6 +1225,10 @@ impl App {
                         );
                     }
                 }
+                Msg::Applied { key, obj, .. } => {
+                    self.apply_watched(Some(&namespace), key, *obj);
+                }
+                Msg::Deleted { key, .. } => self.delete_watched(Some(&namespace), &key),
                 event => self.handle_msg(event),
             },
             Msg::WatchReconnected { generation } if generation == self.generation => {
@@ -1116,37 +1252,14 @@ impl App {
                 generation,
                 key,
                 obj,
-            } if generation == self.generation => {
-                // Record state changes against the previous version before it's
-                // overwritten (session-local timeline), and keep that version
-                // for the session diff (`:diff` on objects with no
-                // last-applied annotation).
-                let prev = self.store.latest(&key);
-                self.timeline
-                    .observe(&self.kind_plural, &key, prev.map(Arc::as_ref), &obj);
-                if let Some(prev) = prev
-                    && prev.metadata.resource_version != obj.metadata.resource_version
-                {
-                    // An `Arc` bump, not a deep copy of the object's whole
-                    // JSON body — this runs on every changed watch event.
-                    self.prev_revisions
-                        .insert(&self.kind_plural, &key, Arc::clone(prev));
-                }
-                match self.store.apply(key.clone(), *obj) {
-                    StoreMutation::Inserted => self.invalidate_row(&key),
-                    StoreMutation::Updated => self.invalidate_row_contents(&key),
-                    StoreMutation::Buffered | StoreMutation::Removed | StoreMutation::Unchanged => {
-                    }
-                }
-            }
+            } if generation == self.generation => self.apply_watched(None, key, *obj),
+            Msg::NsResources {
+                generation,
+                claim,
+                update,
+            } if generation == self.generation => self.receive_ns_resources(claim, update),
             Msg::Deleted { generation, key } if generation == self.generation => {
-                self.timeline.observe_delete(&self.kind_plural, &key);
-                if let Some(obj) = self.store.latest(&key) {
-                    self.server_table.remove(&key, obj.metadata.uid.as_deref());
-                }
-                if self.store.remove(&key) == StoreMutation::Removed {
-                    self.invalidate_row(&key);
-                }
+                self.delete_watched(None, &key);
             }
             Msg::Synced { generation } if generation == self.generation => {
                 if self.store.finish_sync() {
@@ -1208,7 +1321,11 @@ impl App {
                 self.last_error = Some(error.clone());
                 self.borrow_status(format!("internal error: {error}"), true);
             }
-            Msg::Notify { epoch, text } if epoch == self.notify_epoch => {
+            Msg::Notify { epoch, id, text } if epoch == self.notify_epoch => {
+                let text = match self.notify_notes.get(&id) {
+                    Some(note) => format!("{note} - {text}"),
+                    None => text,
+                };
                 self.borrow_status(format!("🔔 {text}"), false);
                 // Delivery happens once per frame in the run loop (see
                 // `take_notification`), so a batch of these coalesces.
@@ -1331,13 +1448,23 @@ impl App {
                 self.last_error = Some(error.clone());
                 self.borrow_status(error, true);
             }
+            Msg::DirPlan {
+                generation,
+                claim,
+                request,
+                verb,
+                path,
+                result,
+            } if generation == self.generation => {
+                self.finish_dir_plan(claim, request, verb, path, *result)
+            }
             Msg::FindResults {
                 generation,
                 claim,
                 query,
                 items,
                 warn,
-            } if generation == self.generation => {
+            } if generation == self.generation && Some(claim) == self.find_claim => {
                 match warn {
                     Some(w) => {
                         self.set_claimed_status(claim, format!("find is incomplete — {w}"), true)
@@ -1397,8 +1524,10 @@ impl App {
                 title,
                 source,
                 findings,
+                pods,
             } if generation == self.generation && request == self.explain_request => {
                 self.explain_claim = None;
+                self.explain_pods = pods;
                 self.explain_task = None;
                 if let Some(source) = source {
                     if let Some(report) = self.explain_refresh_source.as_mut() {
@@ -1784,6 +1913,7 @@ impl App {
                         managed_fields: false,
                     };
                 }
+                self.detail.yaml = warn.is_some();
                 self.detail.title = title;
                 self.detail.replace_lines(lines.into());
                 match warn {
@@ -1983,14 +2113,15 @@ impl App {
                     );
                 }
             }
-            Msg::LogsSaved {
+            Msg::Saved {
                 generation,
                 claim,
+                what,
                 result,
             } if generation == self.generation => match result {
                 Ok(path) => self.set_claimed_status(
                     claim,
-                    format!("saved logs → {}", path.display()),
+                    format!("saved {what} → {}", path.display()),
                     false,
                 ),
                 Err(e) => self.set_claimed_status(claim, format!("save failed: {e}"), true),

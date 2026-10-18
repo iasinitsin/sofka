@@ -146,7 +146,10 @@ include those conditions. Row filters can search the route paths.
   show its type, full image reference, declared ports, and configured startup,
   readiness, and liveness probes. Images and ports wrap to fit the popup.
   Probe labels show configuration, not the current probe result.
-  Regular, init, native sidecar, and ephemeral containers are included. Pod watch
+  Regular, init, native sidecar, and ephemeral containers are included. The
+  pod's default container (the `kubectl.kubernetes.io/default-container`
+  annotation, else the first container) is listed first and selected when the
+  picker opens; the rest are sorted by name. Pod watch
   updates refresh the details and keep the selected container by name. Missing
   status values show `-` or `Unknown`. If the selected container disappears,
   its selection clears. Name, state, and restarts have priority on narrow
@@ -277,6 +280,9 @@ include those conditions. Row filters can search the route paths.
 - **Event timing** - LAST-SEEN shows the most recent reported occurrence for
   core and events.k8s.io Events. It advances with time and sorts by occurrence
   timestamp. AGE continues to show object creation age.
+- **Event sizes** - the events MESSAGE column shows byte counts such as
+  `80474558 bytes` in binary units scaled to the value, like `76.7 MiB`. Counts
+  under 1 KiB stay as they are. Describe and YAML keep the original message.
 - **Service endpoints** include ExternalName targets, configured external IPs,
   load balancer addresses, and NodePort values such as `80:30080/TCP`.
 - **Pod health** shows init progress and failure reasons, Pod reasons such as
@@ -310,7 +316,9 @@ include those conditions. Row filters can search the route paths.
   `w` toggles wide-only columns (kubectl `-o wide`), including
   node IP addresses and labels. IP addresses are selected by type, independent
   of array order. Add `@<namespace>` to a view key to select columns for one
-  namespace. See
+  namespace. Add `:<name>` to keep a second layout for the same kind and
+  switch to it with `:pods -o <name>` or `:layout <name>`; bare `:layout`
+  lists the kind's layouts. See
   [Views and thresholds](views.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,
@@ -328,7 +336,7 @@ include those conditions. Row filters can search the route paths.
   view history.
 - **Command palette** (`:`) - fuzzy search over the full resource catalog, your
   saved bookmarks and workspaces, and the built-in commands (`ctx`, `helm`,
-  `pulse`, `xray`, `explain`, `timeline`, `gitops`, `argocd`, `adjacent`, `users`, `groups`, `policy`, `can-i`, `journal`,
+  `workloads`, `ns-resources`, `pulse`, `xray`, `explain`, `timeline`, `gitops`, `argocd`, `adjacent`, `users`, `groups`, `policy`, `can-i`, `journal`,
   `debug`,
   `debug-clean`, `bundle`, `bundle-save`, `snapshot`, `snapshots`, `diff`,
   `events`, `pf`, `notify`, `find`, `vlogs`, `rightsize`, `fleet`, `skin`,
@@ -344,15 +352,23 @@ include those conditions. Row filters can search the route paths.
   remembered or default namespace. Namespace completion after `@context` is not
   provided.
 - **Help scrolling** (`?`) - browse all bindings, including plugins, bookmarks,
-  and workspaces. `j` / `k` and `↑` / `↓` scroll one line. `ctrl-f`, `PgDn`,
-  and `space` move forward one page; `ctrl-b` and `PgUp` move back one page.
-  Each page uses the visible content height. `g` / `Home` go to the top;
-  `G` / `End` go to the bottom. `/` filters the bindings and resets the scroll
-  position. `esc` clears the filter first, then closes help. `q` or `?` closes
+  and workspaces. Help opens on the section for the view it was opened from,
+  without changing the section order. Plugins follow the table keys; from a
+  table, the plugins for the current kind come first. `j` / `k` and `↑` / `↓` scroll one line.
+  `ctrl-f`, `PgDn`, and `space` move forward one page; `ctrl-b` and `PgUp`
+  move back one page. Each page uses the visible content height. `g` / `Home`
+  go to the top; `G` / `End` go to the bottom. `]` and `[` jump to the next and
+  previous section. `/` filters the bindings and resets the scroll position; a
+  query that matches a section heading, such as `table`, keeps that whole
+  section. `esc` clears the filter first, then closes help. `q` or `?` closes
   help and returns to the previous screen.
 - **Picker paging** - `PgDn` and `PgUp` move one visible page through every
   list picker, including `:ctx` and `:ns`, and keep working while a picker
   filter is being typed.
+- **Half-page scrolling** - `half_page_down` and `half_page_up` move half a
+  page in tables, document views, logs, help, and pickers. They are unbound by
+  default; see [key bindings](keybindings.md) to map them, for example to
+  `ctrl-d` and `ctrl-u`.
 - **Filtering** (`/`) with matched-character highlighting: contiguous text
   (`"text"` keeps spaces), `a|b` for either name, `~text` fuzzy match, `/re/`
   regular expression (all case-insensitive except fuzzy's smart case), `!text`
@@ -368,14 +384,29 @@ include those conditions. Row filters can search the route paths.
   clears. Palette queries combine scope and filtering:
   `:pods -n prod --context west /-l app=api status=Running`.
   See [filter grammar and selectors](filtering.md).
-- **Toggle faults** (`Ctrl+Z`, pods only) shows pending, failed, unknown,
-  terminating, and running pods that are not ready. Completed pods are hidden.
+- **Toggle faults** (`Ctrl+Z`) shows only what needs attention:
+  - Pods: pending, failed, unknown, terminating, and running pods that are
+    not ready. Completed pods are hidden.
+  - Deployments, StatefulSets, DaemonSets, and ReplicaSets: every STATUS
+    other than `Ready` and `ScaledDown`.
+  - Jobs: failed, pending, suspended, and terminating jobs.
+  - CronJobs: suspended or terminating, or the last scheduled run finished
+    without succeeding.
+  - Flux Kustomizations, HelmReleases, Git/Helm/OCI repositories, Buckets,
+    ResourceSets, FluxInstances, and ResourceSetInputProviders: suspended,
+    terminating, or a `Ready` condition that is not `True`.
+  - Argo CD Applications: health other than `Healthy`, sync other than
+    `Synced`, or terminating. ApplicationSets: any status other than `Synced`,
+    or terminating.
+
   The table title shows `[faults]` while the filter is on. It works with the
   text filter and current namespace or drill scope. Press `Ctrl+Z` again to
-  turn it off. The setting stays on for pod views during the session and does
-  not filter other resource types. Configured `Ctrl+Z` bookmark, workspace,
-  and matching plugin actions take precedence. Live updates keep the selected
-  pod selected. If it leaves the list or its UID changes, selection is cleared.
+  turn it off. The setting stays on for these views during the session and
+  does not filter other resource types. Configured `Ctrl+Z` bookmark,
+  workspace, and matching plugin actions take precedence. Live updates keep
+  the selected row selected. If it leaves the list or its UID changes,
+  selection is cleared.
+
 - **Global fuzzy find** (`:find <text>`) - search object names across the common
   kinds (workloads, pods, services, config, ingresses, jobs, storage, nodes,
   namespaces, Flux objects) in every namespace at once, concurrently. Results
@@ -395,6 +426,12 @@ include those conditions. Row filters can search the route paths.
   from `PATH` to copy to the Windows clipboard, including inside tmux. This
   requires Windows interoperability. If `clip.exe` is missing or fails, sofka
   tries the other clipboard tools, then OSC 52.
+- **Save to a file** - `ctrl-s` in the YAML, describe, diff, and events views
+  saves the whole document as rendered, so a manifest no longer needs a trip
+  through the clipboard. YAML and diff save as `.yaml`, the others as `.txt`.
+  `ctrl-s` in logs saves the shown lines as `.log`. Both write to `save_dir`,
+  the temp directory by default. See
+  [Document views](keys.md#document-views-yaml-describe-diff-events).
 - **RBAC-aware palette browse** - the empty `:` list hides kinds you cannot
   `list`. An explicit search checks the full discovery catalog, because some
   delegated authorizers return incomplete rule reviews.
@@ -487,6 +524,8 @@ include those conditions. Row filters can search the route paths.
 - **Job execution status** distinguishes pending, running, suspended, failed,
   completing, completed, and terminating jobs. Failed jobs use the error color even when
   no pod is active.
+  CronJobs carry a STATUS column too: `Running`, `Scheduled`, `Suspended`,
+  `Terminating`, or `Failed` when the last scheduled run did not succeed.
 - **Storage deletion status** shows `Terminating` for PVs and PVCs after
   deletion starts, including when a storage protection finalizer keeps the
   object in the API.
@@ -515,6 +554,30 @@ include those conditions. Row filters can search the route paths.
   of every state change the watch saw: generation bumps, replica and readiness
   changes, pod phase, restarts, waiting reasons, condition flips. Computed from
   the watch stream, bounded, never written to disk.
+- **Workloads view** (`:workloads [ns]`, `:wk`) - Deployments, StatefulSets,
+  DaemonSets, CronJobs, Jobs, and Pods in one live table with KIND, READY,
+  and STATUS columns. Keys that act on a row use the row's own kind, so
+  `ctrl-d`, `d`, `y`, `l`, `s`, `r`, `⏎`, plugins, and guardrails behave as
+  in that kind's own view without drilling into it first. With marks across
+  kinds, an action applies to the marked rows of the cursor row's kind; its confirmation says how many marked rows it skips. A dialog or prompt keeps acting on the kind it was opened for, even if a watch update moves the cursor. By default only top-level workloads are listed: pods owned
+  by a ReplicaSet, StatefulSet, DaemonSet, or Job and Jobs owned by a CronJob
+  are hidden, one `⏎` away from their owner. `O` shows them too. `Ctrl+Z`
+  judges each row by its kind's faults rule. Kinds missing from API discovery
+  are skipped.
+- **Namespace resources** (`:ns-resources [ns]`, `R` on a namespace row) -
+  every namespaced kind from a fresh API discovery that has objects in the
+  namespace, custom resources included, with KIND, GROUP, and COUNT columns.
+  Defaults to the current namespace; all namespaces counts cluster-wide, and a
+  namespace pattern is refused. The counts are a snapshot, not a watch: one
+  `limit=1` list per kind read off `remainingItemCount` (paging the list when
+  the server leaves it out), eight at a time, with rows filling in as they
+  answer. Kinds with no objects are hidden. A kind you can't list stays as a
+  `no access` row and any other failure shows its error, so neither reads as
+  empty. `⏎` opens the kind's own view in that namespace and `esc` returns,
+  counting again. `r` counts again too, keeping the previous counts on screen
+  until the new ones are in. Filter, sort, and view history work as in any
+  table; keys, commands, and plugins that act on objects are disabled on these
+  rows, while `target = "context"` plugins still run.
 - **Pulse dashboard** (`:pulse`) - cluster-health tiles, refreshed every 5s.
 - **Xray tree** (`:xray`) - a hierarchical view from the current kind down
   through owner references to pods and containers.
@@ -524,6 +587,17 @@ include those conditions. Row filters can search the route paths.
   `:policy s:namespace/account` to open a subject by name. Bare `:policy` uses
   the selected service account. Enter on a Role, ClusterRole, RoleBinding, or
   ClusterRoleBinding opens its rules.
+  Rules open as a matrix with one row per resource and API group and a column
+  per standard verb. Rows for the same resource merge verbs from all rules.
+  Other verbs, such as `escalate` or `*`, are listed in `OTHER`. A row marked
+  `(named)` applies only to the objects in `RESOURCE NAMES`. Under a
+  Role or RoleBinding, rows for cluster-scoped resources and non-resource URLs
+  show no ticks because a namespace cannot grant them. A rule for every API
+  group (`*`) is checked against each discovered group with that resource. If
+  only some of them are namespaced, or API discovery skipped a group, the row
+  says it covers namespaced API groups only. Press `t` to switch to the
+  per-rule list. The choice is kept for the session. Set
+  `rbac_rule_list = true` to start with the list.
   Each rule keeps its source binding, source role, namespace scope, resource
   names, subresources, and non-resource URLs. A RoleBinding to a ClusterRole
   remains limited to namespaced resources in the binding's namespace.
@@ -564,8 +638,9 @@ include those conditions. Row filters can search the route paths.
   Late replies are ignored. `c` starts another search; `r` repeats the initial
   adjacent lookup. This action does not search across namespaces, follow
   descendants recursively, or start background watches.
-- **Watch notifications** (`:notify`) - toggle a notification on the selected
-  object and Sophie watches it for you. See [Notifications](debugging.md#notifications).
+- **Watch notifications** (`:notify [note]`) - toggle a notification on the
+  selected object and Sophie watches it for you. An optional note reminds you
+  why you are watching it. See [Notifications](debugging.md#notifications).
 
 ## GitOps and Helm
 
@@ -744,6 +819,18 @@ include those conditions. Row filters can search the route paths.
 
 ## Actions
 
+- **CSR approve and deny** (`V` / `N` on `:csr`) - approve or deny the marked
+  CertificateSigningRequests, or the current one. The confirm popup lists each
+  request's requester, signer and usages, and warns when approving a `client auth`
+  cert from `kubernetes.io/kube-apiserver-client`, since that grants cluster
+  access. Requests that already have an `Approved`, `Denied` or `Failed`
+  condition are skipped. The decision is written through the `approval`
+  subresource, so it needs the `update` verb on `certificatesigningrequests/approval`
+  and `approve` on the signer; sofka does not check this up front, so a 403 is shown as the error.
+  Blocked in read-only mode and gated by the `approve` and `deny` guardrails.
+  The table shows NAME, SIGNER, REQUESTOR, CONDITION and AGE; CONDITION reads
+  `Pending`, `Approved`, `Denied` or `Failed`, with `,Issued` once the
+  certificate is set.
 - **CronJob controls** (`t`) - trigger now (creates a Job from the jobTemplate,
   like `kubectl create job --from`), suspend, resume.
 - **Background port-forwards** (`f`/`F` to start, `:pf` to manage) plus **saved
@@ -751,13 +838,16 @@ include those conditions. Row filters can search the route paths.
   Pressing `f` on a pod or service opens a picker listing the manifest's
   declared ports. Press `enter` to start the selected mapping, or `e` to edit
   only its local port. The edit prompt contains the current local port;
-  `esc` returns to the same picker row. Choose "Custom…" for manual
-  `LOCAL:REMOTE` input. If the local port cannot bind to either loopback address, the input stays open
-  and shows an error so you can choose another port. Active forwards show a teal `●` in a dedicated
+  `esc` returns to the same picker row. Mappings whose local port is already
+  bound show `in use`. Choose "Custom…" to enter a remote port and then a local
+  port, which starts as the remote port. If the local port cannot bind to either
+  loopback address when you start the forward, the input stays open and shows an
+  error so you can choose another port. Active forwards show a teal `●` in a dedicated
   indicator column next to the row name. See [Saved forwards](plugins.md#saved-forwards).
 - **File transfer** (`t` on a pod, or `t` in the container picker for one
   container) - download from or upload to a pod via `kubectl cp`, off-thread
-  with a completion flash. Uploads are gated by the `transfer` guardrail and
+  with a completion flash. `t` on a pod uses its default container and names it
+  in the menu and prompts. Uploads are gated by the `transfer` guardrail and
   read-only mode.
 - **PVC explore** (`x` on a PVC, or `:pvc-explore`) - a two-pane browser over a
   volume's contents, with `s` for a shell inside it. See
@@ -769,7 +859,10 @@ include those conditions. Row filters can search the route paths.
   [Debug containers and pods](debugging.md#debug-containers-and-pods).
 - **Logs** (`l`) - combined logs for marked pods, per-container on a pod, or aggregated across all matching
   pods on a workload/service, with filtering, previous-container logs, and
-  configurable tail/buffer/lookback. Press `T` to enter a duration or `tail`
+  configurable tail/buffer/lookback. A pod with a
+  `kubectl.kubernetes.io/default-container` annotation shows only that
+  container, as kubectl does; `a` switches between it and every container.
+  Press `T` to enter a duration or `tail`
   for the current kubelet log view. Lines with timestamps are sorted by time.
   Press `t` to show or hide timestamps without changing log order or restarting
   streams. If a container is waiting to start, sofka
@@ -787,7 +880,9 @@ include those conditions. Row filters can search the route paths.
   log view opens. Copy and save use the filtered lines.
 - **JSON log display** (`J` in logs) cycles raw, record, and indented JSON. Record
   view shows each structured log record on one row: time, level, message, then
-  `key=value` fields. The setting stays active for the session. Filters and application copy/save use raw records.
+  `key=value` fields in the order the application wrote them, nested objects
+  as dotted keys, with the level,
+  message, keys, and values styled apart. The setting stays active for the session. Filters and application copy/save use raw records.
   See [Log controls](debugging.md#log-controls) for limits.
 - **Log markers** (`m` in logs) add visual separators at the buffer tail.
   Markers stay visible through filters, do not move a paused viewport, and are
@@ -798,6 +893,10 @@ include those conditions. Row filters can search the route paths.
   namespace, covering restarted and deleted pods. Zero config: sofka finds the
   service in-cluster and reaches it through the API-server proxy. See
   [Providers](providers.md#log-provider-victorialogs).
+- **Log links** (`L`) - open the selection in Cloud Logging, with the pod,
+  workload selector, CronJob, namespace, or node filter set. Zero config on GKE
+  clusters named by gcloud. `type = "link"` fills a URL template for any other
+  log UI. See [Providers](providers.md#log-links-cloud-logging-and-other-log-uis).
 - **Right-sizing** (`:rightsize`) - estimate right-sized requests from past
   usage in a Prometheus or VictoriaMetrics backend, with a patch preview. Never
   mutates. See [Providers](providers.md#right-sizing-metrics-provider).
@@ -1026,6 +1125,43 @@ satisfies the `baseline` Pod Security Standard - but not `restricted`, which
 also requires `runAsNonRoot`. In a namespace enforcing `restricted` the helper
 pod is rejected; browse through a pod that already mounts the claim instead.
 
+## Manifest browser
+
+`:dir [path]` lists a local directory under the header, so a manifest from
+your repository is one keystroke from the cluster you are looking at. Without
+a path it opens the directory sofka was started from; `~` and relative paths
+work. Only folders and `.yaml`, `.yml`, and `.json` files are listed, folders
+first. Hidden entries and anything that is neither a regular file nor a
+folder, such as a named pipe called `x.yaml`, are skipped. A folder with a
+`kustomization.yaml`, `kustomization.yml`, or `Kustomization` file is marked
+`kustomize`.
+
+- **`enter`** opens a folder, or shows a manifest as a read-only document.
+- **`e`** opens the manifest in `$KUBE_EDITOR` or `$EDITOR`, suspending the TUI.
+- **`a`** shows a `kubectl diff` of the selection. Nothing is applied until you
+  press `a` again in that diff and confirm. When nothing would change, the
+  status line says so and no diff opens.
+- **`d`** deletes the objects the selection describes, with
+  `--ignore-not-found`, after confirmation.
+
+Both start by rendering the selection once with
+`kubectl apply --dry-run=client -o json`: a manifest with `-f`, a folder with
+`-f <folder> -R`, and a kustomization with `-k`. A delete renders with
+`--validate=false`, so a manifest holding only `apiVersion`, `kind`, and
+`metadata.name` works. The rendered objects stay in memory and reach the diff,
+the apply, and the delete on stdin (`-f -`), so a rendered Secret is never
+written to disk. An edit made after the diff opened is not applied; press `a`
+again to see it. Leaving the diff drops the preview.
+
+Rendering fills in each object's namespace, using the context's default for
+objects without one. Guardrails match the `apply` and `delete` actions against
+every rendered object's resource and namespace, like the same action on a table
+row. `max_bulk` counts every object a rule matches across the whole selection,
+whatever its kind. A selection with a kind sofka has not discovered is refused,
+since its guardrails could not be matched reliably. Every command is
+pinned to the current context with `--context`. Apply and delete are blocked in
+read-only mode and recorded in `:journal`.
+
 ## Safety
 
 - **Read-only mode**, **declarative guardrails**, **action-aware authorization**
@@ -1049,7 +1185,9 @@ pod is rejected; browse through a pod that already mounts the claim instead.
   auto dark/light detection,
   and per-swatch hex overrides. Every semantic color (row status, severity
   badges, headers, borders) is derived from the active palette, so one skin
-  change lands everywhere at once.
+  change lands everywhere at once. The `:skin` picker opens on the active skin
+  and previews each skin as you move; `enter` keeps it, `esc` restores the
+  previous one.
 - **Config file** (TOML or YAML) with per-cluster and per-context overrides and live
   `:reload`. See [Configuration](configuration.md).
 

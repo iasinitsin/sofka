@@ -1,6 +1,6 @@
 name: CI
 
-# PRs only. Pushes to main run no CI. Home Manager tests run here.
+# PRs only. Pushes to main run only nix-cache.yaml. Home Manager tests run here.
 # The release workflow builds Nix packages for all four platforms and updates
 # the Cachix cache. Package build failures can still first appear at release.
 on:
@@ -36,7 +36,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
 
@@ -61,7 +61,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: llvm-tools-preview
 
@@ -72,7 +72,9 @@ jobs:
           workspaces: . -> target/llvm-cov-target
 
       - name: Install coverage tool
-        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov@0.9.1
 
       - name: Generate coverage report
         run: cargo llvm-cov --locked --html

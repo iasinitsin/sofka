@@ -596,6 +596,8 @@ pub struct ResourceQuery {
     pub resource: String,
     pub namespace: Option<String>,
     pub context: Option<String>,
+    /// Named layout from `-o` or a `resource:layout` head.
+    pub layout: Option<String>,
     pub filter: String,
 }
 
@@ -605,17 +607,20 @@ impl ResourceQuery {
     pub fn parse(input: &str) -> Result<Self, String> {
         let (scope, filter) = input.split_once(" /").unwrap_or((input, ""));
         let mut words = scope.split_whitespace();
-        let resource = words.next().ok_or("expected resource")?.to_string();
+        let (resource, layout) =
+            crate::views::split_layout(words.next().ok_or("expected resource")?);
         let mut query = Self {
-            resource,
+            resource: resource.into(),
             namespace: None,
             context: None,
+            layout: layout.map(Into::into),
             filter: filter.into(),
         };
         while let Some(word) = words.next() {
             let slot = match word {
                 "-n" | "--namespace" => &mut query.namespace,
                 "--context" => &mut query.context,
+                "-o" => &mut query.layout,
                 _ if word.starts_with('@') => {
                     let context = &word[1..];
                     if context.is_empty() {
@@ -1109,9 +1114,16 @@ mod tests {
                 resource: "pods".into(),
                 namespace: Some("prod".into()),
                 context: Some("west".into()),
+                layout: None,
                 filter: "-l app=api age<2h".into(),
             }
         );
+        let query = ResourceQuery::parse("pods -o images -n prod").unwrap();
+        assert_eq!(query.layout.as_deref(), Some("images"));
+        assert_eq!(query.namespace.as_deref(), Some("prod"));
+        let query = ResourceQuery::parse("pods:images prod").unwrap();
+        assert_eq!(query.resource, "pods");
+        assert_eq!(query.layout.as_deref(), Some("images"));
         assert_eq!(
             ResourceQuery::parse("pods all /kube system")
                 .unwrap()
@@ -1121,6 +1133,8 @@ mod tests {
         for input in [
             "pods -n",
             "pods --context",
+            "pods -o",
+            "pods:images -o wide",
             "pods -n -x",
             "pods prod extra /api",
             "pods /cpu>oops",
