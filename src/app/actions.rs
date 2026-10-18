@@ -76,13 +76,13 @@ impl App {
 
     /// The objects targeted by a bulk-or-single action (marked rows, else the
     /// selection), as owned clones.
-    fn action_target_objects(&self) -> Vec<DynamicObject> {
+    pub(super) fn action_target_objects(&self) -> Vec<DynamicObject> {
         if self.marked.is_empty() {
             self.selected_ref().cloned().into_iter().collect()
         } else {
             self.rows()
                 .into_iter()
-                .filter(|o| self.marked.contains(&row_key(o)))
+                .filter(|o| self.marked.contains(&self.key_of(o)) && self.in_row_focus(o))
                 .cloned()
                 .collect()
         }
@@ -262,6 +262,117 @@ impl App {
         );
     }
 
+    pub(super) fn request_csr_decision(&mut self, approve: bool) {
+        if self.deny_readonly() {
+            return;
+        }
+        if self.kind_plural != "certificatesigningrequests" {
+            self.flash_warn("approve/deny applies to certificatesigningrequests");
+            return;
+        }
+        let Some(kind) = self.kind.clone() else {
+            return;
+        };
+        let (decided, objs): (Vec<_>, Vec<_>) = self
+            .action_target_objects()
+            .into_iter()
+            .partition(csr_decided);
+        let skipped = decided
+            .iter()
+            .map(|o| o.metadata.name.clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if objs.is_empty() {
+            if !skipped.is_empty() {
+                self.flash_warn(&format!("already decided: {skipped}"));
+            }
+            return;
+        }
+        let action = if approve { "approve" } else { "deny" };
+        let targets: Vec<_> = objs
+            .iter()
+            .map(|o| (o.metadata.name.clone().unwrap_or_default(), String::new()))
+            .collect();
+        let plural = self.kind_plural.clone();
+        // CSRs are cluster-scoped and have no namespace to match, so a rule
+        // with a `namespaces` filter applies to them instead of never matching.
+        let Some(level) = self.guard_scope(action, &plural, &targets, ConfirmLevel::Plain, true)
+        else {
+            return;
+        };
+        let mut label = csr_confirm_label(approve, &objs);
+        if !skipped.is_empty() {
+            label.push_str(&format!("\n\nSkipping already decided: {skipped}"));
+        }
+        let name_hint = match targets.as_slice() {
+            [(name, _)] => name.clone(),
+            many => many.len().to_string(),
+        };
+        let details = label.clone();
+        let warning = csr_access_warning(approve, &objs);
+        self.begin_guarded(
+            ConfirmAction::CsrDecision {
+                kind,
+                approve,
+                objs,
+            },
+            label,
+            level,
+            name_hint,
+        );
+        // The typed prompt replaces the confirm popup, so carry the review
+        // text into it. It scrolls to the bottom while typing, so the warning
+        // is repeated right above what to type.
+        if self.mode == Mode::Prompt {
+            let warning = warning.map(|w| format!("{w}\n\n")).unwrap_or_default();
+            self.prompt_label = format!("{details}\n\n{warning}{}", self.prompt_label);
+        }
+    }
+
+    pub(super) fn do_csr_decision(&mut self, kind: Kind, approve: bool, objs: Vec<DynamicObject>) {
+        let (verb, done) = if approve {
+            ("approving", "approved")
+        } else {
+            ("denying", "denied")
+        };
+        let label = match objs.as_slice() {
+            [one] => one.metadata.name.clone().unwrap_or_default(),
+            many => format!("{} CSRs", many.len()),
+        };
+        self.note_action(if approve { "approve" } else { "deny" }, label.clone());
+        let claim = self.claim_status(format!("{verb} {label}…"));
+        let ok_message = format!("{done} {label}");
+        let now = k8s_openapi::jiff::Timestamp::now().to_string();
+        let client = self.cluster.client.clone();
+        let tx = self.tx.clone();
+        let genr = self.generation;
+        tokio::spawn(async move {
+            let api: Api<DynamicObject> = Api::all_with(client, &kind.ar);
+            let mut errors = Vec::new();
+            for obj in objs {
+                let name = obj.metadata.name.clone().unwrap_or_default();
+                let body =
+                    csr_decision_body(&obj, &kind.ar.api_version, &kind.ar.kind, approve, &now);
+                if let Err(e) = api
+                    .replace_subresource("approval", &name, &PostParams::default(), &body)
+                    .await
+                {
+                    errors.push(format!("{verb} {name} failed: {e}"));
+                }
+            }
+            let err = !errors.is_empty();
+            let message = if err { errors.join("; ") } else { ok_message };
+            let _ = tx
+                .send(Msg::Flash {
+                    generation: genr,
+                    claim,
+                    message,
+                    err,
+                })
+                .await;
+        });
+    }
+
     pub(super) fn request_attach(&mut self) {
         if self.deny_readonly() {
             return;
@@ -275,8 +386,12 @@ impl App {
         };
         let name = obj.metadata.name.clone().unwrap_or_default();
         let ns = obj.metadata.namespace.clone().unwrap_or_default();
+        let container = default_container(obj);
         let mut argv = self.kubectl_base();
         argv.extend(["attach".into(), "-it".into(), "-n".into(), ns, name]);
+        if let Some(c) = container {
+            argv.extend(["-c".into(), c]);
+        }
         self.pending = Some(Suspend::Shell(argv));
     }
 
@@ -370,37 +485,70 @@ impl App {
         );
     }
 
-    /// Save the filtered log buffer to a temp file (k9s Ctrl-S).
+    /// Save the filtered log buffer to `save_dir` (k9s Ctrl-S).
     pub(super) fn save_logs(&mut self) {
         let text = self.filtered_log_text();
         if text.is_empty() {
             self.flash_warn("no log lines to save");
             return;
         }
-        let claim = self.claim_status("saving logs…");
+        let title = self.logs.view.title.clone();
+        self.save_text(text, &title, "log", "logs");
+    }
+
+    /// Save the whole open document to `save_dir`, as rendered and ignoring
+    /// the search, like [`Self::copy_doc`].
+    pub(super) fn save_doc(&mut self) {
+        let text = self.doc_text();
+        if text.is_empty() {
+            self.flash_warn("nothing to save");
+            return;
+        }
+        let ext = if self.mode == Mode::Diff || self.detail.yaml {
+            "yaml"
+        } else {
+            "txt"
+        };
+        let title = self.detail.title.clone();
+        self.save_text(text, &title, ext, "document");
+    }
+
+    /// Write `text` off the UI thread to `sofka-<title>-<ts>.<ext>` in
+    /// `save_dir`, creating the directory first.
+    fn save_text(&mut self, text: String, title: &str, ext: &str, what: &'static str) {
+        let claim = self.claim_status(format!("saving {what}…"));
         // Saving is a one-shot file operation, not part of the live log
         // stream. Leaving Logs bumps `log_gen`, but must not drop this result
         // and strand its progress flash.
         let genr = self.generation;
         let tx = self.tx.clone();
         let ts = k8s_openapi::jiff::Timestamp::now().as_second();
-        let safe: String = self
-            .logs
-            .view
-            .title
+        let mut safe = String::new();
+        for c in title
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '-' })
-            .collect();
-        let path = std::env::temp_dir().join(format!("sofka-{safe}-{ts}.log"));
+        {
+            // File names are capped at 255 bytes on common filesystems; this
+            // leaves room for the prefix, timestamp, suffix, and extension.
+            if safe.len() + c.len_utf8() > MAX_SAVE_TITLE_BYTES {
+                break;
+            }
+            safe.push(c);
+        }
+        let stem = format!("sofka-{safe}-{ts}");
+        let ext = ext.to_string();
+        let save_dir = self.save_dir.clone();
         tokio::spawn(async move {
-            let result = tokio::fs::write(&path, text)
-                .await
-                .map(|_| path)
-                .map_err(|e| e.to_string());
+            let result = tokio::task::spawn_blocking(move || {
+                write_saved(save_dir.as_deref(), &stem, &ext, &text)
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
             let _ = tx
-                .send(Msg::LogsSaved {
+                .send(Msg::Saved {
                     generation: genr,
                     claim,
+                    what,
                     result,
                 })
                 .await;
@@ -412,7 +560,9 @@ impl App {
             .view
             .lines
             .iter()
-            .filter(|l| self.logs.matches(l))
+            .enumerate()
+            .filter(|(i, l)| self.logs.matches(l, self.logs.line_meta.get(*i)))
+            .map(|(_, l)| l)
             .cloned()
             .collect::<Vec<_>>()
             .join("\n")
@@ -490,8 +640,7 @@ impl App {
         };
         let name = obj.metadata.name.clone().unwrap_or_default();
         let ns = obj.metadata.namespace.clone().unwrap_or_default();
-        let containers = container_names(obj);
-        let container = containers.into_iter().next();
+        let container = default_container(obj);
         self.launch_logs(
             LogSource::Single {
                 ns,
@@ -619,13 +768,16 @@ impl App {
             (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
             (Some(Action::Down), _) => list_step(&mut self.container_state, len, true),
             (Some(Action::Up), _) => list_step(&mut self.container_state, len, false),
-            (Some(Action::PageDown), _) => {
-                list_page(&mut self.container_state, len, self.picker_page_items, true)
-            }
-            (Some(Action::PageUp), _) => list_page(
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => list_page(
                 &mut self.container_state,
                 len,
-                self.picker_page_items,
+                a.page_size(self.picker_page_items),
+                true,
+            ),
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => list_page(
+                &mut self.container_state,
+                len,
+                a.page_size(self.picker_page_items),
                 false,
             ),
             (Some(Action::Accept), _) => {
@@ -819,23 +971,8 @@ impl App {
         if self.deny_readonly() {
             return;
         }
-        let container = container.or_else(|| {
-            let obj = self.store.get(&format!("{ns}/{pod}"))?;
-            let containers = obj.data.pointer("/spec/containers")?.as_array()?;
-            let default = obj
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|a| a.get("kubectl.kubernetes.io/default-container"));
-            default
-                .filter(|name| {
-                    containers
-                        .iter()
-                        .any(|c| c["name"].as_str() == Some(name.as_str()))
-                })
-                .cloned()
-                .or_else(|| containers.first()?.get("name")?.as_str().map(str::to_owned))
-        });
+        let container =
+            container.or_else(|| default_container(self.store.get(&format!("{ns}/{pod}"))?));
         self.shell_target = Some(ShellTarget {
             ns: ns.clone(),
             pod: pod.clone(),
@@ -1193,6 +1330,16 @@ impl App {
             _ => pod_port_labels(&obj.data),
         };
         items.dedup();
+        self.pf_picker_in_use = items
+            .iter()
+            .map(|item| {
+                let ports = item.split_whitespace().next().unwrap_or(item);
+                let local = ports.split_once(':').map_or(ports, |(local, _)| local);
+                local
+                    .parse::<u16>()
+                    .is_ok_and(|port| matches!(probe_local_port(port), LocalPort::InUse))
+            })
+            .collect();
         items.push("Custom…".into());
 
         self.pf_picker_items = items;
@@ -1251,27 +1398,17 @@ impl App {
         if port == 0 {
             return true;
         }
-        let mut available = false;
-        let mut in_use = false;
-        let mut last_error = None;
-        for address in [
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        ] {
-            match std::net::TcpListener::bind((address, port)) {
-                Ok(_listener) => available = true,
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => in_use = true,
-                Err(error) => last_error = Some(error),
-            }
-        }
-        if !available {
-            if in_use {
+        match probe_local_port(port) {
+            LocalPort::Available => true,
+            LocalPort::InUse => {
                 self.flash_warn(&format!("port {port} is already in use"));
-            } else if let Some(error) = last_error {
+                false
+            }
+            LocalPort::Unbindable(error) => {
                 self.flash_warn(&format!("cannot bind local port {port}: {error}"));
+                false
             }
         }
-        available
     }
 
     pub(super) fn start_port_forward(&mut self, ns: String, target: String, ports: String) -> bool {
@@ -1395,27 +1532,66 @@ impl App {
     }
 
     pub(super) fn open_skins(&mut self) {
+        // An alias such as `latte` names the same built-in palette as its
+        // listed full name, so fall back to comparing the palettes.
+        let current = self.active_skin.as_deref().and_then(|active| {
+            let palette = crate::theme::builtin(&active.trim().to_ascii_lowercase())?;
+            self.skin_list
+                .iter()
+                .position(|name| name == active)
+                .or_else(|| {
+                    self.skin_list.iter().position(|name| {
+                        crate::theme::builtin(&name.to_ascii_lowercase()) == Some(palette)
+                    })
+                })
+        });
         self.skin_state.select(if self.skin_list.is_empty() {
             None
         } else {
-            Some(0)
+            Some(current.unwrap_or(0))
         });
+        // Reopening from the palette mid-preview keeps the original origin.
+        if self.skin_preview_origin.is_none() {
+            self.skin_preview_origin = Some((self.active_skin.clone(), crate::theme::snapshot()));
+        }
         self.mode = Mode::Skins;
     }
 
     pub(super) fn key_skins(&mut self, key: KeyInput) {
         let len = self.skin_list.len();
         match (key.action, key.code) {
-            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
-            (Some(Action::Down), _) => list_step(&mut self.skin_state, len, true),
-            (Some(Action::Up), _) => list_step(&mut self.skin_state, len, false),
-            (Some(Action::PageDown), _) => {
-                list_page(&mut self.skin_state, len, self.picker_page_items, true)
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
+                self.cancel_skin_preview();
+                self.mode = Mode::Table;
             }
-            (Some(Action::PageUp), _) => {
-                list_page(&mut self.skin_state, len, self.picker_page_items, false)
+            (Some(Action::Down), _) => {
+                list_step(&mut self.skin_state, len, true);
+                self.preview_selected_skin();
+            }
+            (Some(Action::Up), _) => {
+                list_step(&mut self.skin_state, len, false);
+                self.preview_selected_skin();
+            }
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => {
+                list_page(
+                    &mut self.skin_state,
+                    len,
+                    a.page_size(self.picker_page_items),
+                    true,
+                );
+                self.preview_selected_skin();
+            }
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => {
+                list_page(
+                    &mut self.skin_state,
+                    len,
+                    a.page_size(self.picker_page_items),
+                    false,
+                );
+                self.preview_selected_skin();
             }
             (Some(Action::Accept), _) => {
+                self.skin_preview_origin = None;
                 if let Some(name) = self
                     .skin_state
                     .selected()
@@ -1427,6 +1603,32 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Reinstall the skin that was active when the picker opened.
+    pub(super) fn cancel_skin_preview(&mut self) {
+        if let Some((active, palette)) = self.skin_preview_origin.take() {
+            crate::theme::set(palette);
+            self.active_skin = active;
+        }
+    }
+
+    /// Install the highlighted skin while the picker is open, without making
+    /// it the session skin; `esc` restores the palette captured on open.
+    fn preview_selected_skin(&mut self) {
+        let Some(name) = self
+            .skin_state
+            .selected()
+            .and_then(|i| self.skin_list.get(i).cloned())
+        else {
+            return;
+        };
+        if self.active_skin.as_deref() == Some(name.as_str()) {
+            return;
+        }
+        let palette = crate::theme::resolve_skin(Some(&name), &self.skin_colors);
+        crate::theme::set(palette);
+        self.active_skin = Some(name);
     }
 
     pub(super) fn apply_skin(&mut self, name: &str) {
@@ -1441,6 +1643,7 @@ impl App {
         }
         let palette = crate::theme::resolve_skin(Some(name), &self.skin_colors);
         crate::theme::set(palette);
+        self.skin_preview_origin = None;
         // A manual choice becomes the session skin, so it survives context
         // switches into contexts without a config skin override.
         self.session_skin = Some(name.to_string());
@@ -1460,6 +1663,8 @@ impl App {
             self.flash_warn(&format!("unknown skin '{name}' in config"));
             return;
         }
+        // The context's skin replaces any picker preview outright.
+        self.skin_preview_origin = None;
         let palette = crate::theme::resolve_skin(Some(&name), &self.skin_colors);
         crate::theme::set(palette);
         self.active_skin = Some(name);
@@ -1495,6 +1700,7 @@ impl App {
         self.hide_header = resolved.config.hide_header;
         self.terminal_title = resolved.config.terminal_title.unwrap_or(true);
         self.update_check = resolved.config.update_check.unwrap_or(true);
+        self.save_dir = resolved.config.save_dir;
         self.plugins = resolved.config.plugins;
         self.bookmarks = resolved.config.bookmarks;
         self.workspaces = resolved.config.workspaces;
@@ -1519,6 +1725,7 @@ impl App {
         let (views, view_warnings) = crate::views::compile(&resolved.config.views);
         self.user_views = views;
         warnings.extend(view_warnings);
+        warnings.extend(self.prune_layouts());
         let (thresholds, threshold_warnings) =
             crate::thresholds::compile(&resolved.config.thresholds);
         self.thresholds = thresholds;
@@ -1530,6 +1737,11 @@ impl App {
             crate::providers::compile(resolved.config.providers.logs.as_ref());
         self.log_provider = log_provider;
         warnings.extend(provider_warnings);
+        let (log_link, link_warnings) =
+            crate::providers::compile_link(resolved.config.providers.logs.as_ref());
+        self.log_link = log_link;
+        self.log_provider_configured = resolved.config.providers.logs.is_some();
+        warnings.extend(link_warnings);
         let (metrics_provider, metrics_warnings) =
             crate::providers::compile_metrics(resolved.config.providers.metrics.as_ref());
         self.metrics_provider = metrics_provider;
@@ -1699,16 +1911,17 @@ impl App {
         );
     }
 
-    /// `t` on a pod row: open the file-transfer menu for the selected pod.
-    /// No container pin — `kubectl cp` targets the pod's default container;
-    /// the container picker's `t` transfers to/from a specific one.
+    /// `t` on a pod row: open the file-transfer menu for the selected pod,
+    /// pinned to its default container; the container picker's `t` picks
+    /// another one.
     pub(super) fn request_transfer(&mut self) {
         let Some(obj) = self.selected_ref() else {
             return;
         };
         let name = obj.metadata.name.clone().unwrap_or_default();
         let ns = obj.metadata.namespace.clone().unwrap_or_default();
-        self.open_transfer_menu(ns, name, None);
+        let container = default_container(obj);
+        self.open_transfer_menu(ns, name, container);
     }
 
     /// Open the download/upload choice for `pod`. A menu rather than a prompt
@@ -1733,16 +1946,16 @@ impl App {
             }
             (Some(Action::Down), _) => list_step(&mut self.transfer_menu_state, len, true),
             (Some(Action::Up), _) => list_step(&mut self.transfer_menu_state, len, false),
-            (Some(Action::PageDown), _) => list_page(
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => list_page(
                 &mut self.transfer_menu_state,
                 len,
-                self.picker_page_items,
+                a.page_size(self.picker_page_items),
                 true,
             ),
-            (Some(Action::PageUp), _) => list_page(
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => list_page(
                 &mut self.transfer_menu_state,
                 len,
-                self.picker_page_items,
+                a.page_size(self.picker_page_items),
                 false,
             ),
             (Some(Action::Accept), _) => {
@@ -1979,13 +2192,16 @@ impl App {
             (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
             (Some(Action::Down), _) => list_step(&mut self.flux_menu_state, len, true),
             (Some(Action::Up), _) => list_step(&mut self.flux_menu_state, len, false),
-            (Some(Action::PageDown), _) => {
-                list_page(&mut self.flux_menu_state, len, self.picker_page_items, true)
-            }
-            (Some(Action::PageUp), _) => list_page(
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => list_page(
                 &mut self.flux_menu_state,
                 len,
-                self.picker_page_items,
+                a.page_size(self.picker_page_items),
+                true,
+            ),
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => list_page(
+                &mut self.flux_menu_state,
+                len,
+                a.page_size(self.picker_page_items),
                 false,
             ),
             (Some(Action::Accept), _) => {
@@ -2854,6 +3070,33 @@ pub(super) fn forward_target(kind_plural: &str, name: &str) -> String {
     format!("{prefix}/{name}")
 }
 
+enum LocalPort {
+    Available,
+    InUse,
+    Unbindable(std::io::Error),
+}
+
+/// Test-bind `port` on both loopback addresses, as `kubectl port-forward`
+/// does: the port is usable when either address binds.
+fn probe_local_port(port: u16) -> LocalPort {
+    let mut in_use = false;
+    let mut last_error = None;
+    for address in [
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+        match std::net::TcpListener::bind((address, port)) {
+            Ok(_listener) => return LocalPort::Available,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => in_use = true,
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) if !in_use => LocalPort::Unbindable(error),
+        _ => LocalPort::InUse,
+    }
+}
+
 /// Collect declared ports from a Service manifest as `"port:port  (name)"` labels.
 /// Only TCP ports are included — `kubectl port-forward` doesn't support UDP/SCTP.
 fn service_port_labels(data: &Value) -> Vec<String> {
@@ -2970,4 +3213,33 @@ async fn run_helm(argv: &[String]) -> std::result::Result<(), String> {
         }
         Err(e) => Err(e.to_string()),
     }
+}
+
+const MAX_SAVE_TITLE_BYTES: usize = 200;
+
+/// Saves can hold Secret values, so the file is private to this user, and a
+/// name already taken (the same title saved within one second) gets a `-N`
+/// suffix instead of being overwritten.
+pub(super) fn write_saved(
+    save_dir: Option<&str>,
+    stem: &str,
+    ext: &str,
+    text: &str,
+) -> Result<std::path::PathBuf, String> {
+    let dir = crate::config::save_dir(save_dir)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    for n in 1..=100 {
+        let name = if n == 1 {
+            format!("{stem}.{ext}")
+        } else {
+            format!("{stem}-{n}.{ext}")
+        };
+        let path = dir.join(name);
+        match super::secret_edit::create_private(&path, text) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err(format!("no free file name for {stem}.{ext}"))
 }

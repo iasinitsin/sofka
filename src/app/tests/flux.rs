@@ -84,7 +84,9 @@ async fn helmrelease_reconcile_patches_selected_and_marked_releases() {
         );
         if bulk {
             app.handle_key(press(KeyCode::Char(' '))).unwrap();
+            app.handle_key(press(KeyCode::Down)).unwrap();
             app.handle_key(press(KeyCode::Char(' '))).unwrap();
+            app.handle_key(press(KeyCode::Down)).unwrap();
             assert_eq!(app.marked.len(), 2);
         }
         let action = if force {
@@ -196,7 +198,9 @@ async fn helmchart_actions_patch_selected_and_marked_charts() {
             );
             if bulk {
                 app.handle_key(press(KeyCode::Char(' '))).unwrap();
+                app.handle_key(press(KeyCode::Down)).unwrap();
                 app.handle_key(press(KeyCode::Char(' '))).unwrap();
+                app.handle_key(press(KeyCode::Down)).unwrap();
                 assert_eq!(app.marked.len(), 2);
             }
             choose(&mut app, action);

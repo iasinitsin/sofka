@@ -229,6 +229,7 @@ readonly          = false  # true disables every mutating action (delete, edit,
 hide_header = false # true hides the header and logo
 compact_mode = false # true starts with a one-line header and no footer
 detail_wrap = false # true starts with document line wrapping enabled
+rbac_rule_list = false # true opens RBAC rules as the per-rule list, not the matrix
 mouse             = false  # default; :mouse switches it for this session
                            # false keeps the terminal's native mouse behavior
                            # (text selection) instead of scroll/click/sort
@@ -237,6 +238,7 @@ terminal_title = true # false disables terminal title changes
 remember_sort     = true   # save and restore sort choices per resource kind
                            # false makes sort changes temporary
 update_check = true # false turns off the daily check for a newer release
+save_dir = "~/k8s/saves" # ctrl-s target for logs and documents; default: temp dir
 
 # Namespaces pinned to the top of the `n` switcher (★); session recents (·)
 # follow them. Keys 1 to 9 select the first nine entries in this fixed order.
@@ -265,6 +267,13 @@ machines. `:check-update` and `sofka check-update` still check on request. sofka
 never downloads or installs a release; upgrade with the package manager that
 installed it.
 
+`save_dir` is where `ctrl-s` writes in logs and document views. It defaults to
+the system temp directory. A leading `~` expands to `$HOME`. sofka creates the
+directory on the first save if it does not exist, and shows the error in the
+status line if it cannot. A relative path is resolved against the directory
+sofka was started in. The option supports cluster and context overrides and
+`:reload`.
+
 Set `hide_header = true` to remove the header and logo and give more space to
 the active view. The default is `false`. This option supports cluster and
 context overrides and `:reload`. It also hides the one-line header in compact
@@ -283,6 +292,11 @@ The `w` key changes wrapping for the current session. New documents, `:reload`,
 and context switches keep this setting. The configuration is read at startup,
 including cluster and context overrides. Changes made with `w` are not written
 to the configuration file. Log wrapping is separate.
+
+Set `rbac_rule_list = true` to open RBAC rules as the per-rule list instead of
+the resource and verb matrix. The default is `false`. The `t` key in the RBAC
+view switches the layout for the current session and is not written to the
+configuration file.
 
 `mouse_scroll_lines` sets how many navigation steps one received mouse wheel
 event triggers in views with mouse capture enabled (tables and pickers). The
@@ -397,7 +411,7 @@ Each of these is documented where the feature itself is:
 | `[[workspaces]]`      | named sets of views for one task            | [Plugins](plugins.md#workspaces)                           |
 | `[[forwards]]`        | saved port-forwards, optionally autostarted | [Plugins](plugins.md#saved-forwards)                       |
 | `[[guardrails]]`      | enforced rules on destructive actions       | [Safety](safety.md#guardrails)                             |
-| `[logs]`              | tail, buffer, `since`, starting `json_view` | [Log controls](debugging.md#log-controls)                  |
+| `[logs]`              | tail, buffer, `since`, JSON view and times  | [Log controls](debugging.md#log-controls)                  |
 | `[notify]`            | bell and desktop notification delivery      | [Notifications](debugging.md#notifications)                |
 | `[keys]`              | built-in keyboard bindings                  | [Key bindings](keybindings.md)                             |
 | `[debug]`             | ephemeral and node debug images             | [Debug containers](debugging.md#debug-containers-and-pods) |
@@ -405,7 +419,7 @@ Each of these is documented where the feature itself is:
 | `[logging]`           | sofka's own structured log file             | [Runtime diagnostics](debugging.md#runtime-diagnostics)    |
 | `[pvc_explore]`       | helper pod image, TTL, resources            | [PVC explore](features.md#pvc-explore)                     |
 | `[providers.metrics]` | Prometheus/VictoriaMetrics for `:rightsize` | [Providers](providers.md#right-sizing-metrics-provider)    |
-| `[providers.logs]`    | VictoriaLogs backend for `L`                | [Providers](providers.md#log-provider-victorialogs)        |
+| `[providers.logs]`    | VictoriaLogs or log UI link for `L`         | [Providers](providers.md#log-provider-victorialogs)        |
 | `[fleet]`             | contexts in the cross-cluster dashboard     | [Providers](providers.md#fleet-dashboard)                  |
 
 ## Action journal files

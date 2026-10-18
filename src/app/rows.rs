@@ -68,7 +68,7 @@ impl App {
         cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> bool {
-        if self.faults_filter_active() && !pod_has_faults(o) {
+        if self.faults_filter_active() && !self.row_has_faults(o) {
             return false;
         }
         if self.filter.is_empty() {
@@ -78,7 +78,38 @@ impl App {
     }
 
     pub fn faults_filter_active(&self) -> bool {
-        self.faults_only && self.kind_plural == "pods"
+        self.faults_only && self.faults_supported()
+    }
+
+    /// Whether `Ctrl+Z` can filter the current kind.
+    pub(super) fn faults_supported(&self) -> bool {
+        // Synthetic views (rollout history over ReplicaSets) list their
+        // backing kind for another purpose; healthy rows there are the point.
+        self.workloads_active()
+            || self.kind.as_ref().is_some_and(|kind| {
+                kind.ar.plural.eq_ignore_ascii_case(&self.kind_plural)
+                    && ((kind.ar.group.is_empty() && kind.ar.plural == "pods")
+                        || crate::columns::has_faults_rule(&kind.ar.group, &kind.ar.plural))
+            })
+    }
+
+    fn row_has_faults(&self, o: &DynamicObject) -> bool {
+        let (group, plural) = if self.workloads_active() {
+            match workloads::group_plural(o) {
+                Some(kind) => kind,
+                None => return true,
+            }
+        } else {
+            match &self.kind {
+                Some(kind) => (kind.ar.group.as_str(), kind.ar.plural.as_str()),
+                None => return true,
+            }
+        };
+        if group.is_empty() && plural == "pods" {
+            pod_has_faults(o)
+        } else {
+            crate::columns::object_faulted(group, plural, o).unwrap_or(true)
+        }
     }
 
     fn eval_filter(
@@ -461,17 +492,23 @@ impl App {
             || parsed.fields() != self.applied_filter_fields.as_deref()
     }
 
-    /// Char indices in `name` that matched the active row filter's text
-    /// pattern, for highlighting them in the table. `None` when there's no
-    /// active filter or no positive text term (every visible row already
-    /// passed the filter pass, so this is purely a rendering aid, not a
-    /// second filter decision).
+    /// Whether the active row filter has a positive text term whose matches
+    /// the table can highlight.
+    pub fn filter_highlights(&self) -> bool {
+        !self.filter.is_empty() && self.parsed_filter().highlight_pattern().is_some()
+    }
+
+    /// Char indices in `text` (a NAME, NAMESPACE or other displayed cell)
+    /// that matched the active row filter's text pattern, for highlighting
+    /// them in the table. `None` when there's no active filter or no positive
+    /// text term (every visible row already passed the filter pass, so this
+    /// is purely a rendering aid, not a second filter decision).
     ///
-    /// Memoized per name for the current filter: the renderer asks this for
-    /// every visible row on every redraw, and re-running the matcher to get
+    /// Memoized per text for the current filter: the renderer asks this for
+    /// every visible cell on every redraw, and re-running the matcher to get
     /// an answer that cannot have changed is the single most expensive thing
     /// a filtered frame used to do.
-    pub fn filter_match_indices(&self, name: &str) -> Option<Rc<[usize]>> {
+    pub fn filter_match_indices(&self, text: &str) -> Option<Rc<[usize]>> {
         if self.filter.is_empty() {
             return None;
         }
@@ -484,14 +521,14 @@ impl App {
             cache.filter.push_str(&self.filter);
             cache.rows.clear();
         }
-        if let Some(hit) = cache.rows.get(name) {
+        if let Some(hit) = cache.rows.get(text) {
             return hit.clone();
         }
         if cache.rows.len() >= HIGHLIGHT_CACHE_LIMIT {
             cache.rows.clear();
         }
-        let idx = self.match_positions(pat, name).map(Rc::from);
-        cache.rows.insert(Box::from(name), idx.clone());
+        let idx = self.match_positions(pat, text).map(Rc::from);
+        cache.rows.insert(Box::from(text), idx.clone());
         idx
     }
 
@@ -584,7 +621,7 @@ impl App {
             {
                 continue;
             }
-            if !self.in_owner_scope(o) {
+            if !self.in_owner_scope(o) || !self.workload_row_visible(o) {
                 continue;
             }
             if !self.matches_filter_cached(o, k, &parsed, cells, now) {
@@ -626,16 +663,21 @@ impl App {
             entries.push((primary, tie, k));
         }
         let desc = self.sort_desc && sort_header.is_some();
-        // Unstable: the `(namespace, name)` fallback below is a total order
-        // for a Kubernetes object set, so stability buys nothing here — and a
-        // stable sort allocates an n/2 scratch buffer on every rebuild.
+        // Unstable: the `(namespace, name, key)` fallback below is a total
+        // order, so stability buys nothing here — and a stable sort allocates
+        // an n/2 scratch buffer on every rebuild. The key only breaks ties in
+        // the workloads view, where several kinds share a namespace/name.
         entries.sort_unstable_by(|a, b| {
             let mut ord = a.0.cmp_to(&b.0);
             if desc {
                 ord = ord.reverse();
             }
             // Ties always fall back to namespace/name ascending.
-            ord.then_with(|| natural_cmp(a.1.0, b.1.0).then_with(|| natural_cmp(a.1.1, b.1.1)))
+            ord.then_with(|| {
+                natural_cmp(a.1.0, b.1.0)
+                    .then_with(|| natural_cmp(a.1.1, b.1.1))
+                    .then_with(|| a.2.cmp(b.2))
+            })
         });
         cache.keys = entries.into_iter().map(|(_, _, k)| k.clone()).collect();
         cache.dirty = false;
@@ -797,7 +839,7 @@ impl App {
             // Shares `cell_entry` with the filter pass, so a row rendered for
             // filtering is already warm for the renderer (and vice versa) and
             // there is one place that decides what "stale" means.
-            let key = row_key(obj);
+            let key = self.key_of(obj);
             let key = self
                 .store
                 .key(&key)
@@ -939,7 +981,12 @@ impl App {
         if kind.ar.plural.to_lowercase() != self.kind_plural {
             return None;
         }
-        crate::views::lookup(&self.user_views, &kind.ar, self.view_namespace())
+        crate::views::lookup_layout(
+            &self.user_views,
+            &kind.ar,
+            self.view_namespace(),
+            self.active_layout(),
+        )
     }
 
     /// Apply a view's configured initial sort, unless a sort is already
@@ -1278,7 +1325,7 @@ impl App {
         let Some(obj) = self.selected_ref() else {
             return;
         };
-        let key = row_key(obj);
+        let key = self.key_of(obj);
         if self.marked.remove(&key) {
             if self.mark_anchor.as_ref() == Some(&key) {
                 self.mark_anchor = None;
@@ -1297,7 +1344,7 @@ impl App {
     /// Mark every visible row from the last SPACE mark to the cursor (ctrl-space).
     /// Without a marked anchor in the current rows, only the cursor row is marked.
     pub(super) fn mark_range(&mut self) {
-        let keys: Vec<String> = self.rows().iter().map(|obj| row_key(obj)).collect();
+        let keys: Vec<String> = self.rows().iter().map(|obj| self.key_of(obj)).collect();
         let Some(current) = self
             .table_state
             .selected()
@@ -1331,7 +1378,7 @@ impl App {
         }
         self.rows()
             .iter()
-            .filter(|o| self.marked.contains(&row_key(o)))
+            .filter(|o| self.marked.contains(&self.key_of(o)) && self.in_row_focus(o))
             .map(|o| to_pair(o))
             .collect()
     }
@@ -1352,7 +1399,7 @@ impl App {
         }
         self.rows()
             .iter()
-            .filter(|o| self.marked.contains(&row_key(o)))
+            .filter(|o| self.marked.contains(&self.key_of(o)) && self.in_row_focus(o))
             .map(|o| to_pair(o))
             .collect()
     }
@@ -1369,7 +1416,7 @@ impl App {
         let rows: Vec<_> = self
             .rows()
             .iter()
-            .map(|obj| (row_key(obj), obj.metadata.uid.clone()))
+            .map(|obj| (self.key_of(obj), obj.metadata.uid.clone()))
             .collect();
         if rows.is_empty() {
             self.range_selection = None;
@@ -1415,6 +1462,11 @@ impl App {
     pub(super) fn move_page(&mut self, pages: i32) {
         let page = self.table_page_rows.max(1) as i32;
         self.move_selection(pages.saturating_mul(page));
+    }
+
+    pub(super) fn move_half_page(&mut self, pages: i32) {
+        let half = Action::HalfPageDown.page_size(self.table_page_rows) as i32;
+        self.move_selection(pages.saturating_mul(half));
     }
 }
 

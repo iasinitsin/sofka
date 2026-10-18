@@ -34,6 +34,8 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `:resource -n ns --context ctx /filter`                      | query resource, namespace, context, and filter together                                                                                                                                          |
 | `:resource @context [namespace]`                             | switch context and resource; context names fuzzy-complete                                                                                                                                        |
+| `:resource -o layout`                                        | open the resource in a [named layout](views.md#named-layouts); `default` returns to the default columns, `wide` turns on wide mode                                                               |
+| `:layout` / `:layout <name>`                                 | pick the current kind's layout, `default` first / switch to it (the name tab-completes)                                                                                                          |
 | `:mouse`                                                     | switch mouse capture on/off for this session; off allows terminal text selection                                                                                                                 |
 | `:<resource>`                                                | command palette - fuzzy over kinds and built-in commands                                                                                                                                         |
 | `:<resource> <ns>`                                           | switch kind and namespace at once (`:deploy social`; `all`/`*` = all namespaces; the namespace tab-completes)                                                                                    |
@@ -44,6 +46,7 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `esc`                                                        | go back / pop the view stack / clear filter / clear marks                                                                                                                                        |
 | `j`/`k`, `↓`/`↑`, `g`/`G`                                    | navigate                                                                                                                                                                                         |
 | `ctrl-f` / `ctrl-b`, `PgDn` / `PgUp`                         | page forward / back - one screenful at a time                                                                                                                                                    |
+| `half_page_down` / `half_page_up`                            | half a page forward / back; unbound by default, see [key bindings](keybindings.md#example-ctrlu-and-ctrld-for-half-page-scrolling)                                                               |
 | `S` / `I`                                                    | sort-column picker (fuzzy; ⏎ on the active column inverts) / invert sort direction; saved per kind by default (`remember_sort = false` disables this)                                            |
 | `A`                                                          | sort by `AGE`; press again to invert; uses the sort memory setting                                                                                                                               |
 | `ctrl-e`                                                     | compact mode: collapse the header + footer (for tiled/multiplexed panes)                                                                                                                         |
@@ -51,7 +54,11 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `shift-up` / `shift-down`                                    | extend or reduce the marked range from the starting row                                                                                                                                          |
 | `ctrl-space`                                                 | mark every row from the last `space` mark to the cursor                                                                                                                                          |
 | `/`                                                          | filter: text · `a\|b` · `~fuzzy` · `/regex/` · `!inverse` · `label:text` local label search · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                            |
-| `Ctrl+Z`                                                     | toggle faults filter in pod views; configured actions take precedence; combine with `/`; press again to turn off                                                                                 |
+| `Ctrl+Z`                                                     | toggle faults filter in pod, workload, Flux, and Argo CD views; configured actions take precedence; combine with `/`; press again to turn off                                                    |
+| `:workloads [ns]` / `:wk`                                    | deployments, statefulsets, daemonsets, cronjobs, jobs and pods in one table; row keys act on the row's own kind                                                                                  |
+| `:ns-resources [ns]`                                         | namespaced kinds with objects in the namespace (default: current; `all`/`*` = all namespaces) and how many; `⏎` opens the kind in that namespace, `r` counts again                               |
+| `R` (namespaces view)                                        | open `:ns-resources` for the selected namespace                                                                                                                                                  |
+| `O` (workloads view)                                         | show or hide pods and jobs that a listed workload owns                                                                                                                                           |
 | `n` / `0`                                                    | namespace switcher / all namespaces; `0` also selects all namespaces inside the switcher while the filter is empty                                                                               |
 | `W`                                                          | switch to the selected resource's namespace and keep the resource kind                                                                                                                           |
 | `1` to `9`                                                   | select a configured favourite namespace in fixed configuration order; also inside the switcher while the filter is empty                                                                         |
@@ -68,6 +75,8 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `:users` / `:groups`                                         | List subjects from RBAC bindings across all namespaces. Enter shows directly bound rules.                                                                                                        |
 | `:policy [u:name \| g:name \| s:ns/name]`                    | Show directly bound rules. Without an argument, use the selected service account.                                                                                                                |
 | `Enter` (Role, ClusterRole, RoleBinding, ClusterRoleBinding) | Show rules. Follow the binding's role reference when needed.                                                                                                                                     |
+| `t` (RBAC rules)                                             | Switch rules between the resource and verb matrix and the rule list.                                                                                                                             |
+| `h` / `l` (RBAC rules)                                       | Scroll the matrix left / right.                                                                                                                                                                  |
 | `r` / `Esc` (RBAC view)                                      | Read the data again / return to the previous view.                                                                                                                                               |
 | `:can-i` / `:can-i <verb> <resource> [ns]`                   | what you can do here / check a single action (`SelfSubjectAccessReview`)                                                                                                                         |
 | `:journal` / `:audit`                                        | session-local log of the mutating actions you've taken                                                                                                                                           |
@@ -76,27 +85,29 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `:helm`                                                      | Helm releases (native storage-Secret decode): ⏎ history → values · `y` manifest · `d` notes · `r` rollback                                                                                       |
 | `:rollout-history`                                           | Deployment, StatefulSet, or DaemonSet revisions: ⏎ diff against the live template · `r` rollback                                                                                                 |
 | `:fleet`                                                     | cross-context health dashboard (opt-in: `[fleet]` contexts or `space` in `:ctx`; `⏎` switches, `r` refreshes)                                                                                    |
-| `:skin`                                                      | switch the color skin live (`:skin gruvbox-dark` applies directly)                                                                                                                               |
+| `:skin`                                                      | pick a color skin with live preview; `esc` restores the previous skin (`:skin gruvbox-dark` applies directly)                                                                                    |
 | `:reload` / `:config` / `:info`                              | reload config from disk · config sources + warnings · runtime diagnostics                                                                                                                        |
 | `:check-update`                                              | check for a newer sofka release and show the upgrade command                                                                                                                                     |
-| `l` / `p`                                                    | logs (marked pods, or current row; workload = all matching pods) / previous-container logs                                                                                                       |
-| `L` / `:vlogs`                                               | VictoriaLogs history for the selection (pod, container, workload, service, namespace)                                                                                                            |
+| `l` / `p`                                                    | logs (marked pods, or current row; a pod with a `kubectl.kubernetes.io/default-container` annotation shows that container; workload = all matching pods) / previous-container logs               |
+| `L` / `:vlogs`                                               | VictoriaLogs history for the selection (pod, container, workload, service, namespace), or its Cloud Logging / log UI link                                                                        |
 | `c`                                                          | copy resource name to clipboard                                                                                                                                                                  |
 | `Y`                                                          | copy any cell of the selected row: picker over the displayed columns (type to match a column name or value), `⏎` copies                                                                          |
 | `e`                                                          | edit in `$EDITOR` (`kubectl edit`)                                                                                                                                                               |
 | `s`                                                          | shell into pod / shell into a PVC's volume / scale a resource with a discovered scale subresource (context-dependent)                                                                            |
-| `a`                                                          | attach to pod                                                                                                                                                                                    |
+| `a`                                                          | attach to the pod's default container (`kubectl.kubernetes.io/default-container`, else the first one)                                                                                            |
 | `:debug`                                                     | pod: ephemeral debug container (`d` in the picker targets one) · node: privileged debug pod (previewed + confirmed)                                                                              |
 | `:debug-clean`                                               | delete the node debugger pods launched this session                                                                                                                                              |
 | `:pvc-explore` / `:pvc-clean`                                | browse the selected PVC (also `:pvc-browse`; see below) · delete helper pods a previous session left behind (also `:pvc-cleanup`)                                                                |
 | `:bundle` / `:bundle-save`                                   | assemble a redacted diagnostic bundle for the selection · write the previewed bundle to a file                                                                                                   |
 | `:snapshot [text\|json\|yaml]` / `:snapshots`                | capture the current view to a file · browse, open, and delete saved snapshots                                                                                                                    |
-| `:notify`                                                    | toggle watch notifications on the selected object                                                                                                                                                |
+| `:notify [note]`                                             | toggle watch notifications on the selected object; `note` prefixes its messages                                                                                                                  |
 | `:find <text>`                                               | global fuzzy find over object names across common kinds, all namespaces                                                                                                                          |
+| `:dir [path]`                                                | browse local manifests and apply or delete them (see below)                                                                                                                                      |
 | `i`                                                          | set container image                                                                                                                                                                              |
 | `r`                                                          | rollout restart (marked workloads, or current) / force-sync (ExternalSecrets/PushSecrets) / rollback (Helm or rollout history) / refresh (elsewhere)                                             |
-| `f` / `shift-f`                                              | port-forward (pods/services) — picker shows declared ports, or "Custom…" for manual entry; active forwards show `●` next to the name                                                             |
+| `f` / `shift-f`                                              | port-forward (pods/services) — picker shows declared ports, marks busy local ports `in use`, or "Custom…" for remote and local ports; active forwards show `●` next to the name                  |
 | `t`                                                          | Flux and flux-operator: suspend/resume/reconcile (+ force where supported) · ArgoCD: suspend/resume (+ sync, sync with prune for App) · CronJobs: trigger/suspend/resume · pods: file transfer   |
+| `V` / `N`                                                    | CertificateSigningRequests: approve / deny (marked rows, or current); confirm shows requester, signer and usages; already decided requests are skipped                                           |
 | `C` / `U` / `D`                                              | nodes: cordon / uncordon / open drain options                                                                                                                                                    |
 | `ctrl-d` / `ctrl-k`                                          | delete / force-delete (marked rows, or current); in confirm: `f` toggles force, `c` cycles cascade (background → foreground → orphan)                                                            |
 | `w`                                                          | toggle wide-only columns (kubectl `-o wide`), including node IP addresses and labels                                                                                                             |
@@ -135,13 +146,21 @@ See [Node drain options](features.md#node-drain-options) for defaults and limits
 
 ## Port-forward picker (`f` on a pod or service)
 
-| Key                  | Action                                                         |
-| -------------------- | -------------------------------------------------------------- |
-| `enter`              | start the selected mapping, or open manual input for "Custom…" |
-| `e`                  | edit only the local port of a declared mapping                 |
-| `j` / `k`, `↓` / `↑` | select a mapping                                               |
-| `PgDn` / `PgUp`      | move one page down / up                                        |
-| `esc` / `q`          | close the picker                                               |
+| Key                  | Action                                                                      |
+| -------------------- | --------------------------------------------------------------------------- |
+| `enter`              | start the selected mapping, or ask for remote and local ports for "Custom…" |
+| `e`                  | edit only the local port of a declared mapping                              |
+| `j` / `k`, `↓` / `↑` | select a mapping                                                            |
+| `PgDn` / `PgUp`      | move one page down / up                                                     |
+| `esc` / `q`          | close the picker                                                            |
+
+A mapping whose local port is already bound on both loopback addresses when
+the picker opens shows `in use`. The port can still change before you press
+`enter`, so starting a forward checks it again.
+
+"Custom…" asks for the remote port, a number or a port name, then for the local
+port. The local port starts as the remote port when the remote port is a number.
+Forwards bind to `localhost`, as with the declared mappings.
 
 The local-port prompt contains the current value. `enter` starts the forward;
 `esc` returns to the same picker row. Invalid or unavailable ports keep the
@@ -165,12 +184,29 @@ point instead. See [PVC explore](features.md#pvc-explore).
 | `r`              | re-read both panes                                                          |
 | `esc` / `q`      | close (and delete the helper pod, if one was created)                       |
 
+## Manifest browser (`:dir [path]`)
+
+Lists the folders and YAML/JSON manifests in `path`, or in the directory sofka
+was started from. See [Manifest browser](features.md#manifest-browser).
+
+| Key              | Action                                                             |
+| ---------------- | ------------------------------------------------------------------ |
+| `j`/`k`, `g`/`G` | move                                                               |
+| `enter`          | open the selected folder, or show the selected manifest            |
+| `⌫` or `-`       | go up one directory                                                |
+| `e`              | edit the selected manifest in `$KUBE_EDITOR` or `$EDITOR`          |
+| `a`              | diff the selection against the cluster; `a` in the diff applies it |
+| `d`              | delete the resources the selection describes, after confirmation   |
+| `r`              | re-read the directory                                              |
+| `esc` / `q`      | close                                                              |
+
 ## Logs view
 
 `/` filter (substring · `/regex/` · `!invert`) · `s`/`f` autoscroll · `w` wrap ·
 `J` JSON view (raw/record/pretty) · `Ctrl+Z` warning/error filter · `m` visual marker · `t` timestamps · `x` stop/resume stream · `z` clear buffer · `c` copy buffer ·
-`ctrl-s` save to file · `F` fullscreen (no chrome, clean text selection) ·
-`0`–`5` time anchors (tail · 1m · 5m · 15m · 30m · 1h) · `T` custom lookback (`s`/`m`/`h`/`d`, or `tail` for kubelet logs)
+`a` default/all containers (pods with a default-container annotation) ·
+`ctrl-s` save to a file in `save_dir` · `F` fullscreen (no chrome, clean text selection) ·
+`0`–`5` time anchors (tail · 1m · 5m · 15m · 30m · 1h) · `T` custom lookback (`s`/`m`/`h`/`d`/`w`, compound like `1h30m`, decimal like `1.5h`, or `tail` for kubelet logs)
 (VictoriaLogs views) · `esc` back. The newest line anchors to the bottom of the
 viewport.
 
@@ -199,7 +235,20 @@ and reload behavior. Helm rows continue to show release notes.
 `ctrl-f` / `ctrl-b` page forward or back, with `PgDn` / `PgUp` as aliases.
 `/` searches like vim: the whole document stays on screen and every match is
 highlighted. `n` / `N` go to the next or previous match. `w` wraps. `c` copies
-the document. `esc` backs out - the first press clears an active search.
+the document. `ctrl-s` saves it to a file. `esc` backs out - the first press
+clears an active search.
+
+`ctrl-s` writes the whole document as rendered, whatever the search or scroll
+position. `managedFields` are included only after `m` shows them, and a Helm
+row saves the rendered manifest or values it shows. The file goes to
+[`save_dir`](configuration.md#base-options), the temp directory by default, as
+`sofka-<view title>-<unix time>.yaml` for YAML and diff views and `.txt` for
+the others. The file is readable only by your user, since a document can hold
+Secret values, and a name that is already taken gets a `-2`, `-3`, … suffix
+instead of replacing the earlier save. Log saves follow the same rules. The
+write happens off the UI thread; the status line shows the path,
+or the error if the directory cannot be created or the file cannot be written.
+An empty document is not saved.
 
 `F` toggles fullscreen for document views and plugin popup output. Fullscreen
 uses the full terminal area without the application header, status line, key
@@ -274,14 +323,20 @@ refresh can show later changes. This does not add change highlighting to YAML.
 
 ## Help panel (`?`)
 
+Help opens scrolled to the `Keys:` section of the view it was opened from. The
+section order is the same from every view. A view without a section opens at the
+top.
+
 `j` / `k` and `↑` / `↓` scroll one line. `ctrl-f`, `PgDn`, and `space` move
 forward one page. `ctrl-b` and `PgUp` move back one page. The page size is the
 number of visible content rows. `g` / `Home` go to the top; `G` / `End` go to
-the bottom.
+the bottom. `]` jumps to the next section heading and `[` to the previous one.
 
-`/` filters the bindings. Opening help, starting a filter, and clearing a filter
-reset the scroll position to the top. `esc` clears an active filter first, then
-closes help. `q` or `?` closes help and returns to the previous screen.
+`/` filters the bindings. A binding that matches is shown under its section
+heading. A section heading that matches keeps the whole section, so `/table`
+lists every table binding. Starting a filter and clearing a filter reset the
+scroll position to the top. `esc` clears an active filter first, then closes
+help. `q` or `?` closes help and returns to the previous screen.
 
 ## Explain view (`X`)
 
@@ -311,6 +366,12 @@ See [Views](views.md#navigating-between-kinds) for adding CRD relations.
 namespaces, sort and copy fields, port forwards, containers, set image, skins,
 snapshots, and the action and transfer menus. The page size is the number of
 visible list rows. Paging also works while a picker filter is being typed.
+
+`half_page_down` and `half_page_up` move half a page in every view and picker
+that pages. They have no default keys; bind them in
+[key bindings](keybindings.md#example-ctrlu-and-ctrld-for-half-page-scrolling),
+for example to `ctrl-d` and `ctrl-u`. In pickers with a text filter, a shared
+half-page key that types text or edits the line keeps doing that.
 
 ## Text inputs (palette, filters, prompts)
 
@@ -349,7 +410,7 @@ configs, conflicts, and invalid values.
 ## What suspends the TUI
 
 Interactive actions (`e`, `s` for shell, `a`) suspend the TUI and shell out to
-`kubectl`. Delete, scale, restart, set-image, suspend, resume, reconcile, and
+`kubectl`. `e` in the manifest browser suspends it for your editor. Delete, scale, restart, set-image, suspend, resume, reconcile, and
 port-forward go through the kube API (or a backgrounded process) directly.
 
 If the first PVC listing fails because required tools are missing, sofka tries

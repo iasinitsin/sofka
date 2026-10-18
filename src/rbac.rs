@@ -209,3 +209,339 @@ pub fn rule_lines(rules: &[PolicyRule], namespaced_binding: bool) -> Vec<String>
     }
     lines
 }
+
+const MATRIX_VERBS: [(&str, &str); 8] = [
+    ("get", "GET"),
+    ("list", "LIST"),
+    ("watch", "WATCH"),
+    ("create", "CREATE"),
+    ("update", "UPDATE"),
+    ("patch", "PATCH"),
+    ("delete", "DELETE"),
+    ("deletecollection", "DEL-LIST"),
+];
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Target {
+    Resource { group: String, resource: String },
+    Url(String),
+}
+
+/// Rules as one row per resource and verb columns. Rows with the same
+/// resource and resource names merge their verbs across rules.
+///
+/// `scopes` maps discovered `(group, plural)` pairs to whether they are
+/// namespaced. Under a namespaced scope, cluster-scoped resources and
+/// non-resource URLs are not granted. A `*` group is checked against every
+/// discovered group with that plural; when `discovery_complete` is false, a
+/// skipped group may still be namespaced, so such a row is never declared
+/// ungranted. Wildcard and undiscovered resources keep their ticks.
+pub fn rule_matrix(
+    rules: &[PolicyRule],
+    namespaced_binding: bool,
+    scopes: &std::collections::HashMap<(String, String), bool>,
+    discovery_complete: bool,
+) -> Vec<String> {
+    if rules.is_empty() {
+        return vec!["No rules in this role.".into()];
+    }
+    let mut rows: BTreeMap<(Target, Vec<String>), std::collections::BTreeSet<&str>> =
+        BTreeMap::new();
+    for rule in rules {
+        let verbs = rule.verbs.iter().map(String::as_str);
+        let mut names = rule.resource_names.clone().unwrap_or_default();
+        names.sort();
+        for resource in rule.resources.iter().flatten() {
+            for group in rule.api_groups.iter().flatten() {
+                let target = Target::Resource {
+                    group: group.clone(),
+                    resource: resource.clone(),
+                };
+                rows.entry((target, names.clone()))
+                    .or_default()
+                    .extend(verbs.clone());
+            }
+        }
+        for url in rule.non_resource_urls.iter().flatten() {
+            rows.entry((Target::Url(url.clone()), Vec::new()))
+                .or_default()
+                .extend(verbs.clone());
+        }
+    }
+    let with_names = rows.keys().any(|(_, names)| !names.is_empty());
+    let mut header = vec!["RESOURCE".to_string(), "API GROUP".to_string()];
+    header.extend(MATRIX_VERBS.iter().map(|(_, label)| label.to_string()));
+    header.push("OTHER".into());
+    if with_names {
+        header.push("RESOURCE NAMES".into());
+    }
+    let mut table = vec![header];
+    let mut any_ungranted = false;
+    for ((target, names), verbs) in &rows {
+        let (resource, group) = match target {
+            Target::Resource { group, resource } if names.is_empty() => (
+                resource.clone(),
+                if group.is_empty() { "core" } else { group }.to_string(),
+            ),
+            Target::Resource { group, resource } => (
+                format!("{resource} (named)"),
+                if group.is_empty() { "core" } else { group }.to_string(),
+            ),
+            Target::Url(url) => (url.clone(), "non-resource URL".into()),
+        };
+        let (ungranted, namespaced_groups_only) = match target {
+            _ if !namespaced_binding => (false, false),
+            Target::Url(_) => (true, false),
+            Target::Resource { group, resource } => {
+                let plural = resource.split('/').next().unwrap_or_default();
+                if group == "*" {
+                    let namespaced: Vec<bool> = scopes
+                        .iter()
+                        .filter(|((_, candidate), _)| candidate == plural)
+                        .map(|(_, namespaced)| *namespaced)
+                        .collect();
+                    let cluster = namespaced.iter().any(|namespaced| !namespaced);
+                    let mixed = namespaced.contains(&true) || !discovery_complete;
+                    (cluster && !mixed, cluster && mixed)
+                } else {
+                    let key = (group.clone(), plural.to_string());
+                    (scopes.get(&key) == Some(&false), false)
+                }
+            }
+        };
+        any_ungranted |= ungranted;
+        let all = verbs.contains("*");
+        let mut row = vec![resource, group];
+        row.extend(MATRIX_VERBS.iter().map(|(verb, _)| {
+            if !ungranted && (all || verbs.contains(verb)) {
+                "✓"
+            } else {
+                "·"
+            }
+            .to_string()
+        }));
+        let other: Vec<&str> = verbs
+            .iter()
+            .copied()
+            .filter(|verb| !MATRIX_VERBS.iter().any(|(known, _)| known == verb))
+            .collect();
+        row.push(if ungranted {
+            "not granted in a namespace".into()
+        } else if namespaced_groups_only {
+            other
+                .into_iter()
+                .chain(["namespaced API groups only"])
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            other.join(", ")
+        });
+        if with_names {
+            row.push(names.join(", "));
+        }
+        table.push(row);
+    }
+    let widths: Vec<usize> = (0..table[0].len())
+        .map(|col| {
+            table
+                .iter()
+                .map(|row| unicode_width::UnicodeWidthStr::width(row[col].as_str()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut lines = Vec::new();
+    if with_names {
+        lines.push("Rows marked (named) apply only to the objects in RESOURCE NAMES.".into());
+    }
+    if any_ungranted {
+        lines.push(
+            "Cluster-scoped resources and non-resource URLs are not granted in a namespace.".into(),
+        );
+    }
+    lines.extend(table.iter().map(|row| {
+        let mut line = String::new();
+        for (cell, width) in row.iter().zip(&widths) {
+            line.push_str(cell);
+            let pad = width - unicode_width::UnicodeWidthStr::width(cell.as_str());
+            line.push_str(&" ".repeat(pad + 2));
+        }
+        line.trim_end().to_string()
+    }));
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(groups: &[&str], resources: &[&str], names: &[&str], verbs: &[&str]) -> PolicyRule {
+        let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        PolicyRule {
+            api_groups: Some(strings(groups)),
+            resources: Some(strings(resources)),
+            resource_names: (!names.is_empty()).then(|| strings(names)),
+            verbs: strings(verbs),
+            non_resource_urls: None,
+        }
+    }
+
+    #[test]
+    fn matrix_merges_verbs_per_resource_and_aligns_columns() {
+        let rules = [
+            rule(
+                &["", "apps"],
+                &["pods", "deployments"],
+                &[],
+                &["get", "list"],
+            ),
+            rule(&["apps"], &["deployments"], &[], &["watch", "escalate"]),
+            rule(&["batch"], &["jobs"], &[], &["*"]),
+        ];
+        let lines = rule_matrix(&rules, false, &Default::default(), true);
+        assert_eq!(
+            lines,
+            vec![
+                "RESOURCE     API GROUP  GET  LIST  WATCH  CREATE  UPDATE  PATCH  DELETE  DEL-LIST  OTHER",
+                "deployments  core       ✓    ✓     ·      ·       ·       ·      ·       ·",
+                "pods         core       ✓    ✓     ·      ·       ·       ·      ·       ·",
+                "deployments  apps       ✓    ✓     ✓      ·       ·       ·      ·       ·         escalate",
+                "pods         apps       ✓    ✓     ·      ·       ·       ·      ·       ·",
+                "jobs         batch      ✓    ✓     ✓      ✓       ✓       ✓      ✓       ✓         *",
+            ]
+        );
+    }
+
+    #[test]
+    fn matrix_keeps_resource_names_and_non_resource_urls_apart() {
+        let mut url = rule(&[], &[], &[], &["get", "post"]);
+        url.api_groups = None;
+        url.resources = None;
+        url.non_resource_urls = Some(vec!["/healthz".into()]);
+        let rules = [
+            rule(&[""], &["secrets"], &["b", "a"], &["get"]),
+            rule(&[""], &["secrets"], &[], &["list"]),
+            url,
+        ];
+        let lines = rule_matrix(&rules, true, &Default::default(), true);
+        let text = lines.join("\n");
+        assert_eq!(
+            lines[..2],
+            [
+                "Rows marked (named) apply only to the objects in RESOURCE NAMES.",
+                "Cluster-scoped resources and non-resource URLs are not granted in a namespace.",
+            ],
+            "{text}"
+        );
+        assert!(
+            lines[2]
+                .split_whitespace()
+                .rev()
+                .take(3)
+                .eq(["NAMES", "RESOURCE", "OTHER"]),
+            "{text}"
+        );
+        let tokens = |i: usize| lines[i].split_whitespace().collect::<Vec<_>>();
+        assert_eq!(tokens(3)[..4], ["secrets", "core", "·", "✓"], "{text}");
+        assert_eq!(
+            tokens(4)[..5],
+            ["secrets", "(named)", "core", "✓", "·"],
+            "{text}"
+        );
+        assert!(lines[4].ends_with("a, b"), "{text}");
+        let url = tokens(5);
+        assert_eq!(url[..3], ["/healthz", "non-resource", "URL"], "{text}");
+        assert!(url[3..11].iter().all(|cell| *cell == "·"), "{text}");
+        assert!(lines[5].ends_with("not granted in a namespace"), "{text}");
+
+        let cluster = rule_matrix(&rules, false, &Default::default(), true);
+        let text = cluster.join("\n");
+        assert!(!text.contains("not granted"), "{text}");
+        let url = cluster[4].split_whitespace().collect::<Vec<_>>();
+        assert_eq!(url[3], "✓", "{text}");
+        assert!(cluster[4].ends_with("post"), "{text}");
+        assert_eq!(
+            rule_matrix(&[], false, &Default::default(), true),
+            vec!["No rules in this role."]
+        );
+    }
+
+    #[test]
+    fn namespaced_scope_does_not_tick_discovered_cluster_scoped_resources() {
+        let rules = [
+            rule(&[""], &["nodes", "nodes/status", "pods"], &[], &["get"]),
+            rule(&["example.com"], &["widgets"], &[], &["get"]),
+            rule(&["*"], &["*"], &[], &["list"]),
+            rule(
+                &["*"],
+                &["nodes", "pods", "gadgets", "widgets"],
+                &[],
+                &["watch"],
+            ),
+        ];
+        let scopes = [
+            ("", "nodes", false),
+            ("", "pods", true),
+            ("metrics.k8s.io", "nodes", false),
+            ("metrics.k8s.io", "pods", true),
+            ("example.com", "widgets", true),
+            ("other.io", "widgets", false),
+        ]
+        .into_iter()
+        .map(|(group, plural, namespaced)| ((group.to_string(), plural.to_string()), namespaced))
+        .collect();
+        let row = |lines: &[String], name: &str, group: &str| {
+            lines
+                .iter()
+                .find(|line| {
+                    let cells: Vec<_> = line.split_whitespace().collect();
+                    cells.len() > 1 && cells[0] == name && cells[1] == group
+                })
+                .unwrap_or_else(|| panic!("{name} {group}: {lines:#?}"))
+                .clone()
+        };
+        let ticked = |line: String| {
+            (
+                line.contains('✓'),
+                line.ends_with("not granted in a namespace"),
+            )
+        };
+        let namespaced = rule_matrix(&rules, true, &scopes, true);
+        assert!(
+            namespaced[0].starts_with("Cluster-scoped resources"),
+            "{namespaced:?}"
+        );
+        assert_eq!(ticked(row(&namespaced, "nodes", "core")), (false, true));
+        assert_eq!(
+            ticked(row(&namespaced, "nodes/status", "core")),
+            (false, true)
+        );
+        assert_eq!(ticked(row(&namespaced, "pods", "core")), (true, false));
+        assert_eq!(
+            ticked(row(&namespaced, "widgets", "example.com")),
+            (true, false)
+        );
+        assert_eq!(ticked(row(&namespaced, "*", "*")), (true, false));
+        // A `*` group is cluster-scoped only when every discovered match is.
+        assert_eq!(ticked(row(&namespaced, "nodes", "*")), (false, true));
+        assert_eq!(ticked(row(&namespaced, "pods", "*")), (true, false));
+        assert_eq!(ticked(row(&namespaced, "gadgets", "*")), (true, false));
+        let mixed = row(&namespaced, "widgets", "*");
+        assert!(mixed.contains('✓'), "{mixed}");
+        assert!(mixed.ends_with("namespaced API groups only"), "{mixed}");
+
+        // Skipped discovery groups may hold a namespaced `nodes`.
+        let partial = rule_matrix(&rules, true, &scopes, false);
+        let nodes = row(&partial, "nodes", "*");
+        assert!(nodes.contains('✓'), "{nodes}");
+        assert!(nodes.ends_with("namespaced API groups only"), "{nodes}");
+        assert_eq!(ticked(row(&partial, "nodes", "core")), (false, true));
+
+        let cluster = rule_matrix(&rules, false, &scopes, true);
+        assert_eq!(ticked(row(&cluster, "nodes", "core")), (true, false));
+        assert_eq!(ticked(row(&cluster, "nodes", "*")), (true, false));
+        let text = cluster.join("\n");
+        assert!(!text.contains("not granted"), "{text}");
+        assert!(!text.contains("namespaced API groups only"), "{text}");
+    }
+}

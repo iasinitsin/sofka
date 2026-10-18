@@ -203,7 +203,7 @@ async fn subjects_enter_refresh_and_back_preserve_scope_and_sources() {
         "Scope: namespace a",
         "Scope: namespace b",
         "pods/log",
-        "Resource names (restricted): allowed",
+        "RESOURCE NAMES",
     ] {
         assert!(text.contains(expected), "{expected}: {text}");
     }
@@ -241,7 +241,13 @@ async fn group_rules_keep_non_resource_urls() {
     app.handle_key(press(KeyCode::Enter)).unwrap();
     let msg = reply(&mut rx).await;
     app.handle_msg(msg);
-    assert!(output(&app).contains("Non-resource URLs: /healthz/*"));
+    assert!(
+        output(&app)
+            .lines()
+            .any(|line| line.starts_with("/healthz/*  non-resource URL  ✓")),
+        "{}",
+        output(&app)
+    );
     assert!(output(&app).contains("Scope: cluster and all namespaces"));
 }
 
@@ -364,7 +370,7 @@ async fn enter_on_each_rbac_kind_reads_its_rules() {
         let msg = reply(&mut rx).await;
         app.handle_msg(msg);
         assert!(app.rbac.warnings.is_empty(), "{:?}", app.rbac.warnings);
-        assert!(output(&app).contains("Verbs: get"));
+        assert!(output(&app).contains("RESOURCE"), "{}", output(&app));
         if kind == "RoleBinding" {
             assert!(output(&app).contains("Scope: namespace a"));
         }
@@ -386,7 +392,10 @@ async fn denied_binding_lists_and_missing_roles_are_incomplete() {
     let text = output(&app);
     assert!(text.contains("INCOMPLETE: ClusterRoleBindings could not be read"));
     assert!(text.contains("INCOMPLETE: Role a/reader could not be read"));
-    assert!(text.contains("Resources: secrets"));
+    assert!(
+        text.lines().any(|line| line.starts_with("secrets ")),
+        "{text}"
+    );
     assert!(text.contains("Rules unavailable."));
 }
 
@@ -489,22 +498,74 @@ async fn namespaced_binding_keeps_role_scope_and_does_not_grant_urls() {
     app.handle_msg(msg);
     let text = output(&app);
     assert!(text.contains("Role: Role a/reader"), "{text}");
-    assert!(text.contains("Resource names (restricted): one, two"));
-    assert!(text.contains("Verbs: get, watch"));
+    let row: Vec<_> = text
+        .lines()
+        .find(|line| line.starts_with("pods/log"))
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        row,
+        [
+            "pods/log", "(named)", "core", "✓", "·", "✓", "·", "·", "·", "·", "·", "one,", "two"
+        ]
+    );
     assert!(!text.contains("secrets"));
 
     let mut responses = fixtures();
     responses.insert(format!("{BASE}/clusterroles/shared"), (200, json!({
         "apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRole","metadata":{"name":"shared"},
-        "rules":[{"nonResourceURLs":["/healthz"],"verbs":["get"]}]
+        "rules":[
+            {"nonResourceURLs":["/healthz"],"verbs":["get"]},
+            {"apiGroups":[""],"resources":["nodes","nodes/proxy","configmaps"],"verbs":["get"]},
+            {"apiGroups":["*"],"resources":["nodes"],"verbs":["list"]}
+        ]
     })));
     app.cluster.client = client(responses).0;
     palette(&mut app, "policy u:alice");
     let msg = reply(&mut rx).await;
     app.handle_msg(msg);
     let text = output(&app);
-    assert!(text.contains("Non-resource URLs: /healthz"));
-    assert!(text.contains("Not granted by this namespaced binding."));
+    let row = |name: &str| {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name}: {text}"))
+            .to_string()
+    };
+    for ungranted in ["/healthz", "nodes", "nodes/proxy"] {
+        let line = row(ungranted);
+        assert!(!line.contains('✓'), "{line}");
+        assert!(line.ends_with("not granted in a namespace"), "{line}");
+    }
+    assert!(row("configmaps").contains('✓'), "{text}");
+    let wildcard = text
+        .lines()
+        .find(|line| line.split_whitespace().take(2).eq(["nodes", "*"]))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(!wildcard.contains('✓'), "{wildcard}");
+    assert!(
+        wildcard.ends_with("not granted in a namespace"),
+        "{wildcard}"
+    );
+    assert!(text.contains(
+        "Cluster-scoped resources and non-resource URLs are not granted in a namespace."
+    ));
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert!(output(&app).contains("Not granted by this namespaced binding."));
+
+    // A group discovery skipped may serve a namespaced `nodes`.
+    app.cluster.discovery_warnings = vec!["API discovery could not read broken.io/v1".into()];
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    let text = output(&app);
+    let wildcard = text
+        .lines()
+        .find(|line| line.split_whitespace().take(2).eq(["nodes", "*"]))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(wildcard.contains('✓'), "{wildcard}");
+    assert!(
+        wildcard.ends_with("namespaced API groups only"),
+        "{wildcard}"
+    );
 }
 
 #[tokio::test]
@@ -725,4 +786,105 @@ async fn role_reads_run_in_bounded_parallel_and_output_stays_ordered() {
     sorted.sort();
     assert_eq!(lines, sorted);
     assert!(app.rbac.warnings.is_empty());
+}
+
+#[tokio::test]
+async fn t_switches_rules_between_matrix_and_list_for_the_session() {
+    let (mut app, mut rx) = test_app();
+    app.cluster.client = client(fixtures()).0;
+    palette(&mut app, "users");
+    let msg = reply(&mut rx).await;
+    app.handle_msg(msg);
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert!(!app.rbac.rule_list, "t does nothing on the subject list");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let msg = reply(&mut rx).await;
+    app.handle_msg(msg);
+    let matrix = output(&app);
+    assert!(
+        matrix
+            .lines()
+            .any(|line| line.starts_with("RESOURCE ") && line.contains(" API GROUP ")),
+        "{matrix}"
+    );
+    assert!(!matrix.contains("Rule 1"), "{matrix}");
+    assert!(!app.rbac.document.wrap);
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    assert_eq!(app.rbac.document.hscroll, 5);
+
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    let list = output(&app);
+    assert!(list.contains("Rule 1"), "{list}");
+    assert!(
+        list.contains("Resource names (restricted): allowed"),
+        "{list}"
+    );
+    assert!(list.contains("Binding: RoleBinding a/one"), "{list}");
+    assert!(app.rbac.document.wrap);
+    assert_eq!(app.rbac.document.hscroll, 0);
+    assert_eq!(app.flash, "rules: list");
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    let msg = reply(&mut rx).await;
+    app.handle_msg(msg);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let msg = reply(&mut rx).await;
+    app.handle_msg(msg);
+    assert_eq!(output(&app), list);
+
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert_eq!(output(&app), matrix);
+    assert_eq!(app.flash, "rules: matrix");
+}
+
+#[tokio::test]
+async fn configured_rule_list_opens_first_and_t_still_switches() {
+    let dir = std::env::temp_dir().join(format!("sofka-rbac-rule-list-{}", std::process::id()));
+    write_config(&dir, "rbac_rule_list = true\n");
+    let (mut app, mut rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    app.rbac.rule_list = app
+        .config
+        .resolve("dev", "test-cluster")
+        .config
+        .rbac_rule_list;
+    app.cluster.client = client(fixtures()).0;
+    palette(&mut app, "policy u:alice");
+    let msg = reply(&mut rx).await;
+    app.handle_msg(msg);
+    assert!(output(&app).contains("Rule 1"), "{}", output(&app));
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert!(
+        output(&app)
+            .lines()
+            .any(|line| line.starts_with("RESOURCE ") && line.contains(" API GROUP ")),
+        "{}",
+        output(&app)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn help_names_the_configured_rbac_keys() {
+    let (mut app, _rx) = test_app();
+    let cfg: crate::config::Config = toml::from_str(
+        r#"
+        [keys.rbac]
+        toggle = "f7"
+        refresh = "f6"
+    "#,
+    )
+    .unwrap();
+    app.keymap = Keymap::compile(&cfg.keys).unwrap();
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "matrix and list".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let text = super::screen_text(&mut app, 160, 40);
+    assert!(
+        text.contains("show rules; f7 switches matrix and list; f6 refreshes; esc returns"),
+        "{text}"
+    );
 }

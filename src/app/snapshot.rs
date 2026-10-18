@@ -21,7 +21,7 @@ impl App {
             context: self.cluster.context.clone(),
             cluster: self.cluster.cluster_name.clone(),
             namespace: self.namespace.clone(),
-            resource: self.kind_plural.clone(),
+            resource: self.view_plural().to_string(),
             filter: self.filter.clone(),
             columns,
             rows,
@@ -60,7 +60,7 @@ impl App {
         let rows = objs
             .iter()
             .map(|obj| {
-                let rk = row_key(obj);
+                let rk = self.key_of(obj);
                 let mut cells: Vec<String> = Vec::with_capacity(headers.len());
                 if show_ns {
                     cells.push(obj.metadata.namespace.clone().unwrap_or_default());
@@ -69,7 +69,7 @@ impl App {
                     let helm_updated = cache.helm_updated(&rk);
                     for (i, cell) in base_cells.iter().enumerate() {
                         match self.live_cell(obj, i).or_else(|| {
-                            spec.volatile_cached(obj, &self.kind_plural, i, now, helm_updated)
+                            spec.volatile_cached(obj, self.view_plural(), i, now, helm_updated)
                         }) {
                             Some(v) => cells.push(v),
                             None => cells.push(cell.to_string()),
@@ -134,12 +134,18 @@ impl App {
             (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
             (Some(Action::Down), _) => list_step(&mut self.snapshot_state, len, true),
             (Some(Action::Up), _) => list_step(&mut self.snapshot_state, len, false),
-            (Some(Action::PageDown), _) => {
-                list_page(&mut self.snapshot_state, len, self.picker_page_items, true)
-            }
-            (Some(Action::PageUp), _) => {
-                list_page(&mut self.snapshot_state, len, self.picker_page_items, false)
-            }
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => list_page(
+                &mut self.snapshot_state,
+                len,
+                a.page_size(self.picker_page_items),
+                true,
+            ),
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => list_page(
+                &mut self.snapshot_state,
+                len,
+                a.page_size(self.picker_page_items),
+                false,
+            ),
             (Some(Action::Accept), _) => self.open_selected_snapshot(),
             (Some(Action::Delete), _) => self.delete_selected_snapshot(),
             _ => {}

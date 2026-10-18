@@ -24,6 +24,7 @@ actions! {
     Accept => ("accept", "accept selection or input"),
     ActionMenu => ("action_menu", "resource action menu"),
     Adjacent => ("adjacent", "adjacent"),
+    AllContainers => ("all_containers", "toggle default and all containers"),
     AllNamespaces => ("all_namespaces", "all namespaces"),
     Anchor0 => ("anchor_0", "tail logs"),
     Anchor1 => ("anchor_1", "logs from last minute"),
@@ -31,6 +32,8 @@ actions! {
     Anchor3 => ("anchor_3", "logs from last 15 minutes"),
     Anchor4 => ("anchor_4", "logs from last 30 minutes"),
     Anchor5 => ("anchor_5", "logs from last hour"),
+    Apply => ("apply", "apply"),
+    Approve => ("approve", "approve"),
     Attach => ("attach", "attach"),
     AutoRefresh => ("auto_refresh", "toggle automatic refresh"),
     ResetBaseline => ("reset_baseline", "reset diff baseline to displayed resource"),
@@ -50,6 +53,7 @@ actions! {
     Debug => ("debug", "debug"),
     DecodeSecret => ("decode_secret", "decode secret"),
     Delete => ("delete", "delete"),
+    Deny => ("deny", "deny"),
     DeleteWord => ("delete_word", "delete word"),
     Describe => ("describe", "describe"),
     DiscoverChildren => ("discover_children", "discover children"),
@@ -60,6 +64,7 @@ actions! {
     Exit => ("exit", "quit from table"),
     Explain => ("explain", "explain"),
     Faults => ("faults", "faults"),
+    ToggleOwned => ("toggle_owned", "show owned pods and jobs in workloads"),
     FavoriteNamespace1 => ("favorite_namespace_1", "select configured favourite namespace 1"),
     FavoriteNamespace2 => ("favorite_namespace_2", "select configured favourite namespace 2"),
     FavoriteNamespace3 => ("favorite_namespace_3", "select configured favourite namespace 3"),
@@ -76,6 +81,8 @@ actions! {
     Force => ("force", "force"),
     ForceDelete => ("force_delete", "force delete"),
     Fullscreen => ("fullscreen", "fullscreen"),
+    HalfPageDown => ("half_page_down", "half page down"),
+    HalfPageUp => ("half_page_up", "half page up"),
     Help => ("help", "help"),
     HistoryBack => ("history_back", "history back"),
     HistoryForward => ("history_forward", "history forward"),
@@ -93,8 +100,10 @@ actions! {
     RangeDown => ("range_down", "extend or reduce selection down"),
     RangeUp => ("range_up", "extend or reduce selection up"),
     Namespaces => ("namespaces", "namespaces"),
+    NsResources => ("ns_resources", "kinds with objects in the namespace"),
     NamespaceSelected => ("namespace_selected", "selected resource namespace"),
     NextMatch => ("next_match", "next match"),
+    NextSection => ("next_section", "jump to the next section"),
     NextView => ("next_view", "next view"),
     Node => ("node", "node"),
     Open => ("open", "open selection"),
@@ -106,6 +115,7 @@ actions! {
     PortForward => ("port_forward", "port forward"),
     PreviousLogs => ("previous_logs", "previous logs"),
     PreviousMatch => ("previous_match", "previous match"),
+    PreviousSection => ("previous_section", "jump to the previous section"),
     PreviousView => ("previous_view", "previous view"),
     ProviderLogs => ("provider_logs", "provider logs"),
     Quit => ("quit", "quit"),
@@ -151,10 +161,34 @@ impl Action {
     /// its key goes to bookmarks, workspaces, and plugins first.
     pub fn kinds(self) -> Option<&'static [&'static str]> {
         match self {
-            Self::Faults | Self::Attach | Self::PreviousLogs => Some(&["pods"]),
+            Self::Attach | Self::PreviousLogs => Some(&["pods"]),
+            Self::Faults => Some(&[
+                "workloads",
+                "pods",
+                "deployments",
+                "statefulsets",
+                "daemonsets",
+                "replicasets",
+                "jobs",
+                "cronjobs",
+                "kustomizations",
+                "helmreleases",
+                "gitrepositories",
+                "helmrepositories",
+                "ocirepositories",
+                "buckets",
+                "resourcesets",
+                "fluxinstances",
+                "resourcesetinputproviders",
+                "applications",
+                "applicationsets",
+            ]),
             Self::PortForward => Some(&["pods", "services"]),
             Self::Inspect => Some(&["secrets", "persistentvolumeclaims"]),
             Self::Cordon | Self::Uncordon | Self::Drain => Some(&["nodes"]),
+            Self::Approve | Self::Deny => Some(&["certificatesigningrequests"]),
+            Self::ToggleOwned => Some(&["workloads"]),
+            Self::NsResources => Some(&["namespaces"]),
             Self::SetImage => Some(&[
                 "pods",
                 "deployments",
@@ -164,6 +198,14 @@ impl Action {
                 "replicationcontrollers",
             ]),
             _ => None,
+        }
+    }
+
+    /// Rows or lines a paging action moves for a full page of `page`.
+    pub fn page_size(self, page: usize) -> usize {
+        match self {
+            Self::HalfPageDown | Self::HalfPageUp => (page / 2).max(1),
+            _ => page,
         }
     }
 
@@ -197,6 +239,11 @@ impl KeyInput {
     }
     pub fn event(self) -> KeyEvent {
         KeyEvent::new(self.code, self.modifiers)
+    }
+    /// Whether a character key is typed text rather than a Ctrl or Alt chord.
+    /// Ctrl+Alt together is AltGr on some terminals and stays text.
+    pub fn is_text(self) -> bool {
+        self.modifiers.contains(KeyModifiers::CONTROL) == self.modifiers.contains(KeyModifiers::ALT)
     }
 }
 
@@ -262,6 +309,7 @@ const VIEW_SCOPES: &[&str] = &[
     "fleet",
     "find",
     "pvc_explore",
+    "dir",
 ];
 
 const DEFAULTS: &[(&str, Action, &[&str])] = &[
@@ -273,6 +321,9 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("rbac", Action::First, &["g", "home"]),
     ("rbac", Action::Last, &["G", "end"]),
     ("rbac", Action::Refresh, &["r"]),
+    ("rbac", Action::Toggle, &["t"]),
+    ("rbac", Action::Left, &["h", "left"]),
+    ("rbac", Action::Right, &["l", "right"]),
     ("rbac", Action::PageDown, &["ctrl-f", "pagedown"]),
     ("rbac", Action::PageUp, &["ctrl-b", "pageup"]),
     ("adjacent", Action::Accept, &["enter"]),
@@ -344,10 +395,12 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("detail", Action::PageUp, &["pageup", "ctrl-b"]),
     ("detail", Action::PreviousMatch, &["N"]),
     ("detail", Action::Right, &["l", "right"]),
+    ("detail", Action::Save, &["ctrl-s"]),
     ("detail", Action::Up, &["k", "up"]),
     ("detail", Action::Wrap, &["w"]),
     ("diff", Action::AutoRefresh, &["r"]),
     ("diff", Action::ResetBaseline, &["R"]),
+    ("diff", Action::Apply, &["a"]),
     ("diff", Action::Back, &["esc"]),
     ("diff", Action::Close, &["q"]),
     ("diff", Action::Copy, &["c"]),
@@ -362,8 +415,23 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("diff", Action::PageUp, &["pageup", "ctrl-b"]),
     ("diff", Action::PreviousMatch, &["N"]),
     ("diff", Action::Right, &["l", "right"]),
+    ("diff", Action::Save, &["ctrl-s"]),
     ("diff", Action::Up, &["k", "up"]),
     ("diff", Action::Wrap, &["w"]),
+    ("dir", Action::Accept, &["enter"]),
+    ("dir", Action::Apply, &["a"]),
+    ("dir", Action::Back, &["esc"]),
+    ("dir", Action::Close, &["q"]),
+    ("dir", Action::Delete, &["d"]),
+    ("dir", Action::Down, &["j", "down"]),
+    ("dir", Action::Edit, &["e"]),
+    ("dir", Action::First, &["g", "home"]),
+    ("dir", Action::Last, &["G", "end"]),
+    ("dir", Action::PageDown, &["pagedown", "ctrl-f"]),
+    ("dir", Action::PageUp, &["pageup", "ctrl-b"]),
+    ("dir", Action::Parent, &["backspace", "-"]),
+    ("dir", Action::Refresh, &["r"]),
+    ("dir", Action::Up, &["k", "up"]),
     ("drain", Action::Down, &["tab", "down"]),
     ("drain", Action::Up, &["backtab", "up"]),
     ("drain", Action::Toggle, &["space"]),
@@ -383,6 +451,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("events", Action::PageUp, &["pageup", "ctrl-b"]),
     ("events", Action::PreviousMatch, &["N"]),
     ("events", Action::Right, &["l", "right"]),
+    ("events", Action::Save, &["ctrl-s"]),
     ("events", Action::Up, &["k", "up"]),
     ("events", Action::Wrap, &["w"]),
     ("explain", Action::Accept, &["enter"]),
@@ -442,9 +511,12 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("help", Action::Filter, &["/"]),
     ("help", Action::First, &["g", "home"]),
     ("help", Action::Last, &["G", "end"]),
+    ("help", Action::NextSection, &["]"]),
     ("help", Action::PageDown, &["pagedown", "space", "ctrl-f"]),
     ("help", Action::PageUp, &["pageup", "ctrl-b"]),
+    ("help", Action::PreviousSection, &["["]),
     ("help", Action::Up, &["k", "up"]),
+    ("logs", Action::AllContainers, &["a"]),
     ("logs", Action::Anchor0, &["0"]),
     ("logs", Action::Anchor1, &["1"]),
     ("logs", Action::Anchor2, &["2"]),
@@ -549,12 +621,14 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("table", Action::FavoriteNamespace7, &["7"]),
     ("table", Action::FavoriteNamespace8, &["8"]),
     ("table", Action::FavoriteNamespace9, &["9"]),
+    ("table", Action::Approve, &["V"]),
     ("table", Action::Attach, &["a"]),
     ("table", Action::Back, &["esc"]),
     ("table", Action::CopyCell, &["Y"]),
     ("table", Action::CopyName, &["c"]),
     ("table", Action::Cordon, &["C"]),
     ("table", Action::Delete, &["ctrl-d"]),
+    ("table", Action::Deny, &["N"]),
     ("table", Action::Describe, &["d"]),
     ("table", Action::Down, &["j", "down"]),
     ("table", Action::Drain, &["D"]),
@@ -580,6 +654,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("table", Action::Namespaces, &["n"]),
     ("table", Action::NamespaceSelected, &["W"]),
     ("table", Action::NextView, &["tab"]),
+    ("table", Action::NsResources, &["R"]),
     ("table", Action::Node, &["o"]),
     ("table", Action::Open, &["enter"]),
     ("table", Action::Owner, &["J"]),
@@ -597,6 +672,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("table", Action::Sort, &["S"]),
     ("table", Action::SortAge, &["A"]),
     ("table", Action::Timeline, &["T"]),
+    ("table", Action::ToggleOwned, &["O"]),
     ("table", Action::Uncordon, &["U"]),
     ("table", Action::Up, &["k", "up"]),
     ("table", Action::Wide, &["w"]),
@@ -643,6 +719,8 @@ const NAVIGATION_ACTIONS: &[Action] = &[
     Action::Last,
     Action::PageUp,
     Action::PageDown,
+    Action::HalfPageUp,
+    Action::HalfPageDown,
     Action::Left,
     Action::Right,
     Action::Back,
@@ -667,6 +745,13 @@ impl Default for Keymap {
                 }
                 for &scope in TEXT_SCOPES {
                     bindings.entry(scope).or_default();
+                }
+                // Half-page scrolling is available wherever paging is, unbound.
+                for actions in bindings.values_mut() {
+                    if actions.contains_key(&Action::PageDown) {
+                        actions.insert(Action::HalfPageDown, Vec::new());
+                        actions.insert(Action::HalfPageUp, Vec::new());
+                    }
                 }
                 for (&scope, actions) in &mut bindings {
                     for &(action, chords) in GLOBAL
@@ -804,6 +889,31 @@ impl Keymap {
                     .retain(|c| !chords.iter().any(|other| overlaps(c, other)));
             }
         }
+        // Shared half-page keys never take a key that edits text or that the
+        // mode already uses; a mode setting is used as written.
+        for &scope in TEXT_SCOPES {
+            let bindings = map.bindings.get_mut(scope).unwrap();
+            for action in [Action::HalfPageUp, Action::HalfPageDown] {
+                if overrides.contains_key(&(scope, action.name())) {
+                    continue;
+                }
+                let Some(chords) = bindings.get(&action) else {
+                    continue;
+                };
+                let kept: Vec<_> = chords
+                    .iter()
+                    .filter(|c| {
+                        (c.ctrl || c.alt || !matches!(c.code, KeyCode::Char(_)))
+                            && !bindings.iter().any(|(&other, others)| {
+                                !matches!(other, Action::HalfPageUp | Action::HalfPageDown)
+                                    && others.iter().any(|o| overlaps(c, o))
+                            })
+                    })
+                    .copied()
+                    .collect();
+                bindings.insert(action, kept);
+            }
+        }
         // Keep existing custom Ctrl+H bindings valid when Backspace is inherited.
         let ctrl_h = KeyChord::parse("ctrl-h").unwrap();
         for &scope in TEXT_SCOPES {
@@ -863,7 +973,8 @@ impl Keymap {
                         TEXT_SCOPES.contains(&target) && INPUT.iter().any(|&(a, _)| a == action)
                     }
                     "navigation" => {
-                        !TEXT_SCOPES.contains(&target)
+                        (!TEXT_SCOPES.contains(&target)
+                            || matches!(action, Action::HalfPageUp | Action::HalfPageDown))
                             && NAVIGATION_ACTIONS.contains(&action)
                             && !(target == "confirm" && action == Action::Back)
                     }

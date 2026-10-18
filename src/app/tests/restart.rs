@@ -15,7 +15,9 @@ fn marked_workloads(plural: &str, kind: &str) -> (App, Receiver<Msg>) {
     apply(&mut app, workload(kind, "web", "b"));
     apply(&mut app, workload(kind, "untouched", "c"));
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     assert_eq!(app.marked.len(), 2);
     assert_eq!(
         app.selected_ref().unwrap().metadata.namespace.as_deref(),

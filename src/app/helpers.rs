@@ -172,6 +172,111 @@ pub(super) fn node_unschedulable_patch(unschedulable: bool) -> Value {
     json!({ "spec": { "unschedulable": unschedulable } })
 }
 
+/// Whether a CSR already carries a final condition; the approval subresource
+/// rejects a second decision, so these are skipped rather than sent.
+pub(super) fn csr_decided(obj: &DynamicObject) -> bool {
+    crate::columns::csr_condition_types(&obj.data)
+        .any(|t| matches!(t, "Approved" | "Denied" | "Failed"))
+}
+
+/// The CSR with an `Approved`/`Denied` condition appended, as the whole-object
+/// body the `approval` subresource replaces.
+pub(super) fn csr_decision_body(
+    obj: &DynamicObject,
+    api_version: &str,
+    kind: &str,
+    approve: bool,
+    now: &str,
+) -> Value {
+    let (kind_word, verb) = if approve {
+        ("Approved", "approved")
+    } else {
+        ("Denied", "denied")
+    };
+    let mut body = serde_json::to_value(obj).unwrap_or_default();
+    body["apiVersion"] = json!(api_version);
+    body["kind"] = json!(kind);
+    let conditions = &mut body["status"]["conditions"];
+    if !conditions.is_array() {
+        *conditions = json!([]);
+    }
+    if let Some(list) = conditions.as_array_mut() {
+        list.push(json!({
+            "type": kind_word,
+            "status": "True",
+            "reason": if approve { "SofkaApprove" } else { "SofkaDeny" },
+            "message": format!("This CSR was {verb} by sofka."),
+            "lastUpdateTime": now,
+        }));
+    }
+    body
+}
+
+/// Whether approving `obj` hands out cluster access: a `client auth` cert
+/// from the kube-apiserver-client signer.
+fn csr_grants_cluster_access(obj: &DynamicObject) -> bool {
+    obj.data.pointer("/spec/signerName").and_then(Value::as_str)
+        == Some("kubernetes.io/kube-apiserver-client")
+        && obj
+            .data
+            .pointer("/spec/usages")
+            .and_then(Value::as_array)
+            .is_some_and(|u| u.iter().any(|u| u.as_str() == Some("client auth")))
+}
+
+/// The warning for approving CSRs that grant cluster access, or `None`.
+pub(super) fn csr_access_warning(approve: bool, objs: &[DynamicObject]) -> Option<String> {
+    let risky = objs.iter().filter(|o| csr_grants_cluster_access(o)).count();
+    (approve && risky > 0).then(|| {
+        format!(
+            "⚠ {risky} client auth cert(s) from kubernetes.io/kube-apiserver-client — approving grants cluster access"
+        )
+    })
+}
+
+/// The confirm text for approving or denying `objs`: the cluster-access
+/// warning right under the heading, where a long bulk list cannot push it out
+/// of view, then requester, signer and usages per CSR.
+pub(super) fn csr_confirm_label(approve: bool, objs: &[DynamicObject]) -> String {
+    let verb = if approve { "Approve" } else { "Deny" };
+    let field = |o: &DynamicObject, path: &str| {
+        o.data
+            .pointer(path)
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string()
+    };
+    let name = |o: &DynamicObject| o.metadata.name.clone().unwrap_or_default();
+    let mut label = match objs {
+        [one] => format!("{verb} CSR {}?", name(one)),
+        many => format!("{verb} {} CSRs?", many.len()),
+    };
+    if let Some(warning) = csr_access_warning(approve, objs) {
+        label.push_str(&format!("\n\n{warning}"));
+    }
+    for o in objs {
+        let usages = o
+            .data
+            .pointer("/spec/usages")
+            .and_then(Value::as_array)
+            .map(|u| {
+                u.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "-".into());
+        label.push_str(&format!(
+            "\n\n{}\n  requester: {}\n  signer: {}\n  usages: {usages}",
+            name(o),
+            field(o, "/spec/username"),
+            field(o, "/spec/signerName"),
+        ));
+    }
+    label
+}
+
 /// A Job manifest that runs `cj`'s jobTemplate immediately — what `kubectl
 /// create job --from=cronjob/…` builds: the template's spec and labels, its
 /// annotations plus `cronjob.kubernetes.io/instantiate: manual`, and a
@@ -367,6 +472,34 @@ pub(super) fn label_selector(obj: &DynamicObject, field: &str) -> Option<String>
         .collect::<Option<_>>()?;
     parts.sort();
     (!parts.is_empty()).then(|| parts.join(","))
+}
+
+/// The container kubectl would pick for `logs`/`exec`: the
+/// `kubectl.kubernetes.io/default-container` annotation when it names a
+/// container in the spec, otherwise the first container.
+pub(super) fn default_container(obj: &DynamicObject) -> Option<String> {
+    annotated_container(obj).or_else(|| {
+        obj.data
+            .pointer("/spec/containers/0/name")?
+            .as_str()
+            .map(str::to_owned)
+    })
+}
+
+/// The `kubectl.kubernetes.io/default-container` annotation, only when it
+/// names a container in the spec.
+pub(super) fn annotated_container(obj: &DynamicObject) -> Option<String> {
+    let containers = obj.data.pointer("/spec/containers")?.as_array()?;
+    obj.metadata
+        .annotations
+        .as_ref()?
+        .get("kubectl.kubernetes.io/default-container")
+        .filter(|name| {
+            containers
+                .iter()
+                .any(|c| c["name"].as_str() == Some(name.as_str()))
+        })
+        .cloned()
 }
 
 pub(super) fn container_names(obj: &DynamicObject) -> Vec<String> {
@@ -608,6 +741,34 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
     copy_to_clipboard_osc52(text)
 }
 
+/// Open `url` with the desktop's opener. Over SSH the opener would run on
+/// the remote host, so this reports `false` there.
+#[cfg(not(test))]
+pub(super) fn open_in_browser(url: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+        return false;
+    }
+    let mut command = if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else if cfg!(windows) {
+        // `cmd /c start` would split the URL at `&`.
+        let mut command = Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    } else {
+        Command::new("xdg-open")
+    };
+    command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn copy_with_tool(cmd: &str, args: &[&str], input: &[u8]) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -810,6 +971,7 @@ pub(super) fn emit_xray(
         ns: ns.clone(),
         status: xray_status(kind, obj),
         container: None,
+        pod: (kind == "pod").then(|| Box::new(obj.clone())),
     });
 
     if let Some(uid) = &obj.metadata.uid
@@ -830,6 +992,7 @@ pub(super) fn emit_xray(
                 ns: ns.clone(),
                 status: String::new(),
                 container: Some(c),
+                pod: None,
             });
         }
     }

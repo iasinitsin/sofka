@@ -67,7 +67,7 @@ pub struct Config {
     pub default_resource: Option<String>,
     /// Disable every action that could modify the cluster (or run arbitrary
     /// commands): delete, edit, scale, restart, set-image, cordon/drain,
-    /// Flux suspend/resume/reconcile, Helm rollback/uninstall, shell/attach,
+    /// CSR approve/deny, Flux suspend/resume/reconcile, Helm rollback/uninstall, shell/attach,
     /// and plugins. Overridden by the `--readonly`/`--write` CLI flags. Set
     /// it in a per-cluster/per-context override file to lock down just prod.
     pub readonly: bool,
@@ -79,6 +79,8 @@ pub struct Config {
     pub compact_mode: bool,
     /// Start with document line wrapping enabled.
     pub detail_wrap: bool,
+    /// Start RBAC rules as the per-rule list instead of the matrix.
+    pub rbac_rule_list: bool,
     /// Custom alias -> canonical resource (plural/kind) mappings.
     pub aliases: HashMap<String, String>,
     /// Namespaces pinned to the top of the switcher (a curated team list, in
@@ -139,6 +141,9 @@ pub struct Config {
     pub remember_sort: Option<bool>,
     /// Check GitHub once a day for a newer release. Defaults to true.
     pub update_check: Option<bool>,
+    /// Directory for `ctrl-s` saves from logs and document views. Defaults to
+    /// the temp directory; see [`save_dir`].
+    pub save_dir: Option<String>,
     /// How `:notify` events are delivered — see [`NotifyConfig`].
     pub notify: NotifyConfig,
     /// Built-in keyboard bindings, validated by [`crate::keymap::Keymap::compile`].
@@ -354,6 +359,8 @@ pub struct FleetConfig {
 /// since = "1h"       # optional: only logs newer than this, within the tail limit
 /// fullscreen = false # open log views fullscreen (F toggles; k9s fullScreenLogs)
 /// json_view = "raw"  # how JSON lines start: raw, record, or pretty (J cycles)
+/// record_time_format = "%b %d %H:%M:%S%.3f" # optional: strftime for record times
+/// record_time_zone = "utc"                  # utc or local
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -373,6 +380,12 @@ pub struct LogsConfig {
     /// different value is entered: `raw`, `record`, or `pretty`. `J` cycles
     /// from there. Validated by [`logs_warnings`].
     pub json_view: String,
+    /// strftime format for record view times that are RFC 3339 strings or
+    /// epoch numbers. Unset keeps the RFC 3339 text. Validated by
+    /// [`logs_warnings`].
+    pub record_time_format: Option<String>,
+    /// Zone `record_time_format` renders in: `utc` or `local`.
+    pub record_time_zone: String,
 }
 
 impl Default for LogsConfig {
@@ -383,6 +396,8 @@ impl Default for LogsConfig {
             since: None,
             fullscreen: false,
             json_view: "raw".into(),
+            record_time_format: None,
+            record_time_zone: "utc".into(),
         }
     }
 }
@@ -390,14 +405,38 @@ impl Default for LogsConfig {
 /// The `[logs] json_view` values, in `J` order.
 pub const JSON_VIEWS: &[&str] = &["raw", "record", "pretty"];
 
+/// Formats a sample time, so a directive jiff does not support is reported
+/// at load instead of on every record.
+pub fn check_record_time_format(format: &str) -> Result<(), jiff::Error> {
+    let sample = jiff::Timestamp::UNIX_EPOCH.to_zoned(jiff::tz::TimeZone::UTC);
+    jiff::fmt::strtime::format(format, &sample).map(drop)
+}
+
+/// The `[logs] record_time_zone` values.
+pub const RECORD_TIME_ZONES: &[&str] = &["utc", "local"];
+
 pub fn logs_warnings(cfg: &LogsConfig) -> Vec<String> {
-    if JSON_VIEWS.contains(&cfg.json_view.as_str()) {
-        return Vec::new();
+    let mut warnings = Vec::new();
+    if !JSON_VIEWS.contains(&cfg.json_view.as_str()) {
+        warnings.push(format!(
+            "logs: json_view {:?} is not one of raw, record, pretty; using raw",
+            cfg.json_view
+        ));
     }
-    vec![format!(
-        "logs: json_view {:?} is not one of raw, record, pretty; using raw",
-        cfg.json_view
-    )]
+    if let Some(format) = &cfg.record_time_format
+        && let Err(err) = check_record_time_format(format)
+    {
+        warnings.push(format!(
+            "logs: record_time_format {format:?} is invalid ({err}); using RFC 3339"
+        ));
+    }
+    if !RECORD_TIME_ZONES.contains(&cfg.record_time_zone.as_str()) {
+        warnings.push(format!(
+            "logs: record_time_zone {:?} is not one of utc, local; using utc",
+            cfg.record_time_zone
+        ));
+    }
+    warnings
 }
 
 /// Optional action history on disk. Changes take effect on restart.
@@ -824,7 +863,8 @@ pub struct MetricsProviderConfig {
     pub headers: HashMap<String, String>,
 }
 
-/// One log backend. Only `type = "victorialogs"` is supported today.
+/// One log backend: `type = "victorialogs"`, or `"gcp"` / `"link"` to open
+/// a web log UI instead (see [`crate::providers::LogLink`]).
 ///
 /// Everything here is optional except `type` — even the whole section:
 /// without one (or without `url`), sofka autodiscovers a VictoriaLogs
@@ -834,7 +874,7 @@ pub struct MetricsProviderConfig {
 /// [providers.logs]
 /// type = "victorialogs"
 /// url = "https://vlogs.example.com"   # omit to autodiscover in-cluster
-/// lookback = "1h"          # optional: initial query window (s/m/h/d)
+/// lookback = "1h"          # optional: initial query window (s/m/h/d/w, compound like 1h30m)
 /// limit = 300              # optional: lines fetched by the initial query
 ///
 /// [providers.logs.headers]         # optional: sent with every request
@@ -848,12 +888,13 @@ pub struct MetricsProviderConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct LogProviderConfig {
-    /// Backend kind: `"victorialogs"`.
+    /// Backend kind: `"victorialogs"`, `"gcp"`, or `"link"`.
     #[serde(rename = "type")]
     pub kind: String,
     /// Base URL of the backend, e.g. `https://vlogs.example.com` or
     /// `http://localhost:9428` (via a port-forward). Empty/omitted:
     /// autodiscover a VictoriaLogs service and use the API-server proxy.
+    /// For `type = "link"`, the URL template.
     pub url: String,
     /// How far back the initial query reaches (`"30m"`, `"1h"`, `"2d"`).
     pub lookback: Option<String>,
@@ -918,6 +959,8 @@ pub struct ViewConfig {
     /// children by the adjacent view.
     pub children: Vec<String>,
     pub columns: Vec<ViewColumnConfig>,
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// One reference in `[[views."…".refs]]`: a field of this kind's objects that
@@ -1016,6 +1059,8 @@ pub struct ViewColumnConfig {
     pub align: Option<String>,
     /// Value used when every path is missing or null.
     pub default: Option<String>,
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// Skin selection. `name` picks a built-in palette (see
@@ -1059,8 +1104,8 @@ pub struct Skin {
 ///
 /// Placeholders are substituted in `command`/`args`, each as one argument (no
 /// implicit shell): `$NAME`, `$NAMESPACE`/`$NS`, `$CONTEXT`, `$CLUSTER`,
-/// `$RESOURCE` (plural), `$GROUP`, `$VERSION`, `$KIND`, and `$FILTER` (the
-/// active row filter).
+/// `$RESOURCE` (plural), `$GROUP`, `$VERSION`, `$KIND`, `$FILTER` (the
+/// active row filter), and `$SKIN` (the active skin name).
 ///
 /// ```toml
 /// [[plugins]]
@@ -1156,6 +1201,7 @@ pub struct Plugin {
 /// filter = "status!=Running -l app=api"   # optional: same syntax as `/`
 /// sort = "RESTARTS:desc"       # optional: COLUMN[:asc|:desc]
 /// view = "xray"                # optional: xray | pulse
+/// layout = "images"            # optional: a named layout of the resource
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Bookmark {
@@ -1176,6 +1222,8 @@ pub struct Bookmark {
     pub sort: Option<String>,
     /// A view to open after landing: `xray` or `pulse`.
     pub view: Option<String>,
+    /// Named layout of the resource's columns (`[views."pods:<layout>"]`).
+    pub layout: Option<String>,
 }
 
 /// A task-oriented collection of views — checkout operations, a cluster
@@ -1237,6 +1285,7 @@ impl WorkspaceView {
             filter: self.filter.clone(),
             sort: self.sort.clone(),
             view: self.view.clone(),
+            layout: None,
         }
     }
 }
@@ -1350,6 +1399,27 @@ pub fn mouse_scroll_lines(value: Option<u16>, warnings: &mut Vec<String>) -> u16
     }
 }
 
+/// Resolves `save_dir`: unset or blank means the temp directory, and a
+/// leading `~` expands to `$HOME`.
+pub fn save_dir(value: Option<&str>) -> Result<PathBuf, String> {
+    expand_save_dir(value, std::env::var("HOME").ok().as_deref())
+}
+
+fn expand_save_dir(value: Option<&str>, home: Option<&str>) -> Result<PathBuf, String> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(std::env::temp_dir());
+    };
+    let rest = match value.strip_prefix('~') {
+        Some("") => "",
+        Some(rest) if rest.starts_with('/') => &rest[1..],
+        _ => return Ok(PathBuf::from(value)),
+    };
+    let home = home
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| format!("save_dir {value}: HOME is not set"))?;
+    Ok(PathBuf::from(home).join(rest))
+}
+
 /// Validation warnings for guardrails: an unknown `confirmation` mode.
 pub fn guardrail_warnings(guardrails: &[Guardrail]) -> Vec<String> {
     let mut warns = Vec::new();
@@ -1412,6 +1482,7 @@ const PLUGIN_PLACEHOLDERS: &[&str] = &[
     "$VERSION",
     "$KIND",
     "$FILTER",
+    "$SKIN",
 ];
 
 /// Validation warnings for plugins: an unparseable key chord (see
@@ -1953,6 +2024,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn save_dir_defaults_to_temp_and_expands_home() {
+        let home = Some("/home/me");
+        assert_eq!(expand_save_dir(None, home), Ok(std::env::temp_dir()));
+        assert_eq!(expand_save_dir(Some("  "), home), Ok(std::env::temp_dir()));
+        assert_eq!(
+            expand_save_dir(Some("~"), home),
+            Ok(PathBuf::from("/home/me"))
+        );
+        assert_eq!(
+            expand_save_dir(Some("~/k8s/dumps"), home),
+            Ok(PathBuf::from("/home/me/k8s/dumps"))
+        );
+        assert_eq!(
+            expand_save_dir(Some("/srv/dumps"), home),
+            Ok(PathBuf::from("/srv/dumps"))
+        );
+        assert_eq!(
+            expand_save_dir(Some("~other/dumps"), home),
+            Ok(PathBuf::from("~other/dumps"))
+        );
+        assert!(
+            expand_save_dir(Some("~/dumps"), None)
+                .unwrap_err()
+                .contains("HOME is not set")
+        );
+        let toml: Config = toml::from_str("save_dir = \"~/dumps\"").unwrap();
+        let yaml: Config = serde_yaml::from_str("save_dir: ~/dumps\n").unwrap();
+        assert_eq!(toml.save_dir.as_deref(), Some("~/dumps"));
+        assert_eq!(yaml.save_dir.as_deref(), Some("~/dumps"));
+    }
+
+    #[test]
     fn detail_wrap_defaults_and_formats() {
         assert!(!Config::default().detail_wrap);
         assert!(!toml::from_str::<Config>("").unwrap().detail_wrap);
@@ -1961,6 +2064,18 @@ mod tests {
             let yaml: Config = serde_yaml::from_str(&format!("detail_wrap: {enabled}\n")).unwrap();
             assert_eq!(toml.detail_wrap, enabled);
             assert_eq!(yaml.detail_wrap, enabled);
+        }
+    }
+
+    #[test]
+    fn rbac_rule_list_defaults_and_formats() {
+        assert!(!Config::default().rbac_rule_list);
+        for enabled in [false, true] {
+            let toml: Config = toml::from_str(&format!("rbac_rule_list = {enabled}")).unwrap();
+            let yaml: Config =
+                serde_yaml::from_str(&format!("rbac_rule_list: {enabled}\n")).unwrap();
+            assert_eq!(toml.rbac_rule_list, enabled);
+            assert_eq!(yaml.rbac_rule_list, enabled);
         }
     }
 

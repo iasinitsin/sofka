@@ -200,6 +200,7 @@ impl App {
                             resource: "applications".into(),
                             namespace: Some("*".into()),
                             context: Some(ctx),
+                            layout: None,
                             filter: DEGRADED_APPLICATIONS_FILTER.into(),
                         });
                     } else {

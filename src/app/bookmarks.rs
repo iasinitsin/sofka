@@ -63,22 +63,35 @@ impl App {
             self.flash_warn(&format!("filter: {error}"));
             return false;
         }
+        self.flash_err = false;
         self.apply_resource_query(crate::filter::ResourceQuery {
             resource: bm.resource.clone(),
             namespace: bm.namespace.clone(),
             context: None,
+            layout: bm.layout.clone(),
             filter: bm.filter.clone().unwrap_or_default(),
         });
         if let Some(sort) = &bm.sort {
             self.apply_sort_spec(sort);
         }
+        let warning = self.flash_err.then(|| self.flash.clone());
         match bm.view.as_deref() {
             Some("xray") => self.open_xray(),
             Some("pulse") => self.open_pulse(),
             _ => {}
         }
-        self.flash = format!("bookmark: {}", bm.name);
-        self.flash_err = false;
+        let opening_error = self.flash_err.then(|| self.flash.clone());
+        match (opening_error, warning) {
+            (Some(error), Some(warning)) if error != warning => {
+                self.flash_warn(&format!("{error} · {warning}"));
+            }
+            (Some(_), _) => {}
+            (None, Some(warning)) => self.flash_warn(&warning),
+            (None, None) => {
+                self.flash = format!("bookmark: {}", bm.name);
+                self.flash_err = false;
+            }
+        }
         true
     }
 

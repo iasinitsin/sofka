@@ -61,13 +61,22 @@ impl App {
                     | Action::Last
                     | Action::PageUp
                     | Action::PageDown
+                    | Action::HalfPageUp
+                    | Action::HalfPageDown
                     | Action::RangeUp
                     | Action::RangeDown
                     | Action::NextMatch
                     | Action::PreviousMatch
+                    | Action::NextSection
+                    | Action::PreviousSection
             )
         );
+        if self.acts_on_row(&key) {
+            self.focus_workload_row();
+        }
         let result = self.handle_key_inner(key);
+        self.note_skipped_marks(input_mode);
+        self.restore_workloads_identity();
         if self.mode != input_mode {
             self.popup_scroll = 0;
             self.popup_max_scroll = 0;
@@ -115,6 +124,11 @@ impl App {
         if self.pvc.active && self.mode != Mode::PvcExplore && !overlay {
             self.leave_pvc_explore();
         }
+        // A palette command that leaves the skin picker abandons its preview;
+        // a palette or help visit that returns to the picker keeps it.
+        if self.skin_preview_origin.is_some() && self.mode != Mode::Skins && !overlay {
+            self.cancel_skin_preview();
+        }
         // A PVC shell waiting on a dialog can also be walked away from — `:`
         // is accepted from `Mode::Confirm` and simply abandons the action.
         // Nothing else will ever run the suspend, so release what it holds.
@@ -134,40 +148,46 @@ impl App {
         }
         let drain_page = if self.mode == Mode::Drain {
             match key.action {
-                Some(Action::PageDown) => Some(true),
-                Some(Action::PageUp) => Some(false),
+                Some(a @ (Action::PageDown | Action::HalfPageDown)) => {
+                    Some((true, a.page_size(5) as u16))
+                }
+                Some(a @ (Action::PageUp | Action::HalfPageUp)) => {
+                    Some((false, a.page_size(5) as u16))
+                }
                 _ => None,
             }
         } else if self.drain_confirmation() {
-            match key.code {
-                KeyCode::PageDown => Some(true),
-                KeyCode::PageUp => Some(false),
+            match (key.action, key.code) {
+                (Some(Action::HalfPageDown), _) => Some((true, 2)),
+                (Some(Action::HalfPageUp), _) => Some((false, 2)),
+                (_, KeyCode::PageDown) => Some((true, 5)),
+                (_, KeyCode::PageUp) => Some((false, 5)),
                 _ => None,
             }
         } else {
             None
         };
-        if let Some(down) = drain_page {
+        if let Some((down, step)) = drain_page {
             self.drain.focus_field = false;
             self.drain.scroll = if down {
-                self.drain.scroll.saturating_add(5)
+                self.drain.scroll.saturating_add(step)
             } else {
-                self.drain.scroll.saturating_sub(5)
+                self.drain.scroll.saturating_sub(step)
             };
             return Ok(());
         }
         if matches!(self.mode, Mode::Confirm | Mode::Prompt) && !self.drain_confirmation() {
             let page = self.popup_viewport.max(1);
             match key.action {
-                Some(Action::PageDown) => {
+                Some(a @ (Action::PageDown | Action::HalfPageDown)) => {
                     self.popup_scroll = self
                         .popup_scroll
-                        .saturating_add(page)
+                        .saturating_add(a.page_size(page))
                         .min(self.popup_max_scroll);
                     return Ok(());
                 }
-                Some(Action::PageUp) => {
-                    self.popup_scroll = self.popup_scroll.saturating_sub(page);
+                Some(a @ (Action::PageUp | Action::HalfPageUp)) => {
+                    self.popup_scroll = self.popup_scroll.saturating_sub(a.page_size(page));
                     return Ok(());
                 }
                 _ => {}
@@ -232,14 +252,40 @@ impl App {
             Mode::Fleet => self.key_fleet(key),
             Mode::Find => self.key_find(key),
             Mode::PvcExplore => self.key_pvc_explore(key),
+            Mode::Dir => self.key_dir(key),
             Mode::PortForwardPicker => self.key_port_forward_picker(key),
             Mode::PluginForm => self.key_plugin_form(key),
+        }
+        // An apply preview lives only while its diff is on screen, or under
+        // overlays that eventually return to it (help over the diff, then a
+        // search over help).
+        let mut mode = self.mode;
+        let mut in_preview = false;
+        for _ in 0..4 {
+            mode = match mode {
+                Mode::Diff => {
+                    in_preview = true;
+                    break;
+                }
+                Mode::Command => self.palette_return,
+                Mode::Help => self.help_return,
+                Mode::DocFilter => self.doc_filter_return,
+                _ => break,
+            };
+        }
+        if !in_preview {
+            self.dir.preview = None;
         }
         Ok(())
     }
 
     pub fn key_scope(&self) -> &'static str {
-        match self.mode {
+        self.scope_for(self.mode)
+    }
+
+    /// The keymap scope a view uses, which also names its `Keys:` help section.
+    pub(crate) fn scope_for(&self, mode: Mode) -> &'static str {
+        match mode {
             Mode::Contexts if self.ctx_filtering => "context_filter",
             Mode::Table => "table",
             Mode::Command => "command",
@@ -276,6 +322,7 @@ impl App {
             Mode::Fleet => "fleet",
             Mode::Find => "find",
             Mode::PvcExplore => "pvc_explore",
+            Mode::Dir => "dir",
             Mode::PortForwardPicker => "port_forward_picker",
             Mode::PluginForm => "plugin_form",
         }
@@ -333,6 +380,7 @@ impl App {
         self.help_return = self.mode;
         self.help_filter.clear();
         self.help_scroll = 0;
+        self.help_find_section = true;
         self.mode = Mode::Help;
     }
 
@@ -344,6 +392,9 @@ impl App {
             if let Some(namespace) = self.favorite_namespace(index) {
                 self.set_namespace(namespace);
             }
+            return;
+        }
+        if self.ns_resources_blocks(&key) {
             return;
         }
         // A kind-specific built-in leaves its key to user bindings on other
@@ -362,7 +413,7 @@ impl App {
             (Some(Action::Delete), _) => self.request_delete(false),
             (Some(Action::ForceDelete), _) => self.request_delete(true),
             (Some(Action::Refresh), _) => self.refresh_namespace_selection(),
-            (Some(Action::Faults), _) if self.kind_plural == "pods" => {
+            (Some(Action::Faults), _) if self.faults_supported() => {
                 if !self.try_bookmark_key(key.event())
                     && !self.try_workspace_key(key.event())
                     && !self.try_plugin_key(key.event())
@@ -372,6 +423,10 @@ impl App {
                     self.table_state.select(Some(0));
                 }
             }
+            (Some(Action::ToggleOwned), _) if self.workloads_active() => {
+                self.toggle_workloads_owned();
+            }
+            (Some(Action::NsResources), _) => self.open_ns_resources_for_row(),
             (Some(Action::Filter), _) => self.mode = Mode::Filter,
             (Some(Action::Exit), _) => self.should_quit = true,
             (Some(Action::Back), _) => {
@@ -403,15 +458,14 @@ impl App {
             }
             (Some(Action::PageDown), _) => self.move_page(1),
             (Some(Action::PageUp), _) => self.move_page(-1),
+            (Some(Action::HalfPageDown), _) => self.move_half_page(1),
+            (Some(Action::HalfPageUp), _) => self.move_half_page(-1),
             // Move the viewport; keep NAMESPACE/NAME in place.
             (Some(Action::Right), _) => self.scroll_columns(1),
             (Some(Action::Left), _) => self.scroll_columns(-1),
-            // k9s: SPACE marks/unmarks the current row for bulk actions, then
-            // advances so a range can be marked with repeated taps.
-            (Some(Action::Mark), _) => {
-                self.toggle_mark();
-                self.move_selection(1);
-            }
+            // k9s: SPACE marks/unmarks the current row for bulk actions and
+            // leaves the cursor in place.
+            (Some(Action::Mark), _) => self.toggle_mark(),
             (Some(Action::MarkRange), _) => self.mark_range(),
             (Some(Action::Open), _) => self.drill(),
             (Some(Action::Yaml), _) => self.open_detail(),
@@ -460,6 +514,8 @@ impl App {
             (Some(Action::Cordon), _) => self.request_cordon(true),
             (Some(Action::Uncordon), _) => self.request_cordon(false),
             (Some(Action::Drain), _) => self.request_drain(),
+            (Some(Action::Approve), _) => self.request_csr_decision(true),
+            (Some(Action::Deny), _) => self.request_csr_decision(false),
             // Sorting: S opens the column picker, I inverts the direction.
             (Some(Action::Sort), _) => self.open_sort_picker(),
             (Some(Action::SortAge), _) => self.sort_by_age(),
@@ -573,7 +629,7 @@ impl App {
                 self.command.pop();
                 self.update_suggestions();
             }
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 self.command.push(c);
                 self.update_suggestions();
             }
@@ -605,6 +661,7 @@ impl App {
         let slot = match suggestion.kind {
             SuggestKind::Namespace => namespace_word(&self.command).unwrap_or(1),
             SuggestKind::Context => 1,
+            SuggestKind::Layout => layout_word(&self.command).unwrap_or(1),
             _ => 0,
         };
         let span = self.command.split_whitespace().nth(slot).map(|word| {
@@ -633,7 +690,8 @@ impl App {
 
     /// Run the highlighted palette suggestion (or the raw typed text).
     fn palette_accept(&mut self) {
-        let mut typed = self.command.trim().to_string();
+        let raw = self.command.clone();
+        let mut typed = raw.trim().to_string();
         let picked = self.cmd_suggestions.get(self.cmd_sel).cloned();
         let navigated = std::mem::take(&mut self.cmd_navigated) && picked.is_some();
         self.mode = Mode::Table;
@@ -668,10 +726,18 @@ impl App {
                 .any(|p| p.palette.as_deref() == Some(query_head));
         if (self.cluster.resolve(query_head).is_some() || !owns_command)
             && (typed.contains(" /")
-                || typed
-                    .split_whitespace()
-                    .any(|s| s.starts_with('@') || matches!(s, "-n" | "--namespace" | "--context")))
+                || typed.split_whitespace().any(|s| {
+                    s.starts_with('@') || matches!(s, "-n" | "--namespace" | "--context" | "-o")
+                }))
         {
+            if let Some(s) = picked.as_ref().filter(|s| s.kind == SuggestKind::Layout)
+                && let Some(slot) = layout_word(&raw)
+            {
+                let mut words: Vec<&str> = raw.split_whitespace().collect();
+                words.truncate(slot);
+                words.push(&s.label);
+                typed = words.join(" ");
+            }
             if let Some(s) = picked.as_ref().filter(|s| s.kind == SuggestKind::Context)
                 && let Some((head, rest)) = typed.split_once(char::is_whitespace)
                 && rest.trim_start().starts_with('@')
@@ -712,6 +778,11 @@ impl App {
             Some(SuggestKind::Workspace) => {
                 if let Some(s) = picked {
                     self.open_workspace_named(&s.label);
+                }
+            }
+            Some(SuggestKind::Layout) => {
+                if let Some(s) = picked {
+                    self.set_layout(&s.label);
                 }
             }
             // A name owned by a CRD resolves to the CRD even when a
@@ -758,7 +829,8 @@ impl App {
                         SuggestKind::Namespace
                         | SuggestKind::Context
                         | SuggestKind::Bookmark
-                        | SuggestKind::Workspace => {}
+                        | SuggestKind::Workspace
+                        | SuggestKind::Layout => {}
                     }
                 } else if !head.is_empty() {
                     self.switch_kind_ns(&head, ns_arg);
@@ -778,6 +850,19 @@ impl App {
         self.update_suggestions();
     }
 
+    /// Point a row action at the selected row's kind in the workloads view.
+    /// Returns `false` when the view has no row to act on.
+    fn focus_action_row(&mut self, action: PaletteAction) -> bool {
+        if action.acts_on_row() && self.ns_resources_active() {
+            self.flash_warn("ns-resources lists kinds: ⏎ opens one, r counts again");
+            return false;
+        }
+        if action.acts_on_row() {
+            self.focus_workload_row();
+        }
+        true
+    }
+
     /// Run a built-in palette action.
     pub(super) fn run_action(&mut self, action: PaletteAction) {
         if matches!(action, PaletteAction::PluginActivity) {
@@ -785,6 +870,9 @@ impl App {
             return;
         }
         self.stop_plugins();
+        if !self.focus_action_row(action) {
+            return;
+        }
         match action {
             PaletteAction::PluginActivity => unreachable!(),
             PaletteAction::Quit => self.should_quit = true,
@@ -821,6 +909,7 @@ impl App {
             PaletteAction::Rightsize => self.open_rightsize(),
             PaletteAction::PvcExplore => self.open_pvc_explore(),
             PaletteAction::PvcClean => self.request_pvc_clean(),
+            PaletteAction::Dir => self.open_dir(""),
             PaletteAction::Find => self.flash_warn("usage: :find <text>"),
             PaletteAction::Diff => self.open_diff(),
             PaletteAction::RolloutHistory => self.open_rollout_history(),
@@ -829,8 +918,11 @@ impl App {
             PaletteAction::ProviderLogs => self.open_provider_logs(),
             PaletteAction::Skin => self.open_skins(),
             PaletteAction::Helm => self.open_helm_releases(),
-            PaletteAction::Notify => self.toggle_notify(),
+            PaletteAction::Workloads => self.open_workloads(None),
+            PaletteAction::NsResources => self.open_ns_resources(None),
+            PaletteAction::Notify => self.toggle_notify(""),
             PaletteAction::Reload => self.reload_config(),
+            PaletteAction::Layout => self.open_layout_picker(),
             PaletteAction::ConfigInfo => self.open_config_info(),
         }
     }
@@ -854,6 +946,15 @@ impl App {
             }
             return true;
         }
+        // `:layout [name]` switches the current kind's layout; bare `:layout`
+        // lists them.
+        let mut parts = cmd.split_whitespace();
+        if parts.next() == Some("layout")
+            && let Some(name) = parts.next()
+        {
+            self.set_layout(name);
+            return true;
+        }
         // `:snapshot [format]` captures the current view; the optional arg is
         // the output format (text/json/yaml).
         let mut parts = cmd.split_whitespace();
@@ -867,6 +968,23 @@ impl App {
             self.take_snapshot(&rest);
             return true;
         }
+        // `:notify [note]` toggles a watch notification; the optional note is
+        // prepended to its messages.
+        if let Some(first) = cmd.split_whitespace().next()
+            && matches!(first.to_ascii_lowercase().as_str(), "notify" | "bell")
+        {
+            if self.focus_action_row(PaletteAction::Notify) {
+                self.toggle_notify(&cmd[first.len()..]);
+            }
+            return true;
+        }
+        // `:dir [path]` browses local manifests; the path may contain spaces.
+        if let Some(first) = cmd.split_whitespace().next()
+            && first == "dir"
+        {
+            self.open_dir(&cmd[first.len()..]);
+            return true;
+        }
         // `:find <text>` sweeps object names across the common kinds.
         let mut parts = cmd.split_whitespace();
         if let Some(first) = parts.next()
@@ -878,6 +996,17 @@ impl App {
             } else {
                 self.start_find(&rest);
             }
+            return true;
+        }
+        // `:workloads [ns]` opens the mixed workloads table, `:ns-resources
+        // [ns]` the populated kinds.
+        let mut parts = cmd.split_whitespace();
+        if let Some(first) = parts.next()
+            && (workloads::NAMES.contains(&first.to_ascii_lowercase().as_str())
+                || ns_resources::NAMES.contains(&first.to_ascii_lowercase().as_str()))
+            && self.cluster.resolve(first).is_none()
+        {
+            self.switch_kind_ns(first, parts.next());
             return true;
         }
         if let Some(args) = cmd.strip_prefix("policy ") {
@@ -927,6 +1056,7 @@ impl App {
                     .find(|p| p.palette.as_deref() == Some(name))
                     .cloned();
                 if let Some(plugin) = plugin {
+                    self.focus_workload_row();
                     if !plugin.scopes.is_empty() && !plugin.scopes.contains(&self.kind_plural) {
                         self.flash_warn("plugin does not apply to this resource kind");
                     } else {
@@ -961,6 +1091,12 @@ impl App {
                 self.suggest_contexts(&arg);
                 return;
             }
+            if head == "layout" && self.cluster.resolve(&head).is_none() {
+                let layouts = self.kind_layouts();
+                self.suggest_layouts(layouts, &arg);
+                return;
+            }
+            let head = crate::views::split_layout(&head).0.to_string();
             if let Some(context) = arg.strip_prefix('@')
                 && (self.cluster.resolve(&head).is_some()
                     || (!PALETTE_COMMANDS
@@ -983,7 +1119,14 @@ impl App {
                     return;
                 }
             }
-            if self.cluster.resolve(&head).is_some() {
+            if let Some(kind) = self.cluster.resolve(&head) {
+                if let Some(slot) = layout_word(&self.command) {
+                    let arg = self.command.split_whitespace().nth(slot).unwrap_or("");
+                    let arg = arg.to_string();
+                    let layouts = crate::views::layouts_for(&self.user_views, &kind.ar);
+                    self.suggest_layouts(layouts, &arg);
+                    return;
+                }
                 match namespace_word(&self.command) {
                     Some(slot) => {
                         let arg = self.command.split_whitespace().nth(slot).unwrap_or("");
@@ -994,6 +1137,19 @@ impl App {
                         self.cmd_suggestions.clear();
                         self.cmd_sel = 0;
                     }
+                }
+                return;
+            }
+            // `:workloads [ns]` and `:ns-resources [ns]` take their namespace
+            // as the bare second word.
+            if workloads::NAMES.contains(&head.to_ascii_lowercase().as_str())
+                || ns_resources::NAMES.contains(&head.to_ascii_lowercase().as_str())
+            {
+                if namespace_word(&self.command) == Some(1) {
+                    self.suggest_namespaces(&arg);
+                } else {
+                    self.cmd_suggestions.clear();
+                    self.cmd_sel = 0;
                 }
                 return;
             }
@@ -1139,8 +1295,58 @@ impl App {
             }
         }
 
+        for label in self.layout_entries() {
+            let score = if q.is_empty() {
+                Some(0)
+            } else {
+                self.matcher.score(&label, q)
+            };
+            if let Some(score) = score {
+                scored.push((
+                    score,
+                    Suggestion {
+                        label,
+                        kind: SuggestKind::Resource,
+                    },
+                ));
+            }
+        }
+
         rank_completions(&mut scored, |s| s.label.as_str(), !q.is_empty());
         self.cmd_suggestions = scored.into_iter().take(100).map(|(_, s)| s).collect();
+        self.cmd_sel = 0;
+    }
+
+    /// Palette completions for `:layout <name>` and `-o <name>`: `default`
+    /// pinned first, then the kind's layouts. A partial argument fuzzy-matches
+    /// `default` and the layouts together, with an exact name first.
+    fn suggest_layouts(&mut self, layouts: Vec<String>, arg: &str) {
+        let names: Vec<String> = if arg.is_empty() {
+            std::iter::once("default".to_string())
+                .chain(layouts)
+                .collect()
+        } else {
+            let mut scored: Vec<(i64, String)> = std::iter::once("default".to_string())
+                .chain(layouts)
+                .filter_map(|name| {
+                    let score = if name.eq_ignore_ascii_case(arg) {
+                        i64::MAX
+                    } else {
+                        self.matcher.score(&name, arg)?
+                    };
+                    Some((score, name))
+                })
+                .collect();
+            rank_completions(&mut scored, |s| s.as_str(), true);
+            scored.into_iter().map(|(_, name)| name).collect()
+        };
+        self.cmd_suggestions = names
+            .into_iter()
+            .map(|label| Suggestion {
+                label,
+                kind: SuggestKind::Layout,
+            })
+            .collect();
         self.cmd_sel = 0;
     }
 
@@ -1234,7 +1440,7 @@ impl App {
             (Some(Action::Backspace), _) => {
                 self.filter.pop();
             }
-            (None, KeyCode::Char(c)) => self.filter.push(c),
+            (None, KeyCode::Char(c)) if key.is_text() => self.filter.push(c),
             _ => {}
         }
         self.invalidate_rows();
@@ -1276,6 +1482,7 @@ impl App {
                 }
                 self.stop_resource_refresh();
                 self.clear_document_source();
+                self.dir.preview = None;
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
@@ -1304,11 +1511,17 @@ impl App {
             (Some(Action::ResetBaseline), _) if self.mode == Mode::Diff => {
                 self.reset_diff_baseline();
             }
+            (Some(Action::Apply), _)
+                if self.mode == Mode::Diff && self.return_mode == Mode::Dir =>
+            {
+                self.dir_request_apply();
+            }
             // Copy the document to the clipboard (k9s `c`), same as the logs
             // view: an active search copies only the matching lines.
             (Some(Action::Copy), _) if detail => {
                 self.copy_doc();
             }
+            (Some(Action::Save), _) if detail => self.save_doc(),
             // `x` decodes the secret's data from inside its describe/YAML
             // view too — no need to back out to the table first.
             (Some(Action::DecodeSecret), _)
@@ -1323,8 +1536,12 @@ impl App {
             (Some(Action::Up), _) => target.scroll_by(-1),
             (Some(Action::Left), _) => target.scroll_h(-5),
             (Some(Action::Right), _) => target.scroll_h(5),
-            (Some(Action::PageDown), _) => target.scroll_by(20),
-            (Some(Action::PageUp), _) => target.scroll_by(-20),
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => {
+                target.scroll_by(a.page_size(20) as i32)
+            }
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => {
+                target.scroll_by(-(a.page_size(20) as i32))
+            }
             (Some(Action::First), _) => {
                 target.scroll = 0;
                 target.hscroll = 0;
@@ -1358,6 +1575,10 @@ impl App {
         // Ctrl-S saves the buffer to a file (k9s).
         if key.action == Some(Action::Save) {
             self.save_logs();
+            return;
+        }
+        if key.action == Some(Action::AllContainers) {
+            self.toggle_all_containers();
             return;
         }
         match (key.action, key.code) {
@@ -1395,7 +1616,7 @@ impl App {
             (Some(Action::Lookback), _) => {
                 self.prompt_label = if self.provider_logs_active() {
                     format!(
-                        "lookback period: e.g. 30m, 4h, 2d (current: {})",
+                        "lookback period: e.g. 30m, 1h30m, 2d (current: {})",
                         self.provider_lookback_label()
                     )
                 } else {
@@ -1406,7 +1627,7 @@ impl App {
                             .filter(|_| self.log_tail_and_since().1.is_some())
                             .unwrap_or_else(|| "tail".into())
                     });
-                    format!("lookback: s/m/h/d or tail (current: {current})")
+                    format!("lookback: s/m/h/d/w or tail (current: {current})")
                 };
                 self.prompt_input.clear();
                 self.prompt_kind = Some(PromptKind::LogLookback);
@@ -1487,13 +1708,13 @@ impl App {
                 self.logs.follow = false;
                 self.logs.view.scroll = cur.saturating_sub(1);
             }
-            (Some(Action::PageDown), _) => {
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => {
                 self.logs.follow = false;
-                self.logs.view.scroll = cur.saturating_add(page).min(max);
+                self.logs.view.scroll = cur.saturating_add(a.page_size(page)).min(max);
             }
-            (Some(Action::PageUp), _) => {
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => {
                 self.logs.follow = false;
-                self.logs.view.scroll = cur.saturating_sub(page);
+                self.logs.view.scroll = cur.saturating_sub(a.page_size(page));
             }
             (Some(Action::First), _) => {
                 self.logs.follow = false;
@@ -1525,7 +1746,7 @@ impl App {
                 f.pop();
                 self.logs.set_filter(f);
             }
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 let mut f = self.logs.filter.clone();
                 f.push(c);
                 self.logs.set_filter(f);
@@ -1535,6 +1756,7 @@ impl App {
     }
 
     pub(super) fn key_help(&mut self, key: KeyInput) {
+        self.help_find_section = false;
         let page = self.help_viewport_h.max(1);
         match (key.action, key.code) {
             // Esc backs out of an active search first, then closes help.
@@ -1557,15 +1779,35 @@ impl App {
             (Some(Action::Up), _) => {
                 self.help_scroll = self.help_scroll.saturating_sub(1);
             }
-            (Some(Action::PageDown), _) => {
+            (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => {
                 self.help_scroll = self
                     .help_scroll
-                    .saturating_add(page)
+                    .saturating_add(a.page_size(page.into()) as u16)
                     .min(self.help_max_scroll);
             }
-            (Some(Action::PageUp), _) => self.help_scroll = self.help_scroll.saturating_sub(page),
+            (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => {
+                self.help_scroll = self
+                    .help_scroll
+                    .saturating_sub(a.page_size(page.into()) as u16)
+            }
             (Some(Action::First), _) => self.help_scroll = 0,
             (Some(Action::Last), _) => self.help_scroll = self.help_max_scroll,
+            (Some(Action::NextSection), _) => {
+                crate::ui::refresh_help(self);
+                let sections = self.help_cache.as_ref().map_or(&[][..], |c| c.sections());
+                if let Some(&(_, row)) = sections.iter().find(|(_, row)| *row > self.help_scroll) {
+                    self.help_scroll = row.min(self.help_max_scroll);
+                }
+            }
+            (Some(Action::PreviousSection), _) => {
+                crate::ui::refresh_help(self);
+                let sections = self.help_cache.as_ref().map_or(&[][..], |c| c.sections());
+                self.help_scroll = sections
+                    .iter()
+                    .rev()
+                    .find(|(_, row)| *row < self.help_scroll)
+                    .map_or(0, |&(_, row)| row);
+            }
             _ => {}
         }
     }
@@ -1593,7 +1835,7 @@ impl App {
             (Some(Action::Backspace), _) => {
                 self.doc_filter_mut().pop();
             }
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 self.doc_filter_mut().push(c);
             }
             _ => {}
@@ -1636,12 +1878,27 @@ fn namespace_word(command: &str) -> Option<usize> {
     let slot = loop {
         match words.get(i).copied() {
             Some("-n" | "--namespace") => break i + 1,
-            Some("--context") => i += 2,
+            Some("--context" | "-o") => i += 2,
             Some(word) if word.starts_with(['-', '@']) => i += 1,
             _ => break i,
         }
     };
     (slot == typing).then_some(slot)
+}
+
+/// Index of the word a `:resource` query reads as its layout: the value after
+/// `-o`. `None` unless that word is the one being typed.
+fn layout_word(command: &str) -> Option<usize> {
+    if command.contains(" /") {
+        return None;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let typing = if command.ends_with(char::is_whitespace) {
+        words.len()
+    } else {
+        words.len().checked_sub(1)?
+    };
+    (typing > 1 && words[typing - 1] == "-o").then_some(typing)
 }
 
 /// Order scored palette completions: score descending, then label length,

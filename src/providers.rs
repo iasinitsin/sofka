@@ -6,7 +6,10 @@
 //! to look at data Kubernetes itself doesn't keep (log history beyond a pod's
 //! lifetime, logs of deleted pods, whole-namespace searches).
 //!
-//! The first (and so far only) provider kind is a log backend:
+//! Log link providers (Cloud Logging, URL templates) live in [`link`]; they
+//! open a web log UI instead of querying a backend.
+//!
+//! The first provider kind is a log backend:
 //! [VictoriaLogs](https://docs.victoriametrics.com/victorialogs/), queried
 //! over its HTTP API with LogsQL. Loki-style backends can slot in later
 //! behind the same [`LogProvider`] surface.
@@ -50,6 +53,9 @@ use kube::api::{Api, ListParams};
 use serde_json::Value;
 
 use crate::config::LogProviderConfig;
+
+mod link;
+pub use link::{LinkTarget, LogLink, selector as link_selector};
 
 const DEFAULT_NAMESPACE_FIELD: &str = "kubernetes.pod_namespace";
 const DEFAULT_POD_FIELD: &str = "kubernetes.pod_name";
@@ -240,13 +246,17 @@ pub fn compile(cfg: Option<&LogProviderConfig>) -> (Option<LogProvider>, Vec<Str
 
     match cfg.kind.as_str() {
         "victorialogs" => {}
+        // Link providers are compiled by [`compile_link`].
+        "gcp" | "link" => return (None, warnings),
         "" => {
-            warnings.push("providers.logs: missing `type` (expected \"victorialogs\")".into());
+            warnings.push(format!(
+                "providers.logs: missing `type` (expected {LOG_TYPES})"
+            ));
             return (None, warnings);
         }
         other => {
             warnings.push(format!(
-                "providers.logs: unsupported type {other:?} (expected \"victorialogs\")"
+                "providers.logs: unsupported type {other:?} (expected {LOG_TYPES})"
             ));
             return (None, warnings);
         }
@@ -326,6 +336,43 @@ pub fn compile(cfg: Option<&LogProviderConfig>) -> (Option<LogProvider>, Vec<Str
         limit: cfg.limit.unwrap_or(DEFAULT_LIMIT).max(1),
     };
     (Some(provider), warnings)
+}
+
+const LOG_TYPES: &str = "\"victorialogs\", \"gcp\", or \"link\"";
+
+/// Compile a `type = "gcp"` or `type = "link"` `[providers.logs]` section into
+/// a [`LogLink`]. Other types, and a missing section, yield `None` without a
+/// warning; [`compile`] reports those.
+pub fn compile_link(cfg: Option<&LogProviderConfig>) -> (Option<LogLink>, Vec<String>) {
+    let Some(cfg) = cfg.filter(|cfg| matches!(cfg.kind.as_str(), "gcp" | "link")) else {
+        return (None, Vec::new());
+    };
+    let lookback = cfg
+        .lookback
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOOKBACK.into());
+    let lookback_secs = match parse_lookback(&lookback) {
+        Ok(secs) => secs,
+        Err(e) => return (None, vec![format!("providers.logs: lookback: {e}")]),
+    };
+    if cfg.kind == "gcp" {
+        return (Some(LogLink::Gcp { lookback_secs }), Vec::new());
+    }
+    let url = cfg.url.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return (
+            None,
+            vec![format!(
+                "providers.logs: type \"link\" needs a url template starting with http:// or https://, got {:?}",
+                cfg.url
+            )],
+        );
+    }
+    let link = LogLink::Template {
+        url: url.into(),
+        lookback: lookback.trim().into(),
+    };
+    (Some(link), Vec::new())
 }
 
 /// Stream-field naming conventions of the common log shippers, as
@@ -447,26 +494,72 @@ fn pick_service(services: &[Service]) -> Option<(String, String, i32)> {
     ))
 }
 
-/// `"90s"` / `"15m"` / `"1h"` / `"2d"` (bare numbers are seconds).
+/// `"90s"` / `"15m"` / `"1h"` / `"2d"` / `"1w"`, compound (`"1h30m"`) and
+/// decimal (`"1.5h"`, rounded half-up to whole seconds). Bare numbers are
+/// seconds. Integer math throughout, so no float rounding.
 pub(crate) fn parse_lookback(s: &str) -> Result<i64, String> {
+    // shortcut: fraction digits past 18 are truncated, matters only for exact ties at 19+ digits.
+    const SCALE: i128 = 1_000_000_000_000_000_000;
     let s = s.trim();
-    let (digits, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
-        Some(i) => s.split_at(i),
-        None => (s, "s"),
-    };
-    let n: i64 = digits
-        .parse()
-        .map_err(|_| format!("{s:?} is not a duration like \"30m\" or \"1h\""))?;
-    let per_unit = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        _ => return Err(format!("{s:?} has unknown unit {unit:?} (use s/m/h/d)")),
-    };
-    let secs = n
-        .checked_mul(per_unit)
-        .ok_or_else(|| format!("{s:?} is too large"))?;
+    let bad = || format!("{s:?} is not a duration like \"30m\", \"1h30m\" or \"1.5h\"");
+    let too_large = || format!("{s:?} is too large");
+    let digits_end = |t: &str| t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let mut rest = s;
+    let (mut whole, mut frac) = (0i128, 0i128); // frac is in 1/SCALE seconds
+    while !rest.is_empty() {
+        let int_end = digits_end(rest);
+        if int_end == 0 {
+            return Err(bad());
+        }
+        let mut num_end = int_end;
+        let mut frac_digits = "";
+        if let Some(f) = rest[int_end..].strip_prefix('.') {
+            let n = digits_end(f);
+            if n == 0 {
+                return Err(bad());
+            }
+            frac_digits = &f[..n];
+            num_end += 1 + n;
+        }
+        let int: i128 = rest[..int_end].parse().map_err(|_| too_large())?;
+        let after = &rest[num_end..];
+        let unit_end = after
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(after.len());
+        let unit = &after[..unit_end];
+        let per_unit: i128 = match unit {
+            "s" => 1,
+            "m" => 60,
+            "h" => 3600,
+            "d" => 86_400,
+            "w" => 604_800,
+            // bare seconds only when the number is the whole input
+            "" if rest.len() == s.len() && num_end == s.len() => 1,
+            "" => {
+                return Err(format!(
+                    "{s:?} is missing a unit after {:?}",
+                    &rest[..num_end]
+                ));
+            }
+            _ => return Err(format!("{s:?} has unknown unit {unit:?} (use s/m/h/d/w)")),
+        };
+        let scaled: i128 = format!("{frac_digits:0<18.18}")
+            .parse()
+            .map_err(|_| bad())?;
+        whole = int
+            .checked_mul(per_unit)
+            .and_then(|v| whole.checked_add(v))
+            .ok_or_else(too_large)?;
+        frac = scaled
+            .checked_mul(per_unit)
+            .and_then(|v| frac.checked_add(v))
+            .ok_or_else(too_large)?;
+        rest = &after[unit_end..];
+    }
+    let secs = whole
+        .checked_add((frac + SCALE / 2) / SCALE)
+        .and_then(|v| i64::try_from(v).ok())
+        .ok_or_else(too_large)?;
     if secs <= 0 {
         return Err(format!("{s:?} must be a positive duration"));
     }
@@ -1641,6 +1734,34 @@ mod tests {
     }
 
     #[test]
+    fn link_types_compile_into_links_not_backends() {
+        let (p, w) = compile(Some(&cfg("type = \"gcp\"")));
+        assert!(p.is_none() && w.is_empty(), "{w:?}");
+        let (link, w) = compile_link(Some(&cfg("type = \"gcp\"\nlookback = \"2h\"")));
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(
+            link,
+            Some(LogLink::Gcp {
+                lookback_secs: 7200
+            })
+        );
+        let (link, w) = compile_link(Some(&cfg("type = \"victorialogs\"")));
+        assert!(link.is_none() && w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn link_type_needs_an_http_url_template() {
+        let (link, w) = compile_link(Some(&cfg("type = \"link\"")));
+        assert!(link.is_none());
+        assert!(w[0].contains("needs a url template"), "{w:?}");
+        let (link, w) = compile_link(Some(&cfg(
+            "type = \"link\"\nurl = \"https://logs.example.com/?q={pod}\"",
+        )));
+        assert!(w.is_empty(), "{w:?}");
+        assert!(matches!(link, Some(LogLink::Template { .. })));
+    }
+
+    #[test]
     fn parse_lookback_units() {
         assert_eq!(parse_lookback("90s"), Ok(90));
         assert_eq!(parse_lookback("15m"), Ok(900));
@@ -1648,7 +1769,45 @@ mod tests {
         assert_eq!(parse_lookback("1d"), Ok(86_400));
         assert_eq!(parse_lookback("45"), Ok(45)); // bare seconds
         assert!(parse_lookback("0m").is_err());
-        assert!(parse_lookback("1w").is_err());
+        assert_eq!(parse_lookback("1w"), Ok(604_800));
+        assert_eq!(parse_lookback("1h30m"), Ok(5400));
+        assert_eq!(parse_lookback("1d2h"), Ok(93_600));
+        assert_eq!(
+            parse_lookback("1w2d3h4m5s"),
+            Ok(604_800 + 172_800 + 10_800 + 245)
+        );
+        assert_eq!(parse_lookback("1.5h"), Ok(5400));
+        assert_eq!(parse_lookback("0.5m"), Ok(30));
+        assert_eq!(parse_lookback("1.5"), Ok(2)); // bare decimal seconds round
+        assert_eq!(parse_lookback(" 2h "), Ok(7200));
+        for bad in [
+            "", "1h30", "30m1", ".5h", "1.h", "1..5h", "-1h", "1x", "1h-30m", "0.2s", "0h0m",
+        ] {
+            assert!(parse_lookback(bad).is_err(), "{bad:?} should be rejected");
+        }
+        assert!(
+            parse_lookback("99999999999999999w")
+                .unwrap_err()
+                .contains("too large")
+        );
+        assert!(parse_lookback("99999999999999999999999999999w").is_err());
+        assert_eq!(
+            parse_lookback("0h30").unwrap_err(),
+            "\"0h30\" is missing a unit after \"30\""
+        );
+        assert_eq!(parse_lookback("30"), Ok(30));
+        assert_eq!(
+            parse_lookback("9007199254740993s"),
+            Ok(9_007_199_254_740_993)
+        );
+        assert_eq!(parse_lookback("9223372036854775807s"), Ok(i64::MAX));
+        assert!(
+            parse_lookback("9223372036854775808s")
+                .unwrap_err()
+                .contains("too large")
+        );
+        assert_eq!(parse_lookback("1.025m"), Ok(62)); // exactly 61.5s, rounds up
+        assert_eq!(parse_lookback("0.5s0.5s"), Ok(1)); // rounding is on the total
         assert!(parse_lookback("h").is_err());
     }
 

@@ -60,7 +60,9 @@ async fn custom_scale_uses_subresource_for_both_scopes_and_reports_errors() {
                 "default",
             );
             app.handle_key(press(KeyCode::Char(' '))).unwrap();
+            app.handle_key(press(KeyCode::Down)).unwrap();
             app.handle_key(press(KeyCode::Char(' '))).unwrap();
+            app.handle_key(press(KeyCode::Down)).unwrap();
             app.handle_key(press(KeyCode::Char('s'))).unwrap();
             assert_eq!(app.mode, Mode::Prompt);
             assert!(app.prompt_label.contains("Scale 2 todoapps"));
