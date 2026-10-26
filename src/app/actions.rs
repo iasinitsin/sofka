@@ -449,7 +449,8 @@ impl App {
             self.flash_warn("no owner reference");
             return;
         };
-        let Some(kind) = self.cluster.resolve(&owner.kind.to_lowercase()) else {
+        let group = owner.api_version.split_once('/').map_or("", |(g, _)| g);
+        let Some(kind) = self.cluster.resolve_in_group(&owner.kind, group) else {
             self.flash_warn(&format!("owner kind {} unresolved", owner.kind));
             return;
         };
@@ -710,12 +711,15 @@ impl App {
         if self.deny_readonly() {
             return;
         }
+        if self.flux_helmrelease_kind() {
+            self.request_chart_version();
+            return;
+        }
         let is_pod = self.kind_plural == "pods";
-        if !Action::SetImage
-            .kinds()
-            .is_some_and(|kinds| kinds.contains(&self.kind_plural.as_str()))
-        {
-            self.flash_warn("set image applies to pods and workload controllers");
+        if !self.action_applies(Action::SetImage) {
+            self.flash_warn(
+                "set image applies to pods, workload controllers and Flux HelmReleases",
+            );
             return;
         }
         let Some(obj) = self.selected_ref() else {
@@ -760,6 +764,55 @@ impl App {
         self.image_target = Some(target);
         self.container_state.select(Some(0));
         self.mode = Mode::SetImage;
+    }
+
+    /// `i` on a Flux HelmRelease prompts for `spec.chart.spec.version`. A
+    /// release using `spec.chartRef` takes its version from the referenced
+    /// source, so there is nothing to set on the HelmRelease itself.
+    fn request_chart_version(&mut self) {
+        let Some(obj) = self.selected_ref() else {
+            return;
+        };
+        if obj.data.pointer("/spec/chart").is_none() {
+            let message = if obj.data.pointer("/spec/chartRef").is_some() {
+                "chart version comes from the source in spec.chartRef - set it there"
+            } else {
+                "no spec.chart found"
+            };
+            self.flash_warn(message);
+            return;
+        }
+        let ns = obj.metadata.namespace.clone().unwrap_or_default();
+        let name = obj.metadata.name.clone().unwrap_or_default();
+        self.prompt_input = obj
+            .data
+            .pointer("/spec/chart/spec/version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        self.prompt_label = format!("Chart version for {name}:");
+        self.prompt_kind = Some(PromptKind::ChartVersion { ns, name });
+        self.mode = Mode::Prompt;
+    }
+
+    pub(super) fn do_set_chart_version(&mut self, ns: String, name: String, version: String) {
+        let Some(kind) = self.kind.clone() else {
+            return;
+        };
+        self.note_action(
+            format!("set chart version {version}"),
+            format!("{name} in {ns}"),
+        );
+        let claim = self.claim_status(format!("setting chart version: {name} → {version}…"));
+        let ok_message = format!("chart version set: {name} → {version}");
+        self.spawn_patch_action(
+            kind,
+            vec![(name, ns)],
+            Patch::Merge(chart_version_patch(&version)),
+            claim,
+            ok_message,
+            |_, _, e| format!("set chart version failed: {e}"),
+        );
     }
 
     pub(super) fn key_set_image(&mut self, key: KeyInput) {
@@ -1110,6 +1163,9 @@ impl App {
         ]);
         if let Some(c) = target {
             argv.push(format!("--target={c}"));
+        }
+        if let Some(p) = &self.debug.profile {
+            argv.push(format!("--profile={p}"));
         }
         // No configured command = an interactive shell (bash if the image has
         // it, else sh), mirroring the pod shell; otherwise the configured argv.
@@ -2232,6 +2288,10 @@ impl App {
                         let targets = self.action_targets();
                         self.do_flux_reconcile(targets, choice == Some("Force reconcile"));
                     }
+                    Some("Refresh" | "Hard refresh") => {
+                        let targets = self.action_targets();
+                        self.do_argocd_refresh(targets, choice == Some("Hard refresh"));
+                    }
                     Some("Sync now") => {
                         let targets = self.action_targets();
                         self.do_argocd_sync(targets, false);
@@ -2416,6 +2476,47 @@ impl App {
                     .await;
             }
         });
+    }
+
+    /// Ask the ArgoCD controller to re-compare Applications against Git. The
+    /// patch only requests a comparison, so it does not confirm; with
+    /// automated sync enabled, an OutOfSync result then syncs (and prunes, if
+    /// configured) as the next periodic reconcile would.
+    pub(super) fn do_argocd_refresh(&mut self, targets: Vec<(String, String)>, hard: bool) {
+        let Some(kind) = self.kind.clone() else {
+            return;
+        };
+        if targets.is_empty() {
+            return; // see `do_flux_suspend`
+        }
+        let now = k8s_openapi::jiff::Timestamp::now().to_string();
+        let (action, verb) = if hard {
+            ("hard refresh", "hard refreshing")
+        } else {
+            ("refresh", "refreshing")
+        };
+        let label = self.action_label(&targets);
+        self.note_action(action, label);
+        let progress = if targets.len() == 1 {
+            format!("{verb} {}…", targets[0].0)
+        } else {
+            format!("{verb} {} {}…", targets.len(), self.kind_plural)
+        };
+        let claim = self.claim_status(progress);
+        self.clear_marks();
+        let ok_message = if targets.len() == 1 {
+            format!("{action} requested: {}", targets[0].0)
+        } else {
+            format!("{action} requested: {} {}", targets.len(), self.kind_plural)
+        };
+        self.spawn_patch_action(
+            kind,
+            targets,
+            Patch::Merge(argocd_refresh_patch(hard, &now)),
+            claim,
+            ok_message,
+            move |name, _, e| format!("{action} {name} failed: {e}"),
+        );
     }
 
     /// Trigger an ArgoCD Application sync by patching the top-level `operation`

@@ -9,6 +9,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Gauge, HighlightSpacing, List, ListItem, ListState,
     Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, DEFAULT_SORT_LABEL, Mode, Pane, SuggestKind, TRANSFER_MENU_ITEMS};
@@ -819,22 +820,50 @@ fn header_logo_fits(frame_width: u16) -> bool {
     header_hints_fit(frame_width.saturating_sub(HEADER_LOGO_WIDTH))
 }
 
-/// Show the first effective binding for each action.
-fn key_hint(app: &App, scope: &str, actions: &[(Action, &str)]) -> String {
-    actions
-        .iter()
-        .map(|&(action, label)| {
-            let key = app.keymap.first_label(scope, action);
-            format!("{key}:{label}")
-        })
-        .collect::<Vec<_>>()
-        .join("  ")
+fn hint_key_style() -> Style {
+    Style::default()
+        .fg(theme::sky())
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Show the first effective binding for each action. Keys use the header hint
+/// style; labels take the style of the line they are rendered in.
+fn key_hint(app: &App, scope: &str, actions: &[(Action, &str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for &(action, label) in actions {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        let key = app.keymap.first_label(scope, action);
+        spans.push(Span::styled(key.to_string(), hint_key_style()));
+        spans.push(Span::raw(format!(":{label}")));
+    }
+    Line::from(spans)
+}
+
+/// A hint for keys that are not keymap actions. Each label carries its own
+/// leading punctuation, so the text reads exactly as written.
+fn literal_hint(pairs: &[(&str, &str)], separator: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    for &(key, label) in pairs {
+        if !spans.is_empty() {
+            spans.push(Span::raw(separator.to_owned()));
+        }
+        spans.push(Span::styled(key.to_owned(), hint_key_style()));
+        spans.push(Span::raw(label.to_owned()));
+    }
+    Line::from(spans)
+}
+
+/// Pad a hint with one space on each side, for use inside a border.
+fn spaced(mut line: Line<'static>) -> Line<'static> {
+    line.spans.insert(0, Span::raw(" "));
+    line.spans.push(Span::raw(" "));
+    line
 }
 
 fn hint_line(app: &App, pairs: &[(Action, &str)]) -> Line<'static> {
-    let key_style = Style::default()
-        .fg(theme::sky())
-        .add_modifier(Modifier::BOLD);
+    let key_style = hint_key_style();
     let mut spans = Vec::new();
     for (&(action, label), cell_width) in pairs.iter().zip(HEADER_HINT_COLUMNS) {
         let key = app.keymap.first_label("table", action);
@@ -1067,7 +1096,14 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
                     (Action::Describe, "describe"),
                 ],
             ),
-            hint_line(app, &[(Action::Edit, "edit"), (Action::Delete, "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Edit, "edit"),
+                    (Action::Delete, "delete"),
+                    (Action::NsResources, "resources"),
+                ],
+            ),
         ],
         "helm" => vec![
             hint_line(app, &[(Action::Open, "history")]),
@@ -1237,7 +1273,11 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
         lines.push(hint_line(app, &[(Action::ActionMenu, "suspend/sync")]));
     }
     if app.kind_plural == "helmreleases" {
-        lines.push(hint_line(app, &[(Action::Open, "helm history")]));
+        let mut pairs = vec![(Action::Open, "helm history")];
+        if app.flux_helmrelease_kind() {
+            pairs.push((Action::SetImage, "version"));
+        }
+        lines.push(hint_line(app, &pairs));
     }
     if app.cronjob_kind() {
         lines.push(hint_line(app, &[(Action::ActionMenu, "trigger/suspend")]));
@@ -2233,8 +2273,24 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         format!(" {}{} ", app.logs.view.title, flags)
     };
 
-    // The rows are already the exact viewport slice — no Paragraph scroll or
-    // wrap, so ratatui can't re-lay-out (and disagree with) the math above.
+    // The rows are already the exact viewport slice, so ratatui never wraps
+    // them (and can't disagree with the math above). The sideways offset is
+    // applied by cutting columns off each row, since `Paragraph::scroll` takes
+    // a `u16` and would cap how far a very long line can be scrolled.
+    let widest = rows.iter().map(Line::width).max().unwrap_or(0);
+    app.logs.max_hscroll = if wrap {
+        0
+    } else {
+        widest.saturating_sub(inner_w)
+    };
+    let hscroll = app.logs.view.hscroll.min(app.logs.max_hscroll);
+    app.logs.view.hscroll = hscroll;
+    if hscroll > 0 {
+        rows = rows
+            .into_iter()
+            .map(|line| skip_columns(line, hscroll))
+            .collect();
+    }
     let block = if fullscreen {
         // Borderless: `Block::inner` still reserves one row for the top title,
         // matching the fullscreen `inner_h` above.
@@ -2296,6 +2352,36 @@ pub(crate) fn wrapped_height(raw: &str, width: usize) -> usize {
         col += w;
     }
     rows
+}
+
+/// Drop the first `skip` display columns of a styled line, keeping the spans'
+/// styles. A wide glyph cut in half by the boundary becomes spaces so the
+/// remaining text stays aligned.
+fn skip_columns(line: Line<'_>, skip: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+    for span in line.spans {
+        let mut kept = String::new();
+        // Whole graphemes, measured like `Line::width` (which sets the scroll
+        // limit): a joined emoji such as 👩‍💻 is two columns, not four.
+        for g in span.content.graphemes(true) {
+            let w = UnicodeWidthStr::width(g);
+            if col >= skip {
+                kept.push_str(g);
+            } else if col + w > skip {
+                kept.push_str(&" ".repeat(col + w - skip));
+            }
+            col += w;
+        }
+        if !kept.is_empty() {
+            spans.push(Span::styled(kept, span.style));
+        }
+    }
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        ..Line::from(spans)
+    }
 }
 
 /// Greedily split a styled line into rows of at most `width` display columns,
@@ -3110,14 +3196,20 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
             "describe; experimental native backend: --experimental-describe or experimental.native_describe in config"
         } else if scope == "table" && action == Action::RestartOrRefresh {
             "restart workloads (marked rows, or current); force-sync external secrets; rollback Helm or rollout history; refresh elsewhere"
+        } else if scope == "table" && action == Action::SetImage {
+            "set container image; Flux HelmRelease: set chart version"
         } else if scope == "table" && action == Action::Logs {
             "logs (marked pods, or current row)"
         } else if scope == "table" && action == Action::ActionMenu {
-            "action menu: Flux suspend/resume/reconcile (includes HelmChart and flux-operator kinds; HelmRelease, ResourceSetInputProvider, FluxInstance: + force reconcile); Argo CD suspend/resume (Application: + sync, sync with prune); CronJobs trigger/suspend/resume; pods file transfer"
+            "action menu: Flux suspend/resume/reconcile (includes HelmChart and flux-operator kinds; HelmRelease, ResourceSetInputProvider, FluxInstance: + force reconcile); Argo CD suspend/resume (Application: + refresh, hard refresh, sync, sync with prune); CronJobs trigger/suspend/resume; pods file transfer"
         } else if scope == "port_forward_picker" && action == Action::Edit {
             "edit local port of the selected mapping"
         } else if scope == "logs" && action == Action::Lookback {
             "set lookback (s/m/h/d/w, e.g. 1h30m); kubelet logs also accept tail"
+        } else if scope == "logs" && action == Action::Left {
+            "scroll left (unwrapped lines)"
+        } else if scope == "logs" && action == Action::Right {
+            "scroll right (unwrapped lines)"
         } else if action == Action::LogMarker {
             "add visual marker at the log tail (excluded from copy/save)"
         } else if action == Action::Fullscreen {
@@ -3558,22 +3650,22 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     app.help_scroll = scroll;
     let title = &cache.title;
     let title = if max_scroll > 0 {
-        format!(
-            "{title} {} ",
-            key_hint(
-                app,
-                "help",
-                &[(Action::Down, "scroll"), (Action::Filter, "search")]
-            )
-        )
+        let mut hint = key_hint(
+            app,
+            "help",
+            &[(Action::Down, "scroll"), (Action::Filter, "search")],
+        );
+        hint.spans.insert(0, Span::raw(format!("{title} ")));
+        hint.spans.push(Span::raw(" "));
+        hint
     } else {
-        title.clone()
+        Line::from(title.clone())
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::border_focused())
-        .title(Span::styled(title, theme::title()));
+        .title(title.style(theme::title()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     for (y, line) in cache
@@ -4398,7 +4490,7 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         format!(" · {}", app.container_qos)
     };
     let title = format!(" Containers{qos} ");
-    let footer = key_hint(
+    let footer = spaced(key_hint(
         app,
         "containers",
         &[
@@ -4409,11 +4501,12 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
             (Action::Debug, "debug"),
             (Action::ProviderLogs, "provider"),
         ],
-    );
+    ))
+    .style(theme::dim());
     let desired_width = container_columns_width(&container_column_widths(app, usize::MAX)) + 4;
     let popup_w = desired_width
         .max(84)
-        .max(footer.width() + 4)
+        .max(footer.width() + 2)
         .min(usize::from(area.width)) as u16;
     let widths = container_column_widths(app, usize::from(popup_w.saturating_sub(4)));
     let details = container_detail_lines(app, usize::from(popup_w.saturating_sub(6)));
@@ -4446,7 +4539,7 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(theme::border_focused())
         .title(Span::styled(title, theme::title()))
-        .title_bottom(Line::from(Span::styled(format!(" {footer} "), theme::dim())).centered());
+        .title_bottom(footer.centered());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let [header_area, list_area, _, detail_area, _, trend_area] = Layout::vertical([
@@ -4684,11 +4777,17 @@ fn draw_drain(frame: &mut Frame, app: &mut App, area: Rect) {
                 },
             )
         }));
-        footer = if app.drain.done {
-            "Enter/Esc: close".to_string()
+        footer = vec![if app.drain.done {
+            literal_hint(&[("Enter/Esc", ": close")], "")
         } else {
-            "Esc/Ctrl-C: cancel. Accepted requests cannot be reversed.".to_string()
-        };
+            literal_hint(
+                &[(
+                    "Esc/Ctrl-C",
+                    ": cancel. Accepted requests cannot be reversed.",
+                )],
+                "",
+            )
+        }];
     } else {
         for (i, row) in app.drain.rows().into_iter().enumerate() {
             let selected = !review && app.drain.field == i;
@@ -4713,19 +4812,24 @@ fn draw_drain(frame: &mut Frame, app: &mut App, area: Rect) {
         ]);
         if review {
             footer = if app.mode == Mode::Prompt {
-                format!(
-                    "{}\n> {}█\nEnter: confirm   Esc: cancel",
-                    app.prompt_label, app.prompt_input
-                )
+                let mut footer: Vec<Line> =
+                    format!("{}\n> {}█", app.prompt_label, app.prompt_input)
+                        .lines()
+                        .map(|line| Line::from(line.to_owned()))
+                        .collect();
+                footer.push(literal_hint(
+                    &[("Enter", ": confirm"), ("Esc", ": cancel")],
+                    "   ",
+                ));
+                footer
             } else {
-                format!(
-                    "Confirm drain with these options?\n{}",
-                    confirm_action_hint(app, false)
-                )
+                vec![
+                    Line::from("Confirm drain with these options?"),
+                    confirm_action_hint(app, false),
+                ]
             };
         } else {
-            footer = format!(
-                "{}\nType to edit. Backspace: remove character. Ctrl-U: clear.",
+            footer = vec![
                 key_hint(
                     app,
                     "drain",
@@ -4734,10 +4838,11 @@ fn draw_drain(frame: &mut Frame, app: &mut App, area: Rect) {
                         (Action::Up, "previous"),
                         (Action::Toggle, "toggle"),
                         (Action::Accept, "review"),
-                        (Action::Back, "cancel")
-                    ]
-                )
-            );
+                        (Action::Back, "cancel"),
+                    ],
+                ),
+                Line::from("Type to edit. Backspace: remove character. Ctrl-U: clear."),
+            ];
         }
     }
     lines.push(Line::from(""));
@@ -4749,13 +4854,18 @@ fn draw_drain(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|target| Line::from(format!("  {target}"))),
     );
     let footer = if !review && !app.drain.started() && !app.drain.error.is_empty() {
-        format!("{}\n{footer}", app.drain.error)
+        app.drain
+            .error
+            .lines()
+            .map(|line| Line::from(line.to_owned()))
+            .chain(footer)
+            .collect()
     } else {
         footer
     };
     let footer_lines: Vec<_> = footer
-        .lines()
-        .flat_map(|line| wrap_line(Line::from(line.to_owned()), usize::from(inner.width).max(1)))
+        .into_iter()
+        .flat_map(|line| wrap_line(line, usize::from(inner.width).max(1)))
         .collect();
     let footer_height = footer_lines
         .len()
@@ -4815,9 +4925,19 @@ fn draw_text_popup(frame: &mut Frame, app: &mut App, input: bool) {
             "confirm",
             " Command failed ",
             if failure.target.is_some() {
-                "d Start debug container · esc/enter dismiss · PgUp/PgDn scroll".into()
+                literal_hint(
+                    &[
+                        ("d", " Start debug container"),
+                        ("esc/enter", " dismiss"),
+                        ("PgUp/PgDn", " scroll"),
+                    ],
+                    " · ",
+                )
             } else {
-                "esc/enter dismiss · PgUp/PgDn scroll".into()
+                literal_hint(
+                    &[("esc/enter", " dismiss"), ("PgUp/PgDn", " scroll")],
+                    " · ",
+                )
             },
         )
     } else if input {
@@ -4853,20 +4973,15 @@ fn draw_text_popup(frame: &mut Frame, app: &mut App, input: bool) {
         .into_iter()
         .flat_map(|line| wrap_line(line, width))
         .collect();
-    let mut footer = wrap_line(
-        Line::styled(hint, Style::default().fg(theme::yellow())),
-        width,
-    );
+    let mut footer = wrap_line(hint.style(Style::default().fg(theme::yellow())), width);
     if content.len() + footer.len() + 2 > usize::from(bounds.height) {
         footer.extend(wrap_line(
-            Line::styled(
-                key_hint(
-                    app,
-                    scope,
-                    &[(Action::PageUp, "up"), (Action::PageDown, "down")],
-                ),
-                theme::dim(),
-            ),
+            key_hint(
+                app,
+                scope,
+                &[(Action::PageUp, "up"), (Action::PageDown, "down")],
+            )
+            .style(theme::dim()),
             width,
         ));
     }
@@ -4998,20 +5113,18 @@ fn draw_plugin_form(frame: &mut Frame, app: &App) {
         }
     }
     let footer = wrap_line(
-        Line::styled(
-            key_hint(
-                app,
-                "plugin_form",
-                &[
-                    (Action::Down, "next"),
-                    (Action::Up, "previous"),
-                    (Action::Right, "change"),
-                    (Action::Accept, "run"),
-                    (Action::Back, "cancel"),
-                ],
-            ),
-            Style::default().fg(theme::yellow()),
-        ),
+        key_hint(
+            app,
+            "plugin_form",
+            &[
+                (Action::Down, "next"),
+                (Action::Up, "previous"),
+                (Action::Right, "change"),
+                (Action::Accept, "run"),
+                (Action::Back, "cancel"),
+            ],
+        )
+        .style(Style::default().fg(theme::yellow())),
         width,
     );
     let height = (content.len() + footer.len() + 3).min(usize::from(u16::MAX)) as u16;
@@ -5065,7 +5178,11 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
             (Action::Accept, "run"),
         ],
     );
-    let full_title = format!(" commands & resources ({keys}) ");
+    let mut full_title = keys.clone();
+    full_title
+        .spans
+        .insert(0, Span::raw(" commands & resources ("));
+    full_title.spans.push(Span::raw(") "));
     let w = area
         .width
         .saturating_sub(4)
@@ -5073,12 +5190,12 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
     let title_width = usize::from(w.saturating_sub(2));
     let hint = [
         full_title,
-        format!(" {keys} "),
-        format!(" {} ", key_hint(app, "command", &[(Action::Accept, "run")])),
+        spaced(keys),
+        spaced(key_hint(app, "command", &[(Action::Accept, "run")])),
     ]
     .into_iter()
     .find(|title| title.width() <= title_width)
-    .unwrap_or_else(|| clip_to_width(" commands ", title_width));
+    .unwrap_or_else(|| Line::from(clip_to_width(" commands ", title_width)));
     let items: Vec<Text> = app
         .cmd_suggestions
         .iter()
@@ -5140,7 +5257,7 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
         show_scrollbars,
         rect,
         items,
-        Span::styled(hint, theme::title()),
+        hint.style(theme::title()),
         &mut state,
     );
 }
@@ -5888,19 +6005,27 @@ fn counts_tile(frame: &mut Frame, area: Rect, p: &crate::store::Pulse) {
     );
 }
 
-fn navigation_hint(app: &App, width: u16) -> String {
+fn navigation_hint(app: &App, width: u16) -> Line<'static> {
     let scope = app.key_scope();
     if scope == "table" {
-        let cycle = format!(
-            "{}/{}: {}",
-            app.keymap.first_label(scope, Action::NextView),
-            app.keymap.first_label(scope, Action::PreviousView),
-            if app.active_workspace.is_some() {
-                "workspace"
+        let cycle = [
+            Span::styled(
+                app.keymap.first_label(scope, Action::NextView).to_string(),
+                hint_key_style(),
+            ),
+            Span::raw("/"),
+            Span::styled(
+                app.keymap
+                    .first_label(scope, Action::PreviousView)
+                    .to_string(),
+                hint_key_style(),
+            ),
+            Span::raw(if app.active_workspace.is_some() {
+                ": workspace  "
             } else {
-                "resources"
-            }
-        );
+                ": resources  "
+            }),
+        ];
         let mut actions = vec![
             (Action::Command, "command"),
             (Action::Help, "help"),
@@ -5921,7 +6046,9 @@ fn navigation_hint(app: &App, width: u16) -> String {
             (Action::Mark, "mark"),
             (Action::Back, "back"),
         ]);
-        return format!("{cycle}  {}", key_hint(app, scope, &actions));
+        let mut hint = key_hint(app, scope, &actions);
+        hint.spans.splice(0..0, cycle);
+        return hint;
     }
     if scope == "port_forward_picker" {
         return key_hint(
@@ -6103,14 +6230,9 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled("█", Style::default().fg(theme::teal())),
             ])
         }
-        Mode::Confirm => Line::from(Span::styled(
-            confirm_action_hint(app, app.confirm_allows_force_toggle()),
-            Style::default().fg(theme::yellow()),
-        )),
-        _ => Line::from(Span::styled(
-            navigation_hint(app, frame.area().width),
-            theme::dim(),
-        )),
+        Mode::Confirm => confirm_action_hint(app, app.confirm_allows_force_toggle())
+            .style(Style::default().fg(theme::yellow())),
+        _ => navigation_hint(app, frame.area().width).style(theme::dim()),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -6172,7 +6294,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn confirm_action_hint(app: &App, allows_force: bool) -> String {
+fn confirm_action_hint(app: &App, allows_force: bool) -> Line<'static> {
     let mut actions = vec![(Action::Accept, "confirm"), (Action::Back, "cancel")];
     if allows_force {
         actions.extend([
@@ -6500,6 +6622,22 @@ fn centered_rect_with_min(
 mod tests {
     use super::*;
 
+    #[test]
+    fn skip_columns_keeps_styles_and_pads_split_wide_glyphs() {
+        let red = Style::default().fg(Color::Red);
+        let line = Line::from(vec![Span::styled("ab", red), Span::raw("日本c")]);
+        let cut = skip_columns(line.clone(), 3);
+        assert_eq!(cut.to_string(), " 本c");
+        assert_eq!(cut.spans.len(), 1);
+        assert_eq!(skip_columns(line.clone(), 1).spans[0].style, red);
+        assert_eq!(skip_columns(line, 99).width(), 0);
+
+        let joined = Line::from("👩‍💻xEND");
+        assert_eq!(joined.width(), 6);
+        assert_eq!(skip_columns(joined.clone(), 2).to_string(), "xEND");
+        assert_eq!(skip_columns(joined, 1).to_string(), " xEND");
+    }
+
     /// The PVC browser pads file names into a fixed column. A CJK name is
     /// twice as wide as it is long, so counting characters would push the size
     /// column through the pane border.
@@ -6549,7 +6687,8 @@ mod tests {
                     (Action::Complete, "fill"),
                     (Action::Accept, "run"),
                 ],
-            );
+            )
+            .to_string();
             for (width, expected) in [
                 (100, format!(" commands & resources ({keys}) ")),
                 (60, format!(" {keys} ")),
@@ -7057,10 +7196,26 @@ mod tests {
     async fn confirm_hint_mentions_force_only_when_supported() {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let app = App::new(crate::k8s::Cluster::fake(), tx);
-        assert!(confirm_action_hint(&app, true).contains("toggle force"));
-        assert!(!confirm_action_hint(&app, false).contains("toggle force"));
-        assert!(confirm_action_hint(&app, true).contains("cascade"));
-        assert!(!confirm_action_hint(&app, false).contains("cascade"));
+        assert!(
+            confirm_action_hint(&app, true)
+                .to_string()
+                .contains("toggle force")
+        );
+        assert!(
+            !confirm_action_hint(&app, false)
+                .to_string()
+                .contains("toggle force")
+        );
+        assert!(
+            confirm_action_hint(&app, true)
+                .to_string()
+                .contains("cascade")
+        );
+        assert!(
+            !confirm_action_hint(&app, false)
+                .to_string()
+                .contains("cascade")
+        );
     }
 
     /// `⏎` on an Argo CD row opens the Argo CD view, so the hint must not
@@ -7074,6 +7229,26 @@ mod tests {
         let text = text.join("\n");
         assert!(text.contains("argo view"), "{text}");
         assert_eq!(text.matches("yaml").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn helmrelease_rows_hint_the_chart_version_key() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+        app.switch_kind("helmreleases");
+        let text: Vec<String> = header_hints(&app).iter().map(line_text).collect();
+        let text = text.join("\n");
+        assert!(text.contains("i version"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn namespace_rows_hint_the_ns_resources_key() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+        app.switch_kind("namespaces");
+        let text: Vec<String> = header_hints(&app).iter().map(line_text).collect();
+        let text = text.join("\n");
+        assert!(text.contains("R resources"), "{text}");
     }
 
     #[tokio::test]

@@ -101,15 +101,18 @@ coverage alone does not show whether a test checks the correct behavior.
 
 ## Release
 
-After merging the release-ready changes to `main`, run one of:
+After merging the release-ready changes to `main`, run:
 
 ```sh
-just release-patch
-just release-minor
-just release-major
+just release
 ```
 
-The recipe switches to a clean, up-to-date `main`, bumps `Cargo.toml` and
-`Cargo.lock`, commits and pushes the version bump, then creates the GitHub
-Release. The release workflow runs off that published release: it uploads the
-platform binaries, publishes to crates.io, and warms the Nix cache.
+The recipe fast-forwards `main`, runs `cargo check` and `cargo test`, then
+`vesnik release --yes`. vesnik picks the version from the commits, bumps
+`Cargo.toml` and `Cargo.lock`, writes `CHANGELOG.md`, commits and pushes the
+version bump, then creates the GitHub Release. The release workflow runs off
+that published release: it uploads the platform binaries, publishes to
+crates.io, and warms the Nix cache.
+
+`vesnik` is not in the dev shell. Install it from `github:nklmilojevic/vesnik`
+and log in to the `claude` CLI, which writes the release notes.

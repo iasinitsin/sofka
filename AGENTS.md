@@ -93,7 +93,9 @@ update. Regenerate the lockfile with Cargo and commit it with the manifest chang
 
 ## Releases
 
-Releases are cut from a clean `main` with `just release patch|minor|major`. The
-recipe bumps `Cargo.toml` and `Cargo.lock`, pushes, and creates the GitHub
-Release; the release workflow builds the binaries, publishes to crates.io, and
-warms the Nix cache. Never bump the version in a feature PR.
+Releases are cut from `main` with `just release`. The recipe fast-forwards
+`main`, runs `cargo check` and `cargo test`, then `vesnik release --yes`, which
+picks the bump from the commits, bumps `Cargo.toml` and `Cargo.lock`, writes
+`CHANGELOG.md`, commits, tags, pushes, and creates the GitHub Release; the
+release workflow builds the binaries, publishes to crates.io, and warms the Nix
+cache. Never bump the version in a feature PR.
