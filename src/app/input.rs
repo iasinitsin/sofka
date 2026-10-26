@@ -401,8 +401,7 @@ impl App {
         // kinds; with none bound it still runs and says where it applies.
         if key
             .action
-            .and_then(Action::kinds)
-            .is_some_and(|kinds| !kinds.contains(&self.kind_plural.as_str()))
+            .is_some_and(|action| action.kinds().is_some() && !self.action_applies(action))
             && (self.try_bookmark_key(key.event())
                 || self.try_workspace_key(key.event())
                 || self.try_plugin_key(key.event()))
@@ -1598,6 +1597,7 @@ impl App {
             // k9s: `w` toggles line wrap.
             (Some(Action::Wrap), _) => {
                 self.logs.wrap = !self.logs.wrap;
+                self.logs.view.hscroll = 0;
                 self.flash = format!("wrap: {}", if self.logs.wrap { "on" } else { "off" });
                 self.flash_err = false;
                 return;
@@ -1715,6 +1715,12 @@ impl App {
             (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => {
                 self.logs.follow = false;
                 self.logs.view.scroll = cur.saturating_sub(a.page_size(page));
+            }
+            (Some(Action::Left), _) => {
+                self.logs.view.hscroll = self.logs.view.hscroll.saturating_sub(5);
+            }
+            (Some(Action::Right), _) => {
+                self.logs.view.hscroll = (self.logs.view.hscroll + 5).min(self.logs.max_hscroll);
             }
             (Some(Action::First), _) => {
                 self.logs.follow = false;

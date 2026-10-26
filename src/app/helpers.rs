@@ -19,6 +19,10 @@ pub(super) fn set_image_patch(plural: &str, container: &str, image: &str) -> Val
     }
 }
 
+pub(super) fn chart_version_patch(version: &str) -> Value {
+    json!({ "spec": { "chart": { "spec": { "version": version } } } })
+}
+
 pub(super) fn scale_patch(replicas: i32) -> Value {
     json!({ "spec": { "replicas": replicas } })
 }
@@ -160,6 +164,21 @@ pub(super) fn argocd_appset_suspend_patch(obj: &DynamicObject, suspend: bool) ->
 /// while a pruning operation is still pending would otherwise prune too.
 pub(super) fn argocd_sync_patch(prune: bool) -> Value {
     json!({ "operation": { "sync": { "prune": prune } } })
+}
+
+/// ArgoCD refresh patch, the same annotations Argo CD's own `RefreshApp`
+/// writes. The application controller re-compares the Application against Git
+/// when it sees `argocd.argoproj.io/refresh` (`normal` or `hard`; `hard` also
+/// invalidates the repo-server manifest cache), then removes it. It removes
+/// `refresh-timestamp` only while it still holds the value it read, so a
+/// refresh sent during a reconcile is not dropped; controllers that predate
+/// the timestamp ignore it.
+pub(super) fn argocd_refresh_patch(hard: bool, now: &str) -> Value {
+    let level = if hard { "hard" } else { "normal" };
+    json!({ "metadata": { "annotations": {
+        "argocd.argoproj.io/refresh": level,
+        "argocd.argoproj.io/refresh-timestamp": now,
+    } } })
 }
 
 pub(super) fn external_secret_refresh_patch(force_sync: &str) -> Value {
@@ -558,6 +577,21 @@ pub(super) fn xray_pool_plurals(root_kind: &str) -> &'static [&'static str] {
 }
 
 impl App {
+    pub fn flux_helmrelease_kind(&self) -> bool {
+        self.kind.as_ref().is_some_and(|kind| {
+            kind.ar.group == "helm.toolkit.fluxcd.io" && kind.ar.plural == "helmreleases"
+        })
+    }
+
+    /// Whether a kind-specific action applies to the current kind. Plurals are
+    /// not unique across API groups, so `helmreleases` only counts for Flux.
+    pub(super) fn action_applies(&self, action: Action) -> bool {
+        action.kinds().is_some_and(|kinds| {
+            kinds.contains(&self.kind_plural.as_str())
+                && (self.kind_plural != "helmreleases" || self.flux_helmrelease_kind())
+        })
+    }
+
     /// Whether the current kind supports the Flux suspend/resume menu (`t`).
     pub fn flux_suspendable(&self) -> bool {
         self.kind.as_ref().is_some_and(|kind| {

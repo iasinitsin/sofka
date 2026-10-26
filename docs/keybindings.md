@@ -516,9 +516,11 @@ for those operations.
 | `half_page_down` | unbound             |
 | `half_page_up`   | unbound             |
 | `last`           | `G`, `end`          |
+| `left`           | `h`, `left`         |
 | `lookback`       | `T`                 |
 | `page_down`      | `pagedown`, `space` |
 | `page_up`        | `pageup`            |
+| `right`          | `l`, `right`        |
 | `save`           | `ctrl-s`            |
 | `stream`         | `x`                 |
 | `json`           | `J`                 |

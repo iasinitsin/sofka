@@ -24,6 +24,7 @@ mod plugin_form;
 mod popup_wrapping;
 mod proxy;
 mod rbac;
+mod rediscovery;
 mod restart;
 mod resume;
 mod rollout;
@@ -4285,8 +4286,14 @@ async fn jump_owner_uses_owner_scope_and_restores_child_view() {
         for (api_version, owner_kind, owner_plural, expected_namespace) in [
             ("v1", "Node", "nodes", ""),
             ("apps/v1", "Deployment", "deployments", "kube-system"),
+            // A CRD sharing the core `Service` kind name, as discovery leaves
+            // the bare `service` key to the core group.
+            ("example.com/v1", "Service", "services", "kube-system"),
         ] {
             let (mut app, _rx) = test_app();
+            app.cluster
+                .register_kind("example.com", "Service", "services", true);
+            app.cluster.register_kind("", "Service", "services", true);
             app.switch_kind_ns("pods", Some(source_namespace));
             apply(
                 &mut app,
@@ -4311,6 +4318,7 @@ async fn jump_owner_uses_owner_scope_and_restores_child_view() {
             });
             app.handle_key(press(KeyCode::Char('J'))).unwrap();
             assert_eq!(app.kind_plural, owner_plural);
+            assert_eq!(app.kind.as_ref().unwrap().ar.api_version, api_version);
             assert_eq!(app.namespace, expected_namespace);
             assert_eq!(
                 app.watch_key.as_ref().unwrap().namespace,
@@ -7787,6 +7795,77 @@ async fn argocd_menu_sync_now_patches_without_prune() {
         log[0]["body"],
         json!({"operation": {"sync": {"prune": false}}})
     );
+}
+
+#[tokio::test]
+async fn argocd_menu_refresh_sets_annotation_without_confirming() {
+    let (mut app, mut rx, log) = argocd_patch_app(&["guestbook"]);
+
+    open_argocd_menu_item(&mut app, "Refresh");
+    assert_eq!(app.mode, Mode::Table, "a refresh does not confirm");
+    assert!(app.flash.contains("refreshing guestbook"), "{}", app.flash);
+    drain_until(&mut app, &mut rx, |app| {
+        app.flash.contains("refresh requested: guestbook")
+    })
+    .await;
+    assert!(!app.flash_err, "{}", app.flash);
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), 1);
+    assert!(
+        log[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/namespaces/argocd/applications/guestbook"),
+        "{}",
+        log[0]["path"]
+    );
+    let annotations = &log[0]["body"]["metadata"]["annotations"];
+    assert_eq!(annotations["argocd.argoproj.io/refresh"], "normal");
+    assert!(
+        annotations["argocd.argoproj.io/refresh-timestamp"]
+            .as_str()
+            .unwrap()
+            .parse::<k8s_openapi::jiff::Timestamp>()
+            .is_ok(),
+        "{annotations}"
+    );
+    assert_eq!(annotations.as_object().unwrap().len(), 2, "{annotations}");
+    assert!(app.journal.lines().iter().any(|l| l.contains("refresh")));
+}
+
+#[tokio::test]
+async fn argocd_hard_refresh_patches_every_marked_application() {
+    let (mut app, mut rx, log) = argocd_patch_app(&["guestbook", "frontend", "backend"]);
+    app.marked.insert("argocd/guestbook".into());
+    app.marked.insert("argocd/frontend".into());
+
+    open_argocd_menu_item(&mut app, "Hard refresh");
+    assert_eq!(app.mode, Mode::Table);
+    assert!(
+        app.flash.contains("hard refreshing 2 applications"),
+        "{}",
+        app.flash
+    );
+    drain_until(&mut app, &mut rx, |app| {
+        app.flash.contains("hard refresh requested: 2 applications")
+    })
+    .await;
+    assert!(!app.flash_err, "{}", app.flash);
+    let log = log.lock().unwrap();
+    let mut paths: Vec<&str> = log.iter().map(|e| e["path"].as_str().unwrap()).collect();
+    paths.sort();
+    assert_eq!(paths.len(), 2);
+    assert!(paths[0].ends_with("/applications/frontend"), "{paths:?}");
+    assert!(paths[1].ends_with("/applications/guestbook"), "{paths:?}");
+    for entry in log.iter() {
+        let annotations = &entry["body"]["metadata"]["annotations"];
+        assert_eq!(annotations["argocd.argoproj.io/refresh"], "hard");
+        assert!(
+            annotations["argocd.argoproj.io/refresh-timestamp"].is_string(),
+            "{annotations}"
+        );
+    }
+    assert!(app.marked.is_empty());
 }
 
 #[tokio::test]
@@ -11784,6 +11863,59 @@ async fn bundle_logs_follow_the_default_container_annotation() {
     }
 }
 
+#[tokio::test]
+async fn bundle_fetches_the_owner_from_its_own_api_group() {
+    let (mut app, mut rx) = app_with_pod();
+    app.cluster
+        .register_kind("example.com", "Service", "services", true);
+    // Discovery leaves the bare `service` key to the core group.
+    app.cluster.register_kind("", "Service", "services", true);
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"a", "namespace":"default", "ownerReferences":[{
+            "apiVersion":"example.com/v1", "kind":"Service",
+            "name":"parent", "uid":"parent-uid"}]}}),
+    );
+    let (seen, paths) = std::sync::mpsc::channel();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let _ = seen.send(request.uri().path().to_owned());
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(404)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            json!({"kind": "Status", "apiVersion": "v1",
+                            "status": "Failure", "reason": "NotFound", "code": 404})
+                            .to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    for key in ":bundle".chars() {
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !matches!(rx.recv().await, Some(Msg::Bundle { .. }) | None) {}
+    })
+    .await
+    .expect("bundle must finish");
+    let paths: Vec<String> = paths.try_iter().collect();
+    assert!(
+        paths.contains(&"/apis/example.com/v1/namespaces/default/services/parent".into()),
+        "{paths:?}"
+    );
+    assert!(
+        !paths.contains(&"/api/v1/namespaces/default/services/parent".into()),
+        "{paths:?}"
+    );
+}
+
 /// A pod client whose log endpoint answers `from-<container>` and records
 /// the container each log request asked for.
 fn container_log_client(pod: Value, requested: Arc<std::sync::Mutex<Vec<String>>>) -> kube::Client {
@@ -13774,6 +13906,91 @@ async fn enter_on_helmrelease_opens_helm_history() {
     assert_eq!(app.kind_plural, "helmreleases");
 }
 
+fn helmrelease_app(spec: serde_json::Value) -> (App, tokio::sync::mpsc::Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    app.switch_kind("helmreleases");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "helm.toolkit.fluxcd.io/v2", "kind": "HelmRelease",
+            "metadata": {"name": "podinfo", "namespace": "flux-system"},
+            "spec": spec
+        }),
+    );
+    app.table_state.select(Some(0));
+    (app, rx)
+}
+
+#[tokio::test]
+async fn set_image_key_on_helmrelease_rejects_an_empty_version() {
+    let (mut app, _rx) = helmrelease_app(json!({"chart": {"spec": {"chart": "podinfo"}}}));
+    app.handle_key(press(KeyCode::Char('i'))).unwrap();
+    assert_eq!(app.mode, Mode::Prompt);
+    assert_eq!(app.prompt_input, "");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.flash, "no chart version given");
+    assert!(app.flash_err);
+}
+
+#[tokio::test]
+async fn set_image_key_on_helmrelease_with_chart_ref_points_at_the_source() {
+    let (mut app, _rx) = helmrelease_app(json!({
+        "chartRef": {"kind": "OCIRepository", "name": "podinfo"}
+    }));
+    app.handle_key(press(KeyCode::Char('i'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.prompt_kind.is_none());
+    assert_eq!(
+        app.flash,
+        "chart version comes from the source in spec.chartRef - set it there"
+    );
+    assert!(app.flash_err);
+}
+
+#[tokio::test]
+async fn set_image_key_ignores_helmreleases_outside_flux() {
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("example.com", "HelmRelease", "helmreleases", true);
+    app.switch_kind("helmreleases");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "example.com/v1", "kind": "HelmRelease",
+            "metadata": {"name": "podinfo", "namespace": "default"},
+            "spec": {"chart": {"spec": {"version": "1.0.0"}}}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('i'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.prompt_kind.is_none());
+    assert!(app.flash.contains("Flux HelmReleases"), "{}", app.flash);
+
+    app.plugins = vec![crate::config::Plugin {
+        name: "release-cmd".into(),
+        key: "i".into(),
+        command: "true".into(),
+        scopes: vec!["helmreleases".into()],
+        mutating: Some(false),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('i'))).unwrap();
+    assert!(matches!(app.pending, Some(Suspend::Shell(_))));
+    assert!(app.prompt_kind.is_none());
+}
+
+#[tokio::test]
+async fn set_image_key_on_helmrelease_is_refused_in_read_only_mode() {
+    let (mut app, _rx) = helmrelease_app(json!({
+        "chart": {"spec": {"chart": "podinfo", "version": "6.5.0"}}
+    }));
+    app.readonly = true;
+    app.handle_key(press(KeyCode::Char('i'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.flash, "read-only mode — action disabled");
+}
+
 #[tokio::test]
 async fn helm_list_shows_only_latest_revision_per_release() {
     let (mut app, _rx) = test_app();
@@ -14913,6 +15130,10 @@ async fn debug_prompt_prefills_image_then_shells_out_to_kubectl_debug() {
         !argv.iter().any(|a| a.starts_with("--target")),
         "no target when launched from the pod row: {argv:?}"
     );
+    assert!(
+        !argv.iter().any(|a| a.starts_with("--profile")),
+        "no profile unless configured: {argv:?}"
+    );
     // Recorded in the journal as a debug action.
     assert!(app.journal.lines().iter().any(|l| l.contains("debug")));
 }
@@ -14931,6 +15152,38 @@ async fn debug_from_container_picker_pins_target() {
         panic!("expected a debug shell");
     };
     assert!(argv.iter().any(|a| a == "--target=app"), "{argv:?}");
+}
+
+#[tokio::test]
+async fn configured_debug_profile_reaches_prompt_and_recovery_launches() {
+    let (mut app, _rx) = app_with_pod();
+    app.debug = crate::config::DebugConfig {
+        profile: Some("restricted".into()),
+        node_profile: Some("sysadmin".into()),
+        ..Default::default()
+    };
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "debug".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(matches!(app.prompt_kind, Some(PromptKind::Debug { .. })));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("debug should suspend into a kubectl debug shell");
+    };
+    assert!(argv.iter().any(|a| a == "--profile=restricted"), "{argv:?}");
+    assert!(!argv.iter().any(|a| a == "--profile=sysadmin"), "{argv:?}");
+
+    // The `d` recovery from a failed shell launches through the same path.
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    complete_failed_shell(&mut app, MISSING_SHELL);
+    app.handle_key(press(KeyCode::Char('d'))).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let Some(Suspend::Recovery { argv, .. }) = app.pending.take() else {
+        panic!("recovery should launch kubectl debug");
+    };
+    assert!(argv.iter().any(|a| a == "--profile=restricted"), "{argv:?}");
 }
 
 /// A one-node table with the cursor on it.
@@ -17721,6 +17974,7 @@ async fn user_view_wins_over_printer_columns() {
                 condition_match: crate::views::ConditionMatch::Type,
                 condition_field: None,
                 default: None,
+                regex: None,
             }],
             ..Default::default()
         })),
@@ -21034,6 +21288,71 @@ async fn kubelet_lookback_prompt_cancel_and_invalid_input_keep_stream() {
             assert!(app.flash.contains("lookback"));
         }
     }
+}
+
+#[tokio::test]
+async fn logs_arrow_keys_scroll_long_unwrapped_lines_sideways() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    app.return_mode = Mode::Table;
+    use ratatui::{Terminal, backend::TestBackend};
+    let long = format!("{}END", "x".repeat(100));
+    app.handle_msg(Msg::LogLines {
+        generation: app.log_gen,
+        lines: vec![long],
+    });
+    let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    let screen = |term: &Terminal<TestBackend>| format!("{:?}", term.backend().buffer());
+
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(!screen(&term).contains("END"));
+
+    for _ in 0..30 {
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    }
+    assert!(
+        screen(&term).contains("END"),
+        "hs={} max={}\n{}",
+        app.logs.view.hscroll,
+        app.logs.max_hscroll,
+        screen(&term)
+    );
+    assert_eq!(
+        app.logs.view.hscroll, app.logs.max_hscroll,
+        "clamped at the end"
+    );
+
+    app.handle_key(press(KeyCode::Left)).unwrap();
+    assert_eq!(app.logs.view.hscroll, app.logs.max_hscroll - 5);
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(
+        app.logs.view.hscroll, 0,
+        "wrap snaps back to the left margin"
+    );
+}
+
+#[tokio::test]
+async fn logs_sideways_scroll_reaches_the_end_of_a_line_past_u16_columns() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    app.return_mode = Mode::Table;
+    app.handle_msg(Msg::LogLines {
+        generation: app.log_gen,
+        lines: vec![format!("{}SUFFIX", "x".repeat(70_000))],
+    });
+    let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(app.logs.max_hscroll > usize::from(u16::MAX));
+
+    for _ in 0..app.logs.max_hscroll / 5 + 1 {
+        app.handle_key(press(KeyCode::Right)).unwrap();
+    }
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.logs.view.hscroll, app.logs.max_hscroll);
+    assert!(format!("{:?}", term.backend().buffer()).contains("SUFFIX"));
 }
 
 #[tokio::test]
@@ -34117,6 +34436,59 @@ async fn image_tag_columns_render_selected_paths_and_filter_by_tag() {
     assert!(rows.iter().all(|row| row[2] == "1.2.3"));
 }
 
+#[tokio::test]
+async fn regex_columns_show_the_extracted_value_and_filter_by_it() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "NODEGROUP", path = "/metadata/labels/eks.amazonaws.com~1nodegroup", regex = '^(.*)-[0-9]{18}[0-9a-f]{8}$' },
+            { name = "OS", path = "/status/nodeInfo/osImage", regex = '^(.*?) \(', default = "none (yet)" },
+            { name = "PODS", path = ["/spec/missing", "/spec/pods"], type = "number", regex = '[0-9]+' },
+            { name = "OPTIONAL", path = "/spec/pods", regex = '^(x)?[0-9]' },
+        ]
+        "#,
+    );
+    palette(&mut app, "nodes");
+    for (name, nodegroup, os, pods) in [
+        (
+            "a",
+            "default-a-20250314092215118700000003",
+            Some("Bottlerocket OS 1.66.0 (aws-k8s-1.36)"),
+            "12 pods",
+        ),
+        ("b", "system-b-2025031409221512340000000c", None, "3 pods"),
+        ("c", "manual", Some("Ubuntu 24.04"), "none"),
+    ] {
+        let mut node = json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": name, "labels": {"eks.amazonaws.com/nodegroup": nodegroup}},
+            "spec": {"pods": pods},
+        });
+        if let Some(os) = os {
+            node["status"] = json!({"nodeInfo": {"osImage": os}});
+        }
+        apply(&mut app, node);
+    }
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(headers, ["NAME", "NODEGROUP", "OS", "PODS", "OPTIONAL"]);
+    assert_eq!(
+        rows[0],
+        ["a", "default-a", "Bottlerocket OS 1.66.0", "12", "12 pods"]
+    );
+    assert_eq!(rows[1], ["b", "system-b", "none (yet)", "3", "3 pods"]);
+    assert_eq!(rows[2], ["c", "manual", "Ubuntu 24.04", "none", "none"]);
+    type_filter(&mut app, "pods>5");
+    assert_eq!(row_names(&app), ["a"]);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    type_filter(&mut app, "nodegroup=system-b");
+    assert_eq!(row_names(&app), ["b"]);
+}
+
 const PAGING_KEYS: &str = r#"
 [keys.navigation]
 page_up = ["pageup", "ctrl-b", "ctrl-u"]
@@ -42450,4 +42822,115 @@ async fn reload_rejects_skin_hex_with_more_than_one_prefix() {
         crate::theme::builtin("catppuccin-mocha").unwrap().red
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn hint_cells(app: &mut App, width: u16, height: u16, hint: &str) -> Vec<ratatui::buffer::Cell> {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let len = hint.chars().count() as u16;
+    (0..height)
+        .flat_map(|y| (0..=width.saturating_sub(len)).map(move |x| (x, y)))
+        .find(|&(x, y)| {
+            (0..len)
+                .map(|i| buffer[(x + i, y)].symbol())
+                .collect::<String>()
+                == hint
+        })
+        .map(|(x, y)| (0..len).map(|i| buffer[(x + i, y)].clone()).collect())
+        .unwrap_or_else(|| panic!("{hint:?} not rendered"))
+}
+
+fn assert_hint_key(cell: &ratatui::buffer::Cell) {
+    assert_eq!(cell.fg, crate::theme::sky(), "{cell:?}");
+    assert!(
+        cell.modifier.contains(ratatui::style::Modifier::BOLD),
+        "{cell:?}"
+    );
+}
+
+#[tokio::test]
+async fn status_bar_and_popup_footer_style_hint_keys() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(&mut app, container_details_pod());
+    let command = hint_cells(&mut app, 200, 30, "::command");
+    assert_hint_key(&command[0]);
+    for label in &command[1..] {
+        assert_eq!(label.fg, crate::theme::dim().fg.unwrap(), "{label:?}");
+        assert!(
+            !label.modifier.contains(ratatui::style::Modifier::BOLD),
+            "{label:?}"
+        );
+    }
+
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Containers);
+    let key = app
+        .keymap
+        .first_label("containers", Action::PreviousLogs)
+        .to_string();
+    let previous = hint_cells(&mut app, 200, 30, &format!("{key}:previous"));
+    let key_width = key.chars().count();
+    previous[..key_width].iter().for_each(assert_hint_key);
+    for label in &previous[key_width..] {
+        assert_eq!(label.fg, crate::theme::dim().fg.unwrap(), "{label:?}");
+    }
+}
+
+fn assert_literal_hint(app: &mut App, hint: &str, keys: &[&str]) {
+    let cells = hint_cells(app, 200, 40, hint);
+    let mut styled = vec![false; cells.len()];
+    for key in keys {
+        let at = hint
+            .find(key)
+            .unwrap_or_else(|| panic!("{key:?} not in {hint:?}"));
+        let start = hint[..at].chars().count();
+        styled[start..start + key.chars().count()].fill(true);
+    }
+    for (cell, key) in cells.iter().zip(styled) {
+        if key {
+            assert_hint_key(cell);
+        } else {
+            assert!(
+                !cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                "{hint:?}: {cell:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn drain_footers_style_their_keys() {
+    let (mut app, mut rx, _api) = drain_app(DrainApiState::default());
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["drain".into()],
+        confirmation: Some("type-resource-name".into()),
+        ..Default::default()
+    }];
+    drain_open(&mut app);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_literal_hint(&mut app, "Enter: confirm   Esc: cancel", &["Enter", "Esc"]);
+    for c in "node-a".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+    assert_literal_hint(&mut app, "Enter/Esc: close", &["Enter/Esc"]);
+}
+
+#[tokio::test]
+async fn command_failure_footer_styles_its_keys() {
+    let (mut app, _rx) = app_with_pod();
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    complete_failed_shell(&mut app, MISSING_SHELL);
+    app.expire_flash();
+    assert!(app.command_failure_visible());
+    assert_literal_hint(
+        &mut app,
+        "d Start debug container · esc/enter dismiss · PgUp/PgDn scroll",
+        &["d", "esc/enter", "PgUp/PgDn"],
+    );
 }

@@ -1,4 +1,4 @@
-{ lib, craneLib, cmake }:
+{ lib, stdenv, craneLib, cmake, installShellFiles }:
 
 let
   cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
@@ -32,6 +32,16 @@ craneLib.buildPackage (
   commonArgs
     // {
     inherit cargoArtifacts;
+
+    # Kept out of commonArgs so the cached dependency build is unchanged.
+    nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ installShellFiles ];
+
+    postInstall = lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
+      installShellCompletion --cmd sofka \
+        --bash <($out/bin/sofka completion bash) \
+        --fish <($out/bin/sofka completion fish) \
+        --zsh <($out/bin/sofka completion zsh)
+    '';
 
     meta = {
       description = "A Kubernetes TUI, reimagined in Rust";
