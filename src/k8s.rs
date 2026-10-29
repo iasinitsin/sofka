@@ -644,6 +644,9 @@ pub enum WatchProbe {
         synced: Option<Duration>,
         /// Objects in the initial list.
         objects: usize,
+        /// RBAC refused the watch, so the view would poll with a list
+        /// every [`POLL_INTERVAL`] instead.
+        polling: bool,
         errors: usize,
         last_error: Option<String>,
     },
@@ -1086,6 +1089,22 @@ impl Cluster {
             .map_err(|e| format!("reading kubeconfig: {e}"))
     }
 
+    /// Kubeconfig contexts paired with their cluster names (empty when a
+    /// context names none), from one kubeconfig read.
+    pub fn list_context_clusters() -> Result<Vec<(String, String)>, String> {
+        Kubeconfig::read()
+            .map(|k| {
+                k.contexts
+                    .into_iter()
+                    .map(|c| {
+                        let cluster = c.context.map(|ctx| ctx.cluster).unwrap_or_default();
+                        (c.name, cluster)
+                    })
+                    .collect()
+            })
+            .map_err(|e| format!("reading kubeconfig: {e}"))
+    }
+
     /// The kubeconfig context served by `server`, if any.
     ///
     /// Argo CD records a destination as the API-server URL of the target
@@ -1353,12 +1372,14 @@ impl Cluster {
         let mut probe = WatchProbe::Ran {
             synced: None,
             objects: 0,
+            polling: false,
             errors: 0,
             last_error: None,
         };
         let WatchProbe::Ran {
             synced,
             objects,
+            polling,
             errors,
             last_error,
         } = &mut probe
@@ -1366,7 +1387,8 @@ impl Cluster {
             unreachable!("just constructed")
         };
         let deadline = tokio::time::Instant::now() + timeout;
-        while synced.is_none() || !*headers_rx.borrow() {
+        // A polled view has no watch whose headers could arrive.
+        while synced.is_none() || !(*polling || *headers_rx.borrow()) {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
                 changed = headers_rx.changed() => {
@@ -1377,6 +1399,13 @@ impl Cluster {
                 msg = rx.recv() => match msg {
                     Some(Msg::Applied { .. }) => *objects += 1,
                     Some(Msg::Synced { .. }) => *synced = Some(started.elapsed()),
+                    // The poll sends its whole first list after this, which
+                    // replaces whatever the refused watch's list counted.
+                    Some(Msg::WatchPolling { .. }) => {
+                        *polling = true;
+                        *objects = 0;
+                        *synced = None;
+                    }
                     Some(Msg::Reset { .. }) => {
                         *objects = 0;
                         *synced = None;
@@ -1391,7 +1420,7 @@ impl Cluster {
                 }
             }
         }
-        if synced.is_some() && *headers_rx.borrow() && *errors == 0 {
+        if synced.is_some() && (*polling || *headers_rx.borrow()) && *errors == 0 {
             *synced = Some(started.elapsed());
         } else {
             *synced = None;
@@ -1461,6 +1490,129 @@ fn streaming_lists_unsupported(e: &watcher::Error) -> bool {
     }
 }
 
+/// How often a view lists its objects when RBAC refuses its watch.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// RBAC refused the watch request itself: the streaming list, or the watch
+/// after a plain list. A refused list is a different failure and stays one.
+fn watch_forbidden(e: &watcher::Error) -> bool {
+    match e {
+        watcher::Error::WatchStartFailed(kube::Error::Api(status))
+        | watcher::Error::WatchFailed(kube::Error::Api(status)) => status.is_forbidden(),
+        watcher::Error::WatchError(status) => status.is_forbidden(),
+        _ => false,
+    }
+}
+
+async fn list_objects(
+    api: &Api<DynamicObject>,
+    params: &ListParams,
+) -> kube::Result<Vec<DynamicObject>> {
+    let mut list = api.list(params).await?;
+    for obj in &mut list.items {
+        obj.managed_fields_mut().clear();
+    }
+    Ok(list.items)
+}
+
+/// Keep a view current with a list every [`POLL_INTERVAL`] after RBAC refused
+/// its watch. Each list is diffed against the previous one by resourceVersion,
+/// so the store gets the adds, changes, and deletes a re-list would give it
+/// without re-applying the rows that did not change. `relist` resets the store
+/// first when an earlier list already filled it.
+async fn poll_lists(
+    api: Api<DynamicObject>,
+    params: ListParams,
+    kind: String,
+    mut objects: Vec<DynamicObject>,
+    relist: bool,
+    generation: u64,
+    tx: Sender<Msg>,
+) {
+    crate::log_warn!(
+        "watch.polling",
+        kind = kind,
+        interval_secs = POLL_INTERVAL.as_secs(),
+        generation = generation
+    );
+    if tx.send(Msg::WatchPolling { generation }).await.is_err()
+        || (relist && tx.send(Msg::Reset { generation }).await.is_err())
+    {
+        return;
+    }
+    let mut seen: HashMap<String, Option<String>> = HashMap::new();
+    let mut synced = false;
+    let mut backoff = watcher::DefaultBackoff::default();
+    let mut failed = false;
+    loop {
+        let mut current = HashMap::with_capacity(objects.len());
+        for obj in objects {
+            let key = row_key(&obj);
+            let version = obj.metadata.resource_version.clone();
+            let changed = seen.remove(&key).is_none_or(|old| old != version);
+            current.insert(key.clone(), version);
+            if changed
+                && tx
+                    .send(Msg::Applied {
+                        generation,
+                        key,
+                        obj: Box::new(obj),
+                    })
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+        for key in std::mem::replace(&mut seen, current).into_keys() {
+            if tx.send(Msg::Deleted { generation, key }).await.is_err() {
+                return;
+            }
+        }
+        if !synced {
+            synced = true;
+            if tx.send(Msg::Synced { generation }).await.is_err() {
+                return;
+            }
+        }
+        let mut delay = POLL_INTERVAL;
+        objects = loop {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = tx.closed() => return,
+            }
+            match list_objects(&api, &params).await {
+                Ok(objects) => {
+                    backoff.reset();
+                    if std::mem::take(&mut failed)
+                        && tx.send(Msg::WatchRecovered { generation }).await.is_err()
+                    {
+                        return;
+                    }
+                    break objects;
+                }
+                Err(e) => {
+                    let e = watcher::Error::InitialListFailed(e);
+                    crate::log_warn!("watch.poll.error", kind = kind, error = e);
+                    failed = true;
+                    delay = backoff
+                        .next()
+                        .unwrap_or(Duration::from_secs(30))
+                        .max(POLL_INTERVAL);
+                    let msg = Msg::WatchError {
+                        generation,
+                        error: e.to_string(),
+                        failure: watch_failure(&e),
+                    };
+                    if tx.send(msg).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        };
+    }
+}
+
 fn watch_api(client: Client, kind: &Kind, namespace: &str) -> Api<DynamicObject> {
     if kind.namespaced && !namespace.is_empty() {
         Api::namespaced_with(client, namespace, &kind.ar)
@@ -1523,6 +1675,13 @@ fn spawn_watch_task(
         // list is in flight, so the UI gets exactly one Reset per re-list.
         // Starts true because the Reset below opens the first list.
         let mut listing = true;
+        let list_params = ListParams {
+            label_selector: cfg.label_selector.clone(),
+            field_selector: cfg.field_selector.clone(),
+            ..Default::default()
+        }
+        .at("0");
+        let mut polled = None;
         let mut stream = watcher(
             api.clone(),
             if using_streaming {
@@ -1618,6 +1777,22 @@ fn spawn_watch_task(
             };
             if !matches!(event, Ok(watcher::Event::Init)) {
                 first_data = None;
+            }
+            // kube's watcher would only retry the refused watch, so a list
+            // that RBAC allows takes over as a poll. If the list is refused
+            // too, the watch error below is reported as before.
+            if let Err(e) = &event
+                && watch_forbidden(e)
+            {
+                match list_objects(&api, &list_params).await {
+                    Ok(objects) => {
+                        polled = Some(objects);
+                        break;
+                    }
+                    Err(error) => {
+                        crate::log_debug!("watch.poll.refused", kind = kind, error = error);
+                    }
+                }
             }
             // Initialisation events can repeat before each failed list request.
             // Reset the delay only after the watch makes progress.
@@ -1751,6 +1926,10 @@ fn spawn_watch_task(
                     _ = tx.closed() => break,
                 }
             }
+        }
+        if let Some(objects) = polled {
+            drop(stream);
+            poll_lists(api, list_params, kind, objects, !listing, generation, tx).await;
         }
     })
 }
@@ -2435,49 +2614,55 @@ pub(crate) mod tests {
     use super::*;
 
     fn probe_cluster(streaming: bool, status: u16, delay: Duration) -> Cluster {
+        let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut cluster = Cluster::fake();
         cluster.client = Client::new(
-            tower::service_fn(move |req: http::Request<kube::client::Body>| async move {
-                let query = req.uri().query().unwrap_or("");
-                let watch = query.contains("watch=true");
-                let initial = query.contains("sendInitialEvents=true");
-                let (code, body) = if initial && streaming {
-                    (200, concat!(
+            tower::service_fn(move |req: http::Request<kube::client::Body>| {
+                let lists = Arc::clone(&lists);
+                async move {
+                    let query = req.uri().query().unwrap_or("");
+                    let watch = query.contains("watch=true");
+                    let initial = query.contains("sendInitialEvents=true");
+                    let (code, body) = if initial && streaming {
+                        (200, concat!(
                     "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"one\",\"resourceVersion\":\"1\"}}}\n",
                     "{\"type\":\"BOOKMARK\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"resourceVersion\":\"1\",\"annotations\":{\"k8s.io/initial-events-end\":\"true\"}}}}\n"
                 ).to_string())
-                } else if initial {
-                    (400, r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"BadRequest","message":"streaming lists unsupported","code":400}"#.into())
-                } else if watch {
-                    tokio::time::sleep(delay).await;
-                    (
-                        status,
-                        if status == 200 {
-                            String::new()
-                        } else {
-                            serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","message":"watch forbidden","code":status}).to_string()
-                        },
-                    )
-                } else {
-                    (200, r#"{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"one","resourceVersion":"1"}}]}"#.into())
-                };
-                let keep_open = watch && code == 200;
-                let frames = futures_util::stream::iter([Ok::<_, std::io::Error>(
-                    hyper::body::Frame::data(hyper::body::Bytes::from(body)),
-                )])
-                .chain(futures_util::stream::poll_fn(move |_| {
-                    if keep_open {
-                        Poll::Pending
+                    } else if initial {
+                        (400, r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"BadRequest","message":"streaming lists unsupported","code":400}"#.into())
+                    } else if watch {
+                        tokio::time::sleep(delay).await;
+                        (
+                            status,
+                            if status == 200 {
+                                String::new()
+                            } else {
+                                serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":if status == 403 { "Forbidden" } else { "ServiceUnavailable" },"message":"watch refused","code":status}).to_string()
+                            },
+                        )
+                    } else if lists.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (200, r#"{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"one","resourceVersion":"1"}}]}"#.into())
                     } else {
-                        Poll::Ready(None)
-                    }
-                }));
-                Ok::<_, std::io::Error>(
-                    http::Response::builder()
-                        .status(code)
-                        .body(http_body_util::StreamBody::new(frames))
-                        .unwrap(),
-                )
+                        (200, r#"{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"2"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"one","resourceVersion":"1"}},{"apiVersion":"v1","kind":"Pod","metadata":{"name":"two","resourceVersion":"2"}}]}"#.into())
+                    };
+                    let keep_open = watch && code == 200;
+                    let frames = futures_util::stream::iter([Ok::<_, std::io::Error>(
+                        hyper::body::Frame::data(hyper::body::Bytes::from(body)),
+                    )])
+                    .chain(futures_util::stream::poll_fn(move |_| {
+                        if keep_open {
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(None)
+                        }
+                    }));
+                    Ok::<_, std::io::Error>(
+                        http::Response::builder()
+                            .status(code)
+                            .body(http_body_util::StreamBody::new(frames))
+                            .unwrap(),
+                    )
+                }
             }),
             "default",
         );
@@ -2486,13 +2671,33 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn probe_requires_watch_headers_after_a_successful_list() {
-        let cluster = probe_cluster(false, 403, Duration::from_millis(20));
+        let cluster = probe_cluster(false, 503, Duration::from_millis(20));
         let probe = cluster
             .probe_watch("pods", "default", Duration::from_secs(1))
             .await;
         assert!(
-            matches!(&probe, WatchProbe::Ran { synced: None, objects: 1, errors: 1, last_error: Some(error) } if error.contains("watch forbidden"))
+            matches!(&probe, WatchProbe::Ran { synced: None, objects: 1, polling: false, errors: 1, last_error: Some(error) } if error.contains("watch refused"))
         );
+    }
+
+    #[tokio::test]
+    async fn probe_reports_polling_when_rbac_forbids_the_watch() {
+        // The fallback list has one more pod than the refused watch's list,
+        // so a count from the earlier list would show up as 1.
+        let cluster = probe_cluster(false, 403, Duration::ZERO);
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_secs(1))
+            .await;
+        assert!(matches!(
+            probe,
+            WatchProbe::Ran {
+                synced: Some(_),
+                objects: 2,
+                polling: true,
+                errors: 0,
+                last_error: None,
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2981,33 +3186,137 @@ clusters:
         assert!(!requests[1].contains("watch=true"));
     }
 
+    const FORBIDDEN: &str = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"forbidden","reason":"Forbidden","code":403}"#;
+
+    fn pod_list(version: u32, pods: &[(&str, u32)]) -> String {
+        let items: Vec<_> = pods
+            .iter()
+            .map(|(name, rv)| serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":"default","resourceVersion":rv.to_string()}}))
+            .collect();
+        serde_json::json!({"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":version.to_string()},"items":items}).to_string()
+    }
+
     #[tokio::test]
-    async fn authorization_error_does_not_trigger_streaming_fallback() {
-        let forbidden = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"forbidden","reason":"Forbidden","code":403}"#.to_string();
-        let (url, requests) = mock_watch_server(vec![("403 Forbidden", forbidden)]).await;
+    async fn forbidden_watch_polls_with_a_list() {
+        for streaming in [true, false] {
+            let mut responses = Vec::new();
+            if !streaming {
+                responses.push(("200 OK", pod_list(10, &[("a", 1), ("b", 2)])));
+            }
+            responses.extend([
+                ("403 Forbidden", FORBIDDEN.to_string()),
+                ("200 OK", pod_list(10, &[("a", 1), ("b", 2)])),
+                ("200 OK", pod_list(11, &[("b", 3), ("c", 4)])),
+            ]);
+            let (url, requests) = mock_watch_server(responses).await;
+            let cluster = watch_cluster(&url);
+            if !streaming {
+                cluster
+                    .streaming_lists
+                    .store(STREAMING_UNSUPPORTED, Ordering::Release);
+            }
+            let kind = cluster.resolve("pods").unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let task = cluster.spawn_watch(&kind, "default", None, None, 1, tx);
+            let mut store = crate::store::Store::default();
+            let mut polling = false;
+            let mut deleted = Vec::new();
+            while !(store.get("default/c").is_some() && store.get("default/a").is_none()) {
+                match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("poll message timeout")
+                    .expect("watch channel closed")
+                {
+                    Msg::WatchPolling { .. } => polling = true,
+                    Msg::Reset { .. } => {
+                        store.begin_reset();
+                    }
+                    Msg::Applied { key, obj, .. } => {
+                        store.apply(key, *obj);
+                    }
+                    Msg::Deleted { key, .. } => {
+                        store.remove(&key);
+                        deleted.push(key);
+                    }
+                    Msg::Synced { .. } => {
+                        store.finish_sync();
+                    }
+                    Msg::WatchError { error, .. } => panic!("polling reported {error}"),
+                    _ => {}
+                }
+            }
+            task.abort();
+            assert!(polling);
+            assert!(store.synced);
+            assert_eq!(store.len(), 2);
+            assert_eq!(
+                store
+                    .get("default/b")
+                    .unwrap()
+                    .metadata
+                    .resource_version
+                    .as_deref(),
+                Some("3")
+            );
+            assert_eq!(deleted, ["default/a"]);
+            assert_eq!(
+                cluster.streaming_lists.load(Ordering::Acquire),
+                if streaming {
+                    STREAMING_UNKNOWN
+                } else {
+                    STREAMING_UNSUPPORTED
+                }
+            );
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.iter().filter(|r| r.contains("watch=true")).count(),
+                1,
+                "{requests:?}"
+            );
+            let polls = &requests[requests.len() - 2..];
+            assert!(
+                polls.iter().all(|r| r.contains("resourceVersion=0")),
+                "{requests:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_list_stays_an_error_without_polling() {
+        let (url, requests) = mock_watch_server(vec![
+            ("403 Forbidden", FORBIDDEN.to_string()),
+            ("403 Forbidden", FORBIDDEN.to_string()),
+        ])
+        .await;
         let cluster = watch_cluster(&url);
         let kind = cluster.resolve("pods").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let task = cluster.spawn_watch(&kind, "default", None, None, 1, tx);
-        let mut saw_error = false;
-        for _ in 0..4 {
-            if let Msg::WatchError { .. } =
-                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-                    .await
-                    .expect("watch message timeout")
-                    .expect("watch channel closed")
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("watch message timeout")
+                .expect("watch channel closed")
             {
-                saw_error = true;
-                break;
+                Msg::WatchError { error, .. } => {
+                    assert!(error.contains("forbidden"), "{error}");
+                    break;
+                }
+                Msg::WatchPolling { .. } | Msg::Synced { .. } => {
+                    panic!("a refused list must not start polling")
+                }
+                _ => {}
             }
         }
         task.abort();
-        assert!(saw_error);
         assert_eq!(
             cluster.streaming_lists.load(Ordering::Acquire),
             STREAMING_UNKNOWN
         );
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("watch=true"));
+        assert!(!requests[1].contains("watch=true"));
     }
 
     #[test]

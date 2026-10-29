@@ -460,6 +460,7 @@ pub fn watch_probe_lines(
     let crate::k8s::WatchProbe::Ran {
         synced,
         objects,
+        polling,
         errors,
         last_error,
     } = probe
@@ -469,6 +470,11 @@ pub fn watch_probe_lines(
         )];
     };
     let mut lines = vec![match synced {
+        Some(elapsed) if *polling => format!(
+            "  established: polling every {} (watch forbidden), first list in {}ms ({objects} objects)",
+            human_duration(crate::k8s::POLL_INTERVAL),
+            elapsed.as_millis()
+        ),
         Some(elapsed) => format!(
             "  established: yes, in {}ms ({objects} objects in the initial list)",
             elapsed.as_millis()
@@ -695,6 +701,7 @@ mod tests {
         let probe = crate::k8s::WatchProbe::Ran {
             synced: Some(Duration::from_millis(84)),
             objects: 312,
+            polling: false,
             errors: 0,
             last_error: None,
         };
@@ -707,10 +714,30 @@ mod tests {
     }
 
     #[test]
+    fn watch_probe_reports_polling_instead_of_a_failure() {
+        let probe = crate::k8s::WatchProbe::Ran {
+            synced: Some(Duration::from_millis(31)),
+            objects: 3,
+            polling: true,
+            errors: 0,
+            last_error: None,
+        };
+        let lines = watch_probe_lines(&probe, "pods", WATCH_PROBE_TIMEOUT).join("\n");
+        assert!(
+            lines.contains(
+                "established: polling every 2s (watch forbidden), first list in 31ms (3 objects)"
+            ),
+            "{lines}"
+        );
+        assert!(lines.contains("errors:      0"), "{lines}");
+    }
+
+    #[test]
     fn watch_probe_redacts_the_error_it_reports() {
         let probe = crate::k8s::WatchProbe::Ran {
             synced: None,
             objects: 0,
+            polling: false,
             errors: 1,
             last_error: Some("401 for authorization: Bearer eyJhbGciOi.J9.sig".into()),
         };

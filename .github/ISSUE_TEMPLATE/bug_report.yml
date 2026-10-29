@@ -65,6 +65,8 @@ body:
         - macOS (Intel)
         - Linux (x86_64)
         - Linux (aarch64)
+        - Windows (x86_64)
+        - Windows (aarch64)
         - Other
     validations:
       required: true
@@ -75,6 +77,7 @@ body:
       options:
         - Homebrew
         - Nix
+        - Scoop
         - cargo install / built from source
         - GitHub release binary
         - Other

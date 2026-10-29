@@ -8,6 +8,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 #[cfg(unix)]
 mod clipboard;
+mod context_badge;
 mod credentials;
 mod dir;
 mod exec_auth;
@@ -133,7 +134,7 @@ async fn mock_pods_api() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
                     requests.push(path.clone());
                     requests
                         .iter()
-                        .filter(|p| !p.contains("watch=true"))
+                        .filter(|p| p.contains("/pods") && !p.contains("watch=true"))
                         .count()
                 };
                 let (status, body) = if path.contains("watch=true") {
@@ -7424,6 +7425,73 @@ async fn flux_menu_rejects_non_flux_kinds() {
     assert!(app.flash_err);
     assert!(app.flash.contains("Flux"), "{}", app.flash);
     assert_eq!(app.mode, Mode::Table); // never opens the menu
+}
+
+#[tokio::test]
+async fn flux_tables_show_suspended_before_the_long_message() {
+    // Issue #978: SUSPENDED sat after MESSAGE, so a long message pushed it
+    // off the right edge.
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "fluxcd.controlplane.io",
+        "ResourceSet",
+        "resourcesets",
+        true,
+    );
+    let message = "x".repeat(200);
+    for (command, plural, object, headers) in [
+        (
+            "kustomizations",
+            "kustomizations",
+            json!({
+                "apiVersion": "kustomize.toolkit.fluxcd.io/v1", "kind": "Kustomization",
+                "metadata": {"name": "infra", "namespace": "default"},
+                "spec": {"suspend": true},
+                "status": {
+                    "lastAppliedRevision": "main@sha1:abc",
+                    "conditions": [{"type": "Ready", "status": "True", "message": message}]
+                }
+            }),
+            vec!["NAME", "READY", "SUSPENDED", "MESSAGE", "REVISION", "AGE"],
+        ),
+        (
+            "resourcesets.fluxcd.io",
+            "resourcesets",
+            json!({
+                "apiVersion": "fluxcd.controlplane.io/v1", "kind": "ResourceSet",
+                "metadata": {
+                    "name": "apps", "namespace": "default",
+                    "annotations": {"fluxcd.controlplane.io/reconcile": "disabled"}
+                },
+                "status": {
+                    "lastAppliedRevision": "sha256:abc",
+                    "conditions": [{"type": "Ready", "status": "True", "message": message}]
+                }
+            }),
+            vec![
+                "NAME",
+                "READY",
+                "SUSPENDED",
+                "MESSAGE",
+                "REVISION",
+                "RESOURCES",
+                "AGE",
+            ],
+        ),
+    ] {
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        type_in_palette(&mut app, command);
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, plural);
+        apply(&mut app, object);
+        assert_eq!(app.display_headers().to_vec(), headers, "{plural}");
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, status_idx) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(cells[1..4], ["True", "true", message.as_str()], "{plural}");
+        assert_eq!(status_idx, Some(1), "{plural}");
+    }
 }
 
 #[tokio::test]
@@ -33042,10 +33110,7 @@ async fn configured_metric_columns_keep_order_values_and_live_filters() {
         headers,
         ["NAME", "READY", "CPU", "CPU/R", "LOAD", "MEM/R", "AGE"]
     );
-    assert_eq!(
-        &rows[0][..6],
-        ["api", "3/3", "4200m", "4200m", "100%", "1.1Gi"]
-    );
+    assert_eq!(&rows[0][..6], ["api", "3/3", "4.2", "4.2", "100%", "1.1Gi"]);
     app.handle_key(press(KeyCode::Char('w'))).unwrap();
     let (headers, rows) = app.snapshot_table();
     assert_eq!(headers[6], "LIMIT");
@@ -33094,7 +33159,7 @@ async fn configured_metric_columns_keep_order_values_and_live_filters() {
     });
     let (_, rows) = app.snapshot_table();
     assert_eq!(rows[0][2], "-");
-    assert_eq!(rows[0][3], "4200m");
+    assert_eq!(rows[0][3], "4.2");
     assert_eq!(rows[0][4], "-");
 }
 
@@ -34004,12 +34069,12 @@ async fn quantity_formats_render_values_and_keep_unformatted_columns() {
     assert_eq!(app.display_headers().to_vec(), ["NAME", "CPU/A", "CPU/RAW"]);
     app.handle_key(press(KeyCode::Char('w'))).unwrap();
     let cases = [
-        (json!("4"), json!("16374956Ki"), "4000m", "15.6Gi"),
+        (json!("4"), json!("16374956Ki"), "4", "15.6Gi"),
         (json!("250m"), json!("512Mi"), "250m", "512Mi"),
         (json!("1000000n"), json!("1Gi"), "1m", "1.0Gi"),
         (json!("1500u"), json!("129M"), "2m", "123Mi"),
         (json!("1e-3"), json!("1e6"), "1m", "1Mi"),
-        (json!(4), json!(1048576), "4000m", "1Mi"),
+        (json!(4), json!(1048576), "4", "1Mi"),
         (json!(0), json!(0), "0m", "0Mi"),
         (json!("0"), json!("0Ki"), "0m", "0Mi"),
         (json!("-0"), json!("-0"), "0m", "0Mi"),
@@ -34101,7 +34166,7 @@ async fn quantity_formats_sort_and_filter_before_display_rounding() {
         );
     }
     let (_, rows) = app.snapshot_table();
-    assert!(rows.iter().all(|row| row[1..] == ["1000m", "1.0Gi"]));
+    assert!(rows.iter().all(|row| row[1..] == ["1", "1.0Gi"]));
     for header in ["CPU/A", "MEM/A"] {
         app.handle_key(press(KeyCode::Char('S'))).unwrap();
         for key in header.chars() {
@@ -34226,7 +34291,7 @@ async fn quantity_formats_reject_incompatible_columns_and_keep_valid_columns() {
             "spec": {"image": "registry:5000/app:1.2.3"}, "status": {"allocatable": {"cpu": "4"}}}),
         );
         let (_, rows) = app.snapshot_table();
-        assert_eq!(rows[0][1], if format == "cpu" { "4000m" } else { "0Mi" });
+        assert_eq!(rows[0][1], if format == "cpu" { "4" } else { "0Mi" });
         assert_eq!(rows[0][2..], ["4", "1.2.3"]);
     }
 }
@@ -34351,7 +34416,7 @@ async fn fallback_paths_render_sort_filter_and_refresh_selected_values() {
     app.handle_key(press(KeyCode::Char('w'))).unwrap();
     let (headers, rows) = app.snapshot_table();
     assert_eq!(headers, ["NAME", "NODEPOOL", "CPU/A"]);
-    assert_eq!(rows[0], ["a-high", "primary", "2000m"]);
+    assert_eq!(rows[0], ["a-high", "primary", "2"]);
     assert_eq!(rows[1], ["m-missing", "<none>", "invalid"]);
     assert_eq!(rows[2], ["z-low", "fallback", "500m"]);
     app.handle_key(press(KeyCode::Char('S'))).unwrap();
@@ -34379,7 +34444,7 @@ async fn fallback_paths_render_sort_filter_and_refresh_selected_values() {
     type_filter(&mut app, "nodepool=new-primary");
     let (_, rows) = app.snapshot_table();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0], ["z-low", "new-primary", "3000m"]);
+    assert_eq!(rows[0], ["z-low", "new-primary", "3"]);
 }
 
 #[tokio::test]

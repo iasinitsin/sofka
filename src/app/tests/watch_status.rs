@@ -368,3 +368,66 @@ async fn expect_watch_error(app: &mut App, rx: &mut Receiver<Msg>) {
         app.flash
     );
 }
+
+/// RBAC that grants `list` but not `watch` on pods: the view fills from a
+/// list, follows the next poll's adds, changes, and deletes, and says in the
+/// header that it is polling instead of flashing the refused watch.
+#[tokio::test]
+async fn a_forbidden_watch_polls_the_view_and_says_so() {
+    let (url, seen) = mock_pods_api().await;
+    let (mut app, mut rx) = test_app();
+    app.cluster.client = mock_cluster(&url).client;
+    type_resource_query(&mut app, "pods");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut listed_a = false;
+        while !(listed_a
+            && app.store.synced
+            && app.store.len() == 2
+            && app.store.get("default/d").is_some())
+        {
+            app.handle_msg(rx.recv().await.unwrap());
+            listed_a |= app.store.get("default/a").is_some();
+        }
+    })
+    .await
+    .expect("the poll did not pick up the changed list");
+    assert_eq!(
+        app.store
+            .get("default/c")
+            .unwrap()
+            .metadata
+            .resource_version
+            .as_deref(),
+        Some("4")
+    );
+    assert!(app.watch_polling);
+    assert!(!app.flash.contains("watch failed"), "{}", app.flash);
+    assert!(!app.flash_err);
+    assert_eq!(app.watch_errors, 0);
+    let screen = screen_text(&mut app, 140, 30);
+    assert!(screen.contains("polling 2s (watch forbidden)"), "{screen}");
+    assert!(screen.contains("● polling"), "{screen}");
+    app.cluster.context = "a-very-long-context-name-that-fills-a-narrow-header".into();
+    app.handle_key(ctrl(KeyCode::Char('e'))).unwrap();
+    assert!(app.compact);
+    let screen = screen_text(&mut app, 70, 30);
+    let header = screen.lines().next().unwrap();
+    assert!(header.contains("polling 2s (watch forbidden)"), "{header}");
+    app.handle_key(ctrl(KeyCode::Char('e'))).unwrap();
+
+    type_resource_query(&mut app, "services");
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.watch_polling);
+    let screen = screen_text(&mut app, 140, 30);
+    assert!(!screen.contains("polling 2s"), "{screen}");
+    let pod_lists = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.contains("/pods") && !p.contains("watch=true"))
+            .count()
+    };
+    let before = pod_lists();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(pod_lists(), before, "the pods poll outlived its view");
+}

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.33.0 - 2026-10-29
+
+sofka adds shell completions for the Nix package, Scoop install on Windows, and per-context badges. It also works when RBAC allows list but not watch.
+
+### New features
+
+- The Nix package now installs shell completions for bash, fish, and zsh.
+- CPU values of one core or more now show as cores, such as `64` instead of `64000m`. Values below one core stay in millicores.
+- Flux views show SUSPENDED next to READY. A suspended object is visible even when the message is long.
+- Windows users can install sofka with `scoop install sofka`. The update check suggests the matching Scoop upgrade command.
+- Set `[context_badge]` in a context override file to label a context, such as `prod`. The label shows in the header and in the `:ctx` picker.
+- sofka works when RBAC allows list but not watch, because views poll with list every 2 seconds. Before, the views stayed empty with a retry error.
+
+### Fixes
+
+- sofka exits with a short error when the `--kubeconfig` file does not exist. Before, it opened a disconnected TUI that you had to quit by hand.
+
 ## v0.32.0 - 2026-10-22
 
 This release changes how keys look in status bar and popup hints. It also adds a way to set a HelmRelease chart version and fixes log scrolling.

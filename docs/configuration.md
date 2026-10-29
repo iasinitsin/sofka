@@ -382,6 +382,40 @@ Every semantic color - row status, severity badges, headers, borders - is derive
 from the active palette, so one skin change lands everywhere at once. `:skin`
 switches live, `:skin gruvbox-dark` applies directly.
 
+## Context badge
+
+A context badge is a label shown next to the context name, so the active
+context is obvious at a glance. Set it in a
+[per-cluster or per-context override](#per-cluster-and-per-context-overrides):
+
+```toml
+[context_badge]
+label = "prod"   # required
+color = "red"    # optional skin color name
+```
+
+The badge shows as `[prod]` after the context name in the header and in the
+compact one-line header, next to `[read-only]` when both apply. On a narrow
+terminal the label is shortened, or hidden, so the read-only marker stays
+visible. `:info` redacts addresses and credentials in the label like the rest of
+its header. Each row of the
+`:ctx` picker shows the badge of that context, so you can see it before you
+switch. Contexts without a badge look unchanged.
+
+`color` takes a skin swatch name, the same names `[skin.colors]` accepts:
+`rosewater`, `flamingo`, `pink`, `mauve`, `red`, `maroon`, `peach`, `yellow`,
+`green`, `teal`, `sky`, `sapphire`, `blue`, `lavender`, `text`, `subtext1`,
+`subtext0`, `overlay1`, `overlay0`, `surface2`, `surface1`, `surface0`, `base`,
+`mantle`, and `crust`. The badge uses the active skin's value for that swatch,
+so it follows `:skin` and per-context skins. Without `color`, the label uses the normal text color. An unknown color
+name shows the label uncolored with a config warning. A `color` without a
+`label` shows no badge and produces a warning, so meaning never depends on
+color alone.
+
+The table merges key by key like other tables, so a cluster file can set
+`color` and each context file only its `label`. Changes apply on `:reload` and
+on every `:ctx` switch.
+
 Custom columns accept a single `path` string or an ordered list of fallback
 paths. sofka uses the first value that exists and is not `null`. See
 [fallback paths](views.md#fallback-paths) for an example and validation rules.
@@ -397,8 +431,9 @@ Path columns accept `regex` to show the first capture group of a value. See
 [regex extraction](views.md#regex-extraction).
 
 Quantity path columns accept `format = "cpu"` or `format = "memory"` with
-`type = "quantity"`. These formats use millicores or Mi/Gi for display and
-the original values for sorting and numeric filters. See
+`type = "quantity"`. CPU displays millicores below one core and cores from one
+core up; memory displays Mi/Gi. Both use the original values for sorting and
+numeric filters. See
 [quantity formats](views.md#quantity-formats).
 
 ## Other sections
@@ -530,7 +565,14 @@ readonly = true
 [skin]
 name = "catppuccin-latte"
 background = true
+
+[context_badge]
+label = "prod"
+color = "red"
 ```
+
+A context file under that cluster can then change only the label, for example
+`label = "prod admin"` under `[context_badge]`, and keep the cluster's color.
 
 A skin in an override sets the colors for that context. A context with no skin
 keeps the session skin (config `skin.name`, the auto-detected default, or your

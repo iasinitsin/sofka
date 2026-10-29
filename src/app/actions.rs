@@ -1804,6 +1804,9 @@ impl App {
         warnings.extend(metrics_warnings);
         self.skin_colors = resolved.config.skin.colors;
         self.readonly = self.readonly_override.unwrap_or(resolved.config.readonly);
+        let (badge, badge_warnings) = resolved.config.context_badge.compile();
+        self.context_badge = badge;
+        warnings.extend(badge_warnings);
         self.configure_native_describe(resolved.config.experimental.native_describe);
         self.cluster.add_aliases(&self.user_aliases);
         crate::theme::set_background(resolved.config.skin.background);

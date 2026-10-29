@@ -121,6 +121,31 @@ async fn namespace_watch_recovery_preserves_other_failures() {
 }
 
 #[tokio::test]
+async fn a_polled_namespace_clears_its_failure_and_marks_the_view_polled() {
+    let (mut app, _rx) = pattern_app();
+    type_resource_query(&mut app, "pods");
+    type_resource_query(&mut app, "ns *-crons");
+    resolve(&mut app, &["a-crons", "b-crons"]);
+    let generation = app.generation;
+    watch(
+        &mut app,
+        "a-crons",
+        Msg::WatchError {
+            generation,
+            error: "pods is forbidden".into(),
+            failure: WatchFailure::Response,
+        },
+    );
+    assert!(app.flash_err);
+    watch(&mut app, "a-crons", Msg::WatchPolling { generation });
+    assert!(app.watch_polling);
+    assert!(app.flash.is_empty(), "{}", app.flash);
+    assert!(!app.namespace_label().contains("incomplete"));
+    type_resource_query(&mut app, "services");
+    assert!(!app.watch_polling);
+}
+
+#[tokio::test]
 async fn namespace_patterns_keep_selection_on_discovery_failure_and_drop_stale_results() {
     let (mut app, _rx) = pattern_app();
     type_resource_query(&mut app, "pods");

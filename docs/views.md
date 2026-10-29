@@ -180,7 +180,9 @@ type = "quantity"
 format = "memory"
 ```
 
-CPU values display as whole millicores: `4` becomes `4000m`.
+CPU values display as whole millicores below one core and as cores from one
+core up, with at most two decimals: `4` stays `4`, `250m` stays `250m`, and
+`1234m` becomes `1.23`.
 Memory values display as whole Mi below 1 Gi, or Gi with one decimal place:
 `16374956Ki` becomes `15.6Gi`. These formats also accept JSON numbers.
 Values without a suffix mean CPU cores or memory bytes. The format is explicit;

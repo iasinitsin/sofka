@@ -1,8 +1,8 @@
 //! Release update checks: is a newer sofka published, and how would this
 //! install upgrade to it.
 //!
-//! sofka never downloads or replaces itself. Homebrew, Nix, Cargo, winget, and
-//! the distro packages each track the installed binary, so the check only
+//! sofka never downloads or replaces itself. Homebrew, Nix, Cargo, winget, Scoop,
+//! and the distro packages each track the installed binary, so the check only
 //! reports the latest release and the upgrade command for the install method
 //! the running executable came from. The background check runs at most once
 //! per [`CHECK_INTERVAL`]; the result is cached under the state directory so
@@ -164,6 +164,8 @@ pub enum InstallMethod {
     Nix,
     Cargo,
     Winget,
+    Scoop,
+    ScoopGlobal,
     Package,
     Unknown,
 }
@@ -172,22 +174,38 @@ impl InstallMethod {
     /// The running executable's install method.
     pub fn current() -> Self {
         let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
+        let scoop_global = std::env::var_os("SCOOP_GLOBAL").map(PathBuf::from);
         std::env::current_exe()
             .and_then(std::fs::canonicalize)
             .map_or(Self::Unknown, |exe| {
-                Self::detect(&exe, cargo_home.as_deref())
+                Self::detect(&exe, cargo_home.as_deref(), scoop_global.as_deref())
             })
     }
 
-    pub fn detect(exe: &Path, cargo_home: Option<&Path>) -> Self {
+    pub fn detect(exe: &Path, cargo_home: Option<&Path>, scoop_global: Option<&Path>) -> Self {
         let path = exe.to_string_lossy().replace('\\', "/");
         let lower = path.to_ascii_lowercase();
+        let scoop_global_apps = scoop_global
+            .filter(|root| !root.as_os_str().is_empty())
+            .map(|root| {
+                let root = root
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase();
+                format!("{}/apps/sofka/", root.trim_end_matches('/'))
+            });
         if path.starts_with("/nix/store/") {
             Self::Nix
         } else if path.contains("/Cellar/") || path.contains("/linuxbrew/") {
             Self::Homebrew
         } else if lower.contains("/microsoft/winget/") {
             Self::Winget
+        } else if lower.contains("/programdata/scoop/apps/sofka/")
+            || scoop_global_apps.is_some_and(|apps| lower.contains(&apps))
+        {
+            Self::ScoopGlobal
+        } else if lower.contains("/scoop/apps/sofka/") {
+            Self::Scoop
         } else if cargo_home.is_some_and(|home| exe.starts_with(home.join("bin")))
             || path.contains("/.cargo/bin/")
         {
@@ -206,6 +224,8 @@ impl InstallMethod {
             Self::Nix => "update the sofka flake input or Nix profile".into(),
             Self::Cargo => "cargo install sofka --locked".into(),
             Self::Winget => "winget upgrade nklmilojevic.sofka".into(),
+            Self::Scoop => "scoop update; scoop update sofka".into(),
+            Self::ScoopGlobal => "scoop update; scoop update sofka --global".into(),
             Self::Package | Self::Unknown => format!("download it from {}", release.url),
         }
     }
@@ -404,7 +424,7 @@ mod tests {
 
     #[test]
     fn install_method_follows_the_executable_path() {
-        let detect = |path: &str| InstallMethod::detect(Path::new(path), None);
+        let detect = |path: &str| InstallMethod::detect(Path::new(path), None, None);
         assert_eq!(
             detect("/opt/homebrew/Cellar/sofka/0.31.1/bin/sofka"),
             InstallMethod::Homebrew
@@ -424,12 +444,37 @@ mod tests {
             ),
             InstallMethod::Winget
         );
+        assert_eq!(
+            detect(r"C:\Users\me\scoop\apps\sofka\0.32.0\sofka.exe"),
+            InstallMethod::Scoop
+        );
+        assert_eq!(
+            detect(r"\\?\C:\ProgramData\scoop\apps\sofka\current\sofka.exe"),
+            InstallMethod::ScoopGlobal
+        );
+        assert_eq!(
+            InstallMethod::detect(
+                Path::new(r"\\?\D:\Global\scoop\apps\sofka\0.32.0\sofka.exe"),
+                None,
+                Some(Path::new(r"D:\Global\Scoop\"))
+            ),
+            InstallMethod::ScoopGlobal
+        );
+        assert_eq!(
+            InstallMethod::detect(
+                Path::new(r"C:\Users\me\scoop\apps\sofka\0.32.0\sofka.exe"),
+                None,
+                Some(Path::new(""))
+            ),
+            InstallMethod::Scoop
+        );
         assert_eq!(detect("/usr/bin/sofka"), InstallMethod::Package);
         assert_eq!(detect("/usr/local/bin/sofka"), InstallMethod::Unknown);
         assert_eq!(
             InstallMethod::detect(
                 Path::new("/opt/cargo/bin/sofka"),
-                Some(Path::new("/opt/cargo"))
+                Some(Path::new("/opt/cargo")),
+                None
             ),
             InstallMethod::Cargo
         );
@@ -440,6 +485,18 @@ mod tests {
         assert_eq!(
             InstallMethod::Unknown.upgrade_hint(&release("9.0.0")),
             format!("download it from {RELEASES_URL}/tag/v9.0.0")
+        );
+    }
+
+    #[test]
+    fn scoop_installs_sync_buckets_before_upgrading() {
+        assert_eq!(
+            InstallMethod::Scoop.upgrade_hint(&release("9.0.0")),
+            "scoop update; scoop update sofka"
+        );
+        assert_eq!(
+            InstallMethod::ScoopGlobal.upgrade_hint(&release("9.0.0")),
+            "scoop update; scoop update sofka --global"
         );
     }
 

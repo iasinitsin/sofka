@@ -337,6 +337,9 @@ working says nothing about whether watches do: a proxy that closes long-lived
 connections passes every other check in this report and still leaves the TUI
 with an empty table. The probe gives up after 5s, which is itself the answer
 when a first view is too slow to be usable.
+When RBAC refuses the watch but allows the list, the probe reports
+`established: polling every 2s (watch forbidden)` instead of a failure.
+`sofka --check` runs the same probe and prints the same lines.
 
 Identifiers, paths, and counts only, never credentials, tokens, decoded Secret
 values, or plugin inputs. Values that could carry a credential - an API server
@@ -446,6 +449,13 @@ in `:info` for diagnosis.
 If failures continue, run `SOFKA_LOG=debug sofka pods` and open `:info` to find
 the log path. A connection error alone does not identify whether the cause is
 the network, a proxy, or the API server.
+
+A `403 Forbidden` on the watch while RBAC allows `list` does not leave this
+message on screen. The view switches to a list every 2 seconds, served from the
+API server cache (`resourceVersion=0`), and the header shows
+`polling 2s (watch forbidden)`. If the list is refused too, the watch error
+stays and sofka keeps retrying with increasing delays. A list that fails while
+the view is polling shows the same message until a later list succeeds.
 
 ## TLS session resumption and HTTP 401
 
