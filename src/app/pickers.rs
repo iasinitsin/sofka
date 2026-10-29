@@ -642,13 +642,19 @@ impl App {
         self.ctx_filter.clear();
         self.ctx_filtering = false;
         self.ctx_list.clear();
+        self.ctx_badges.clear();
         self.ctx_state.select(None);
         self.mode = Mode::Contexts;
+        self.ctx_badge_request += 1;
+        let request = self.ctx_badge_request;
         let tx = self.tx.clone();
         let genr = self.generation;
+        let config = self.config.clone();
         tokio::spawn(async move {
-            match Cluster::list_contexts() {
-                Ok(mut list) => {
+            match Cluster::list_context_clusters() {
+                Ok(contexts) => {
+                    let mut list: Vec<String> =
+                        contexts.iter().map(|(name, _)| name.clone()).collect();
                     list.sort();
                     let _ = tx
                         .send(Msg::Contexts {
@@ -656,6 +662,9 @@ impl App {
                             list,
                         })
                         .await;
+                    // The list shows first; badges need every context's
+                    // override files read, which waits for nothing on screen.
+                    send_context_badges(tx, genr, request, config, contexts).await;
                 }
                 // An unreadable kubeconfig must say so — an empty picker
                 // over a parse error looks like "you have no contexts".
@@ -667,6 +676,23 @@ impl App {
                         })
                         .await;
                 }
+            }
+        });
+    }
+
+    /// Re-resolve picker badges after the kubeconfig changed under the open
+    /// picker. The new request drops any result still in flight.
+    pub(super) fn refresh_context_badges(&mut self) {
+        self.ctx_badge_request += 1;
+        let request = self.ctx_badge_request;
+        let tx = self.tx.clone();
+        let genr = self.generation;
+        let config = self.config.clone();
+        tokio::spawn(async move {
+            if let Ok(Ok(contexts)) =
+                tokio::task::spawn_blocking(Cluster::list_context_clusters).await
+            {
+                send_context_badges(tx, genr, request, config, contexts).await;
             }
         });
     }
@@ -1011,6 +1037,9 @@ impl App {
         self.timeline.clear();
         self.skin_colors = resolved.config.skin.colors;
         self.readonly = self.readonly_override.unwrap_or(resolved.config.readonly);
+        let (badge, badge_warnings) = resolved.config.context_badge.compile();
+        self.context_badge = badge;
+        plugin_warnings.extend(badge_warnings);
         self.configure_native_describe(resolved.config.experimental.native_describe);
         cluster.add_aliases(&self.user_aliases);
         self.bump_generation();
@@ -1119,5 +1148,26 @@ impl App {
         self.forwards_cfg = resolved.config.forwards;
         self.notify_cfg = resolved.config.notify;
         self.start_autostart_forwards();
+    }
+}
+
+/// Resolve picker badges off the UI thread and send them tagged with the
+/// picker request they answer.
+async fn send_context_badges(
+    tx: tokio::sync::mpsc::Sender<Msg>,
+    generation: u64,
+    request: u64,
+    config: crate::config::ConfigLoader,
+    contexts: Vec<(String, String)>,
+) {
+    if let Ok(badges) = tokio::task::spawn_blocking(move || config.context_badges(&contexts)).await
+    {
+        let _ = tx
+            .send(Msg::ContextBadges {
+                generation,
+                request,
+                badges,
+            })
+            .await;
     }
 }

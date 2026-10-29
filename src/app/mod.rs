@@ -2337,6 +2337,9 @@ pub struct App {
     /// count next to a flat error count is the signature of a flaky connection
     /// rather than a broken one, which is why `:info` reports them apart.
     pub watch_reconnects: u64,
+    /// RBAC refused a watch behind the current view, which now polls with a
+    /// list instead. Cleared with the generation that started it.
+    pub watch_polling: bool,
     /// The most recent error message, for `:info` diagnostics.
     pub last_error: Option<String>,
     /// The most recent failure to persist a small UI-state file (namespace,
@@ -2449,6 +2452,13 @@ pub struct App {
     /// Session-wide pin from `--readonly`/`--write`; wins over any config
     /// `readonly` value on every context switch. `None` = config decides.
     pub readonly_override: Option<bool>,
+    /// The active context's `[context_badge]`, shown in the header.
+    pub context_badge: Option<crate::config::ContextBadge>,
+    /// Badges for `:ctx` picker rows, keyed by context name. Resolved
+    /// off-thread after the context list arrives.
+    pub ctx_badges: HashMap<String, crate::config::ContextBadge>,
+    /// Bumped per badge resolution so only the latest result lands.
+    pub(crate) ctx_badge_request: u64,
 
     /// Current images aligned with `container_list`, for the Set-Image picker.
     pub image_values: Vec<String>,
@@ -2840,6 +2850,7 @@ impl App {
             journal: crate::journal::Journal::default(),
             watch_errors: 0,
             watch_reconnects: 0,
+            watch_polling: false,
             last_error: None,
             last_state_write_error: None,
             metrics_seen: false,
@@ -2886,6 +2897,9 @@ impl App {
             config_warnings: Vec::new(),
             readonly: false,
             readonly_override: None,
+            context_badge: None,
+            ctx_badges: HashMap::new(),
+            ctx_badge_request: 0,
             image_values: Vec::new(),
             image_target: None,
             metrics: HashMap::new(),

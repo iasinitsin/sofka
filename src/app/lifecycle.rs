@@ -523,6 +523,7 @@ impl App {
         self.cancel_adjacent_request();
         self.cancel_rbac();
         self.generation += 1;
+        self.watch_polling = false;
         self.container_history = metrics_history::ContainerHistory::default();
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -1113,6 +1114,7 @@ impl App {
         self.cancel_adjacent_request();
         self.cancel_rbac();
         self.generation += 1;
+        self.watch_polling = false;
         self.container_history = metrics_history::ContainerHistory::default();
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -1215,7 +1217,8 @@ impl App {
                         failure,
                     );
                 }
-                Msg::WatchRecovered { .. } => {
+                event @ (Msg::WatchRecovered { .. } | Msg::WatchPolling { .. }) => {
+                    self.watch_polling |= matches!(event, Msg::WatchPolling { .. });
                     self.namespace_errors.remove(&namespace);
                     // Credentials that work for every namespace again are fine.
                     if self.namespace_errors.is_empty() {
@@ -1283,6 +1286,11 @@ impl App {
                 self.show_watch_error(error, failure);
             }
             Msg::WatchRecovered { generation } if generation == self.generation => {
+                self.note_watch_recovered();
+                self.clear_watch_error_flash();
+            }
+            Msg::WatchPolling { generation } if generation == self.generation => {
+                self.watch_polling = true;
                 self.note_watch_recovered();
                 self.clear_watch_error_flash();
             }
@@ -2179,6 +2187,13 @@ impl App {
                     self.ctx_state.select(Some(idx));
                 }
             }
+            Msg::ContextBadges {
+                generation,
+                request,
+                badges,
+            } if generation == self.generation && request == self.ctx_badge_request => {
+                self.ctx_badges = badges;
+            }
             Msg::ContextRenamed {
                 generation,
                 claim,
@@ -2195,6 +2210,12 @@ impl App {
                         }
                         list.sort();
                     }
+                    // Keep the row's badge until the new name's overrides
+                    // are resolved, which also drops any result in flight.
+                    if let Some(badge) = self.ctx_badges.remove(&old) {
+                        self.ctx_badges.insert(new.clone(), badge);
+                    }
+                    self.refresh_context_badges();
                     if self.mode == Mode::Contexts {
                         let idx = self.filtered_contexts().iter().position(|c| *c == new);
                         self.ctx_state.select(Some(idx.unwrap_or(0)));

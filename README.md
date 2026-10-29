@@ -95,6 +95,12 @@ nix run github:nklmilojevic/sofka       # Nix, nothing to install
 cargo install sofka                     # Cargo
 ```
 
+On Windows, install with [Scoop](https://scoop.sh) from its Main bucket:
+
+```powershell
+scoop install sofka
+```
+
 Or build from source: `cargo build --release` (see
 [Development](docs/architecture.md#development)).
 

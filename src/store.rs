@@ -85,6 +85,11 @@ pub enum Msg {
     WatchReconnected {
         generation: u64,
     },
+    /// RBAC refused the watch but allows the list, so the view is now kept
+    /// current by a list every [`crate::k8s::POLL_INTERVAL`] instead.
+    WatchPolling {
+        generation: u64,
+    },
     LogLines {
         generation: u64,
         lines: Vec<String>,
@@ -352,6 +357,14 @@ pub enum Msg {
     Contexts {
         generation: u64,
         list: Vec<String>,
+    },
+    /// Each listed context's `[context_badge]`, resolved off-thread from its
+    /// override files after [`Msg::Contexts`].
+    ContextBadges {
+        generation: u64,
+        /// The picker request this answers; a newer request drops it.
+        request: u64,
+        badges: std::collections::HashMap<String, crate::config::ContextBadge>,
     },
     /// Result of an off-thread context switch (rebuilds client + discovery).
     ContextSwitched {

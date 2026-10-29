@@ -75,6 +75,14 @@ macro_rules! palette_swatches {
                 }
                 true
             }
+
+            /// One swatch by name, `None` for an unknown key.
+            fn get(&self, key: &str) -> Option<Color> {
+                match key {
+                    $(stringify!($field) => Some(self.$field),)+
+                    _ => None,
+                }
+            }
         }
 
         $(pub fn $field() -> Color {
@@ -342,6 +350,17 @@ pub fn validate_skin(name: Option<&str>, colors: &HashMap<String, String>) -> Ve
     }
     warns.sort();
     warns
+}
+
+/// Swatch names accepted where config names a skin color.
+pub fn swatch_names() -> &'static [&'static str] {
+    FIELDS
+}
+
+/// The active palette's swatch called `name` (lowercase), so a color named
+/// in config follows `:skin` and per-context skins.
+pub fn swatch(name: &str) -> Option<Color> {
+    palette().get(name)
 }
 
 /// Parse `#rrggbb` (or `rrggbb`) into a `Color::Rgb`. Returns `None` for any

@@ -106,6 +106,8 @@ pub struct Config {
     pub node_roles: NodeRoles,
     /// Color skin: a built-in palette name plus optional per-swatch overrides.
     pub skin: Skin,
+    /// A label shown next to the context name — see [`ContextBadgeConfig`].
+    pub context_badge: ContextBadgeConfig,
     /// Optional external observability backends — see [`Providers`]. Compiled
     /// and validated by [`crate::providers::compile`].
     pub providers: Providers,
@@ -1101,6 +1103,66 @@ pub struct Skin {
     pub background: bool,
 }
 
+/// A badge shown next to the context name in the header and on the context's
+/// `:ctx` picker row, meant for per-cluster/per-context override files.
+/// `color` names a skin swatch, so the badge follows the active skin. A
+/// badge always carries a label: `color` alone is rejected, so meaning never
+/// depends on color.
+///
+/// ```toml
+/// [context_badge]
+/// label = "prod"
+/// color = "red"
+/// ```
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ContextBadgeConfig {
+    pub label: Option<String>,
+    pub color: Option<String>,
+}
+
+/// A validated [`ContextBadgeConfig`]: a non-empty one-line label and, when
+/// the configured name is a known swatch, its lowercase name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextBadge {
+    pub label: String,
+    pub color: Option<String>,
+}
+
+impl ContextBadgeConfig {
+    /// The badge to show, plus one warning per problem: `color` without a
+    /// `label` shows no badge, and an unknown color name shows the label
+    /// uncolored.
+    pub fn compile(&self) -> (Option<ContextBadge>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let label = self
+            .label
+            .as_deref()
+            .map(crate::text::one_line)
+            .filter(|l| !l.is_empty());
+        let color = self.color.as_deref().map(|c| c.trim().to_ascii_lowercase());
+        let Some(label) = label else {
+            if self.label.is_some() {
+                warnings.push("context_badge: label is empty; no badge shown".into());
+            } else if color.is_some() {
+                warnings.push("context_badge: color needs a label; no badge shown".into());
+            }
+            return (None, warnings);
+        };
+        let color = color.filter(|name| {
+            let known = crate::theme::swatch_names().contains(&name.as_str());
+            if !known {
+                warnings.push(format!(
+                    "context_badge.color: unknown color '{name}' (known: {}); label shown uncolored",
+                    crate::theme::swatch_names().join(", ")
+                ));
+            }
+            known
+        });
+        (Some(ContextBadge { label, color }), warnings)
+    }
+}
+
 /// A shell-out plugin (k9s-style). Bound to `key` on resources matching
 /// `scopes` (plural names; empty = all).
 ///
@@ -1558,7 +1620,7 @@ pub struct Resolved {
 /// Holds the parsed base config for the session and re-reads override
 /// files on demand, so `:ctx` switches pick up freshly edited overrides
 /// without a restart.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ConfigLoader {
     /// Base settings as a shared table (`None` when missing or invalid).
     base: Option<toml::Value>,
@@ -1706,8 +1768,32 @@ impl ConfigLoader {
         self.resolve_inner(context, cluster, false)
     }
 
-    fn resolve_inner(&self, context: &str, cluster: &str, migrate: bool) -> Resolved {
-        let mut warnings = Vec::new();
+    /// Each context's badge, keyed by context name, for the `:ctx` picker.
+    /// `contexts` pairs a kubeconfig context with its cluster. Each context's
+    /// layers merge exactly as in [`resolve`](Self::resolve), so a row never
+    /// shows a badge the header would drop, but without plugin loading and
+    /// without writing key migrations.
+    pub fn context_badges(&self, contexts: &[(String, String)]) -> HashMap<String, ContextBadge> {
+        contexts
+            .iter()
+            .filter_map(|(context, cluster)| {
+                let (config, _) = self.layered(context, cluster, false, &mut Vec::new());
+                let badge = config.context_badge.compile().0?;
+                Some((context.clone(), badge))
+            })
+            .collect()
+    }
+
+    /// Base, drop-ins, then this cluster's and context's override files,
+    /// merged and deserialized, plus the merged override layers alone (for
+    /// [`Resolved::skin_override`]). Problems are pushed onto `warnings`.
+    fn layered(
+        &self,
+        context: &str,
+        cluster: &str,
+        migrate: bool,
+        warnings: &mut Vec<String>,
+    ) -> (Config, toml::Value) {
         let mut merged = self
             .base
             .clone()
@@ -1715,7 +1801,7 @@ impl ConfigLoader {
         let mut overlay = toml::Value::Table(toml::map::Map::new());
         let mut migrations = Vec::new();
         if let Some(path) = self.base_path()
-            && let Some(migration) = key_migration::prepare(&mut merged, &path, &mut warnings)
+            && let Some(migration) = key_migration::prepare(&mut merged, &path, warnings)
         {
             migrations.push(migration);
         }
@@ -1728,7 +1814,7 @@ impl ConfigLoader {
         for path in self.dropin_paths() {
             match read_dropin(&path) {
                 Ok(Some(mut v)) => {
-                    if let Some(migration) = key_migration::prepare(&mut v, &path, &mut warnings) {
+                    if let Some(migration) = key_migration::prepare(&mut v, &path, warnings) {
                         migrations.push(migration);
                     }
                     if let Err(e) = merge_config(&mut merged, v) {
@@ -1743,7 +1829,7 @@ impl ConfigLoader {
         for path in self.override_paths(context, cluster) {
             match read_value(&path) {
                 Ok(Some(mut v)) => {
-                    if let Some(migration) = key_migration::prepare(&mut v, &path, &mut warnings) {
+                    if let Some(migration) = key_migration::prepare(&mut v, &path, warnings) {
                         migrations.push(migration);
                     }
                     match merge_config(&mut merged, v.clone()) {
@@ -1761,7 +1847,7 @@ impl ConfigLoader {
         // A type mismatch introduced by an override drops back to the base
         // config (validated at load time) rather than losing everything.
         let mut valid_config = true;
-        let mut config: Config = merged.try_into().unwrap_or_else(|e| {
+        let config: Config = merged.try_into().unwrap_or_else(|e| {
             valid_config = false;
             warnings.push(format!("ignoring drop-in and cluster overrides: {e}"));
             base.try_into().unwrap_or_default()
@@ -1770,9 +1856,15 @@ impl ConfigLoader {
             key_migration::finish(
                 migrations,
                 valid_config && crate::keymap::Keymap::compile(&config.keys).is_ok(),
-                &mut warnings,
+                warnings,
             );
         }
+        (config, overlay)
+    }
+
+    fn resolve_inner(&self, context: &str, cluster: &str, migrate: bool) -> Resolved {
+        let mut warnings = Vec::new();
+        let (mut config, overlay) = self.layered(context, cluster, migrate, &mut warnings);
         if let Some(dir) = &self.dir {
             crate::plugins::load_packages(&dir.join("plugins"), &mut config.plugins, &mut warnings);
         }
@@ -3013,5 +3105,115 @@ bookmarks = []
                 "{bad}: {warnings:?}"
             );
         }
+    }
+
+    #[test]
+    fn context_badge_needs_a_label_and_a_known_color() {
+        let badge = |text: &str| {
+            toml::from_str::<Config>(text)
+                .unwrap()
+                .context_badge
+                .compile()
+        };
+        assert_eq!(badge(""), (None, Vec::new()));
+        assert_eq!(
+            badge("[context_badge]\nlabel = \" prod\\n eu \"\ncolor = ' Red '"),
+            (
+                Some(ContextBadge {
+                    label: "prod eu".into(),
+                    color: Some("red".into()),
+                }),
+                Vec::new()
+            )
+        );
+        assert_eq!(
+            badge("[context_badge]\ncolor = 'red'"),
+            (
+                None,
+                vec!["context_badge: color needs a label; no badge shown".to_string()]
+            )
+        );
+        assert_eq!(
+            badge("[context_badge]\nlabel = '  '\ncolor = 'red'"),
+            (
+                None,
+                vec!["context_badge: label is empty; no badge shown".to_string()]
+            )
+        );
+        let (shown, warnings) = badge("[context_badge]\nlabel = 'prod'\ncolor = 'crimson'");
+        assert_eq!(
+            shown,
+            Some(ContextBadge {
+                label: "prod".into(),
+                color: None,
+            })
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("unknown color 'crimson'"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn context_badges_merge_every_layer_per_context() {
+        let dir = std::env::temp_dir().join(format!("sofka-context-badges-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |path: &str, text: &str| {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("config.toml", "[context_badge]\ncolor = 'blue'\n");
+        write(
+            "conf.d/10-badge.yaml",
+            "context_badge:\n  label: everywhere\n",
+        );
+        write(
+            "clusters/prod/config.yaml",
+            "context_badge:\n  label: prod\n  color: red\n",
+        );
+        write(
+            "clusters/prod/admin/config.toml",
+            "[context_badge]\nlabel = 'prod admin'\n",
+        );
+        write(
+            "clusters/prod/broken/config.toml",
+            "readonly = 'yes'\n[context_badge]\nlabel = 'x'\n",
+        );
+        let loader = ConfigLoader {
+            dir: Some(dir.clone()),
+            ..Default::default()
+        }
+        .reload()
+        .unwrap();
+        let contexts = [
+            ("admin", "prod"),
+            ("view", "prod"),
+            ("broken", "prod"),
+            ("dev", ""),
+        ]
+        .map(|(context, cluster)| (context.to_string(), cluster.to_string()));
+        let badges = loader.context_badges(&contexts);
+        let shown = |context: &str| {
+            let badge = &badges[context];
+            (badge.label.as_str(), badge.color.as_deref())
+        };
+        assert_eq!(shown("admin"), ("prod admin", Some("red")));
+        assert_eq!(shown("view"), ("prod", Some("red")));
+        assert!(
+            !badges.contains_key("broken"),
+            "an invalid override drops every override, as in resolve"
+        );
+        assert_eq!(shown("dev"), ("everywhere", Some("blue")));
+        for (context, cluster) in &contexts {
+            let (badge, _) = loader
+                .resolve_read_only(context, cluster)
+                .config
+                .context_badge
+                .compile();
+            assert_eq!(badge.as_ref(), badges.get(context), "{context}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
