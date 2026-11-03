@@ -646,14 +646,7 @@ impl App {
 
     /// Read CRD columns first, then try server Tables if no columns are available.
     pub(super) fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
-        let user_has_columns = self
-            .active_user_view()
-            .is_some_and(|v| !v.columns.is_empty());
-        if crate::columns::has_curated(&kind.ar.group, &self.kind_plural)
-            || kind.ar.group.is_empty()
-            || kind.ar.plural.to_lowercase() != self.kind_plural
-            || user_has_columns
-        {
+        if !self.uses_printer_columns(kind) {
             return;
         }
         if self.crd_views.contains_key(&kind.resource_key()) {
@@ -689,13 +682,28 @@ impl App {
         self.tasks.push(handle);
     }
 
-    pub(super) fn server_table_eligible(&self) -> bool {
-        let Some(kind) = &self.kind else { return false };
-        !self.namespace_is_pattern()
-            && !kind.ar.group.is_empty()
+    /// Whether `kind`'s columns come from its CRD printer columns, or the
+    /// server Table when it has none: an uncurated custom resource whose
+    /// active view declares no columns.
+    fn uses_printer_columns(&self, kind: &Kind) -> bool {
+        !kind.ar.group.is_empty()
             && kind.ar.plural.to_lowercase() == self.kind_plural
             && !crate::columns::has_curated(&kind.ar.group, &self.kind_plural)
             && self.active_user_view().is_none_or(|v| v.columns.is_empty())
+    }
+
+    /// The current kind's CRD printer-column lookup has not answered yet, so
+    /// its columns are still the provisional NAME/AGE.
+    pub(super) fn printer_columns_pending(&self) -> bool {
+        self.kind.as_ref().is_some_and(|kind| {
+            self.uses_printer_columns(kind) && !self.crd_views.contains_key(&kind.resource_key())
+        })
+    }
+
+    pub(super) fn server_table_eligible(&self) -> bool {
+        let Some(kind) = &self.kind else { return false };
+        !self.namespace_is_pattern()
+            && self.uses_printer_columns(kind)
             && self
                 .crd_views
                 .get(&kind.resource_key())
@@ -847,11 +855,7 @@ impl App {
                 let mut failure = None;
                 let mut succeeded = false;
                 for ns in &namespaces {
-                    let api: Api<DynamicObject> = if namespaced && !ns.is_empty() {
-                        Api::namespaced_with(client.clone(), ns, &ar)
-                    } else {
-                        Api::all_with(client.clone(), &ar)
-                    };
+                    let api = crate::k8s::dynamic_api(client.clone(), &ar, namespaced, ns);
                     match api.list(&ListParams::default()).await {
                         Ok(list) => {
                             succeeded = true;
@@ -1642,43 +1646,9 @@ impl App {
             Msg::Argocd {
                 generation,
                 request,
-                claim,
-                title,
-                source,
-                destination,
-                findings,
-                resources,
+                report,
             } if generation == self.generation && request == self.argocd_request => {
-                self.argocd_claim = None;
-                self.argocd_resources = resources;
-                if let Some(source) = source {
-                    self.argocd_source = Some(*source);
-                }
-                self.argocd_items = findings;
-                self.argocd_title = title;
-                self.argocd_destination = destination;
-                let first = self
-                    .argocd_items
-                    .iter()
-                    .position(|f| f.target.is_some())
-                    .unwrap_or(0);
-                let selected = self
-                    .argocd_reselect
-                    .take()
-                    .and_then(|row| self.managed_row_at(row))
-                    .unwrap_or(first);
-                self.argocd_state
-                    .select((!self.argocd_items.is_empty()).then_some(selected));
-                self.clear_claimed_status(claim);
-                // Nothing in the Application's own status says why it is
-                // unhealthy, so go and look. Costs nothing for the rest.
-                if self
-                    .argocd_source
-                    .as_ref()
-                    .is_some_and(|a| crate::argocd::health_unexplained(a, &self.argocd_resources))
-                {
-                    self.spawn_argocd_cause();
-                }
+                self.apply_argocd_report(report);
             }
             Msg::ArgocdCause {
                 generation,
@@ -2267,17 +2237,15 @@ impl App {
             }
             _ => {} // stale generation, drop
         }
+        if self.finish_filter_reselect() {
+            return;
+        }
         if preserve_selection {
             let index = selected_pod.and_then(|(key, uid)| {
-                self.ensure_rows_cache();
                 if self.store.get(&key)?.metadata.uid != uid {
                     return None;
                 }
-                self.rows_cache
-                    .borrow()
-                    .keys
-                    .iter()
-                    .position(|k| k.as_ref() == key)
+                self.row_index(&key)
             });
             self.table_state.select(index);
         }

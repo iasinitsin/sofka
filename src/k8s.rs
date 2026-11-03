@@ -15,7 +15,7 @@ use k8s_openapi::jiff::Timestamp;
 use kube::api::{Api, ListParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::core::{DynamicObject, GroupVersionResource};
-use kube::discovery::ApiResource;
+use kube::discovery::{ApiResource, Scope};
 use kube::runtime::{WatchStreamExt, utils::Backoff, watcher};
 use kube::{Client, Config, ResourceExt};
 use secrecy::ExposeSecret;
@@ -283,6 +283,17 @@ static EXEC_WRAPPER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLo
 /// The argument that makes sofka run the rest of its arguments as a detached
 /// exec auth plugin. See [`run_detached`].
 pub const EXEC_DETACHED_ARG: &str = "--exec-detached";
+
+/// Drop the `NO_PROXY` entries kube-rs would refuse the kubeconfig over, and
+/// return a warning for each value that lost a non-empty entry.
+///
+/// # Safety
+///
+/// Modifies the process environment, so call it before any other thread starts.
+pub unsafe fn sanitize_no_proxy_env() -> Vec<String> {
+    // SAFETY: forwarded from the caller.
+    unsafe { proxy::sanitize_env() }
+}
 
 /// Route exec auth plugins through `exe` so they run without a controlling
 /// terminal. Call once at startup with the sofka binary.
@@ -660,7 +671,28 @@ pub struct Kind {
     pub scalable: bool,
 }
 
+/// An `Api` for `ar` in `namespace`, where `""` means every namespace. A
+/// cluster-scoped resource ignores the namespace.
+pub fn dynamic_api(
+    client: Client,
+    ar: &ApiResource,
+    namespaced: bool,
+    namespace: &str,
+) -> Api<DynamicObject> {
+    let scope = if namespaced {
+        Scope::Namespaced
+    } else {
+        Scope::Cluster
+    };
+    Api::dynamic(client, ar, &scope).constrain(namespace)
+}
+
 impl Kind {
+    /// An `Api` for this kind in `namespace`. See [`dynamic_api`].
+    pub fn api(&self, client: Client, namespace: &str) -> Api<DynamicObject> {
+        dynamic_api(client, &self.ar, self.namespaced, namespace)
+    }
+
     pub fn resource_key(&self) -> GroupVersionResource {
         GroupVersionResource::gvr(&self.ar.group, &self.ar.version, &self.ar.plural)
     }
@@ -1275,7 +1307,7 @@ impl Cluster {
             tx.clone(),
             Arc::clone(&reconnecting),
         );
-        let api = watch_api(client, kind, namespace);
+        let api = kind.api(client, namespace);
         let mut cfg = watcher::Config::default().any_semantic();
         if let Some(l) = labels {
             cfg = cfg.labels(&l);
@@ -1304,7 +1336,7 @@ impl Cluster {
         generation: u64,
         tx: Sender<Msg>,
     ) -> JoinHandle<()> {
-        let api = watch_api(self.client.clone(), kind, namespace);
+        let api = kind.api(self.client.clone(), namespace);
         table::spawn(
             self.client.clone(),
             api.resource_url().to_string(),
@@ -1359,7 +1391,7 @@ impl Cluster {
         });
         let client = Client::new(service, self.default_namespace.clone());
         let task = spawn_watch_task(
-            watch_api(client, &kind, ns),
+            kind.api(client, ns),
             kind.ar.plural.clone(),
             ns.to_string(),
             watcher::Config::default().any_semantic(),
@@ -1613,14 +1645,6 @@ async fn poll_lists(
     }
 }
 
-fn watch_api(client: Client, kind: &Kind, namespace: &str) -> Api<DynamicObject> {
-    if kind.namespaced && !namespace.is_empty() {
-        Api::namespaced_with(client, namespace, &kind.ar)
-    } else {
-        Api::all_with(client, &kind.ar)
-    }
-}
-
 /// `reconnecting` is set when a synced watch was cut. The resumed watch
 /// counts as a reconnect once its request succeeds.
 fn watch_status_client(
@@ -1672,7 +1696,7 @@ fn spawn_watch_task(
         let mut initializing = true;
         // Distinct from `initializing`, which drives the streaming-list
         // fallback and must keep its current lifetime: this tracks whether a
-        // list is in flight, so the UI gets exactly one Reset per re-list.
+        // list is in flight, so an Init after the first list logs a re-list.
         // Starts true because the Reset below opens the first list.
         let mut listing = true;
         let list_params = ListParams {
@@ -1705,8 +1729,7 @@ fn spawn_watch_task(
         let mut backoff = watcher::DefaultBackoff::default();
         let mut failed = false;
         let mut last_cut: Option<Instant> = None;
-        // The server expired the watch, so a re-list follows. A streaming
-        // re-list announces itself only with its first object.
+        // The server expired the watch, so a re-list follows.
         let mut relist_due = false;
         // A streaming list answers at once on a reachable API server. A proxy
         // that buffers responses holds a small one back until the stream
@@ -1810,21 +1833,6 @@ fn spawn_watch_task(
             {
                 failed = false;
                 if tx.send(Msg::WatchRecovered { generation }).await.is_err() {
-                    break;
-                }
-            }
-            // A streaming list restarts after a 410 without an Init event, so
-            // without this Reset the re-list would only upsert and objects
-            // deleted while the watch was down would stay on screen.
-            if !listing
-                && matches!(
-                    event,
-                    Ok(watcher::Event::InitApply(_) | watcher::Event::InitDone)
-                )
-            {
-                listing = true;
-                crate::log_info!("watch.relist", kind = kind, generation = generation);
-                if tx.send(Msg::Reset { generation }).await.is_err() {
                     break;
                 }
             }
@@ -2452,12 +2460,11 @@ pub(crate) mod tests {
         kube::runtime::watcher::Error::WatchStartFailed(kube::Error::Auth(
             kube::client::AuthError::AuthExecRun {
                 cmd: "aws".into(),
-                status: std::process::ExitStatus::from_raw(256),
-                out: std::process::Output {
+                out: Box::new(std::process::Output {
                     status: std::process::ExitStatus::from_raw(256),
                     stdout: vec![],
                     stderr: stderr.as_bytes().to_vec(),
-                },
+                }),
             },
         ))
     }
@@ -2898,6 +2905,32 @@ clusters:
         config.proxy_url = Some("socks5://127.0.0.1:9090".parse().unwrap());
 
         Client::try_from(config).expect("build client with a SOCKS5 proxy");
+    }
+
+    #[tokio::test]
+    async fn dynamic_api_scopes_by_namespace() {
+        let client = Client::try_from(Config::new("https://127.0.0.1:6443".parse().unwrap()))
+            .expect("offline client");
+        let pods = ApiResource::erase::<k8s_openapi::api::core::v1::Pod>(&());
+        let nodes = ApiResource::erase::<k8s_openapi::api::core::v1::Node>(&());
+        for (ar, namespaced, namespace, url) in [
+            (&pods, true, "prod", "/api/v1/namespaces/prod/pods"),
+            (&pods, true, "", "/api/v1/pods"),
+            (&nodes, false, "prod", "/api/v1/nodes"),
+            (&nodes, false, "", "/api/v1/nodes"),
+        ] {
+            let api = dynamic_api(client.clone(), ar, namespaced, namespace);
+            assert_eq!(api.resource_url(), url, "{} in {namespace:?}", ar.plural);
+        }
+        let kind = Kind {
+            ar: pods,
+            namespaced: true,
+            scalable: false,
+        };
+        assert_eq!(
+            kind.api(client, "prod").resource_url(),
+            "/api/v1/namespaces/prod/pods"
+        );
     }
 
     #[test]
