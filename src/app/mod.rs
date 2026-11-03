@@ -1729,6 +1729,14 @@ impl PrevRevisions {
     }
 }
 
+/// An object to re-select once the watch a filter change restarted has
+/// listed, because the rows it was looked up in were not the final ones.
+struct FilterReselect {
+    generation: u64,
+    key: String,
+    index: usize,
+}
+
 /// The active filter string alongside its parsed form, so the grammar is
 /// reparsed only when the string actually changes — never per frame or row.
 struct FilterCache {
@@ -2555,6 +2563,15 @@ pub struct App {
     argocd_children_claims: Vec<StatusClaim>,
     /// Claim held while searching for what is making an Application unhealthy.
     argocd_cause_claim: Option<StatusClaim>,
+    /// A gather is in flight, quiet or not.
+    argocd_pending: bool,
+    /// The last report showed a sync in flight, so the view keeps re-reading.
+    argocd_following: bool,
+    argocd_gathered_at: Option<std::time::Instant>,
+    /// What the last cause search found, shown again by the follow-up reads
+    /// of a running sync instead of searching on every one.
+    /// `None` until a search has run for the state on screen.
+    argocd_causes: Option<Vec<crate::explain::Finding>>,
     /// Session-local per-object state-change history, fed by the table watch.
     pub timeline: crate::timeline::Timeline,
     /// Table geometry from the last frame, for mouse hit-testing. A RefCell
@@ -2623,6 +2640,7 @@ pub struct App {
     /// Row key (ns/name) selected when a transient view was opened, restored on
     /// return so the cursor lands back on the same object.
     return_selection: Option<String>,
+    filter_reselect: Option<FilterReselect>,
     pub should_quit: bool,
     matcher: crate::fuzzy::Fuzzy,
     rows_cache: RefCell<RowsCache>,
@@ -2677,6 +2695,9 @@ pub struct App {
     /// Active column layout for the current view; rebuilt by
     /// [`App::refresh_view_spec`] whenever kind/views/wide change.
     spec: crate::columns::ViewSpec,
+    /// The active view's `pin`, read with [`Self::spec`] so a frame does not
+    /// look the view up again.
+    pinned_columns: Option<Vec<String>>,
 }
 
 impl App {
@@ -2953,6 +2974,10 @@ impl App {
             argocd_children_request: 0,
             argocd_children_claims: Vec::new(),
             argocd_cause_claim: None,
+            argocd_pending: false,
+            argocd_following: false,
+            argocd_gathered_at: None,
+            argocd_causes: None,
             timeline: crate::timeline::Timeline::default(),
             table_hit: RefCell::new(None),
             notify_tasks: HashMap::new(),
@@ -2987,6 +3012,7 @@ impl App {
             command_failure: None,
             return_mode: Mode::Table,
             return_selection: None,
+            filter_reselect: None,
             should_quit: false,
             matcher: crate::fuzzy::Fuzzy::new(),
             hay_buf: RefCell::new(String::new()),
@@ -3022,6 +3048,7 @@ impl App {
             latest_release: None,
             update_fetcher: default_update_fetcher,
             spec: crate::columns::build_spec("", "", None, None, false),
+            pinned_columns: None,
         }
     }
 
