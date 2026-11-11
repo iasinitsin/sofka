@@ -1316,6 +1316,7 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
         }
     };
     if app.kind_plural == "machinedeployments"
+        && app.configured_drill().is_none()
         && app
             .kind
             .as_ref()
@@ -2172,24 +2173,71 @@ fn draw_scrollable(
     area: Rect,
     accent: ratatui::style::Color,
 ) {
+    draw_document(
+        frame,
+        show_scrollbars,
+        fullscreen,
+        view,
+        area,
+        accent,
+        |line| Line::from(highlight_yaml(line)),
+    );
+}
+
+/// A scrollable document with its search highlights and `V` selection.
+/// `style` colors one source line before the highlights are applied.
+fn draw_document(
+    frame: &mut Frame,
+    show_scrollbars: bool,
+    fullscreen: bool,
+    view: &mut crate::app::Scrollable,
+    area: Rect,
+    accent: ratatui::style::Color,
+    style: impl Fn(&str) -> Line<'static>,
+) {
     let inner_w = area.width.saturating_sub(if fullscreen { 0 } else { 2 }) as usize;
     let inner_h = area.height.saturating_sub(if fullscreen { 1 } else { 2 }) as usize;
-    view.set_viewport(inner_w, inner_h);
+    let selection = view.selection();
+    let content_w = if selection.is_some() {
+        inner_w.saturating_sub(SELECTION_GUTTER).max(1)
+    } else {
+        inner_w
+    };
+    view.set_viewport(content_w, inner_h);
+    view.reveal_selection();
     let (start, end, row_offset) = view.visible_source_window();
     let text: Vec<Line> = view
         .lines
         .iter()
         .skip(start)
         .take(end - start)
-        .map(|l| {
-            let line = strip_ansi_if_present(l);
-            highlight_matches(Line::from(highlight_yaml(&line)), &view.filter)
-        })
+        .map(|l| highlight_matches(style(&strip_ansi_if_present(l)), &view.filter))
         .collect();
-    let text = if view.wrap {
-        visible_wrapped_rows(text, inner_w, row_offset, inner_h)
-    } else {
-        text
+    let text = match selection {
+        Some(selection) => {
+            let range = selection.range();
+            let rows: Vec<_> = text
+                .into_iter()
+                .zip(start..)
+                .flat_map(|(line, i)| {
+                    let mark = range.contains(&i).then_some(i == selection.cursor);
+                    let rows = if view.wrap {
+                        wrap_line(line, content_w)
+                    } else {
+                        vec![skip_columns(line, view.hscroll)]
+                    };
+                    rows.into_iter()
+                        .enumerate()
+                        .map(move |(row, line)| (line, mark.map(|cursor| cursor && row == 0)))
+                })
+                .skip(row_offset)
+                .take(inner_h)
+                .map(|(line, mark)| selection_row(line, mark))
+                .collect();
+            rows
+        }
+        None if view.wrap => visible_wrapped_rows(text, inner_w, row_offset, inner_h),
+        None => text,
     };
     let block = Block::default()
         .borders(if fullscreen {
@@ -2203,7 +2251,7 @@ fn draw_scrollable(
     let p = Paragraph::new(text).block(block);
     // Wrapped lines are already sliced to the exact visible display rows;
     // otherwise honor the horizontal offset for content past the right edge.
-    let p = if view.wrap {
+    let p = if view.wrap || selection.is_some() {
         p
     } else {
         p.scroll((0, view.hscroll.min(u16::MAX as usize) as u16))
@@ -2212,6 +2260,31 @@ fn draw_scrollable(
     if !fullscreen {
         draw_document_scrollbars(frame, show_scrollbars, view, area);
     }
+}
+
+/// Columns the selection markers take at the left of logs and documents.
+const SELECTION_GUTTER: usize = 2;
+
+/// Prefix a row with its selection gutter. `mark` is `None` outside the
+/// selection, `Some(true)` on the cursor's first row and `Some(false)` on the
+/// other selected rows, which also take a background.
+fn selection_row(line: Line<'static>, mark: Option<bool>) -> Line<'static> {
+    let (gutter, style) = match mark {
+        None => ("  ", Style::default()),
+        Some(true) => (
+            "▶ ",
+            Style::default()
+                .fg(theme::lavender())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Some(false) => ("▌ ", Style::default().fg(theme::lavender())),
+    };
+    let mut line = line;
+    line.spans.insert(0, Span::styled(gutter, style));
+    if mark.is_some() {
+        line = line.patch_style(Style::default().bg(theme::surface1()));
+    }
+    line
 }
 
 fn visible_wrapped_rows(
@@ -2265,12 +2338,20 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         && !(filter.len() >= 2 && filter.starts_with('/') && filter.ends_with('/'));
     let highlight = if is_plain { filter.as_str() } else { "" };
 
+    // A line selection takes a gutter column for its markers.
+    let selecting = app.logs.selecting();
+    let content_w = if selecting {
+        inner_w.saturating_sub(SELECTION_GUTTER).max(1)
+    } else {
+        inner_w
+    };
+
     // Which lines pass the filter, and where each starts in display rows.
     // Maintained incrementally across frames (see `LogIndex`) rather than
     // rebuilt: the buffer runs to 100k lines while paused, and the viewport
     // shows ~40.
     let wrap = app.logs.wrap;
-    let wrap_width = if wrap { inner_w } else { 0 };
+    let wrap_width = if wrap { content_w } else { 0 };
     let total_rows = app.logs.refresh_index(wrap_width).total_rows();
 
     // Record viewport geometry (display rows) so key handlers clamp the scroll
@@ -2278,7 +2359,8 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     // into rows when shifting a paused anchor.
     app.logs.viewport_rows = total_rows;
     app.logs.viewport_h = inner_h;
-    app.logs.last_wrap_width = if app.logs.wrap { inner_w } else { 0 };
+    app.logs.last_wrap_width = wrap_width;
+    app.logs.reveal_selection();
 
     // Deepest offset pins the last full page to the viewport bottom; that same
     // value is where `follow` anchors, so pausing freezes exactly in place.
@@ -2298,6 +2380,7 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     // The first one is found by binary search over the index's cumulative row
     // ends, not by walking the buffer from the top.
     let mut rows: Vec<Line> = Vec::with_capacity(inner_h);
+    let mut marks: Vec<Option<bool>> = Vec::with_capacity(inner_h);
     {
         let index = app.logs.index();
         let first = index.first_at_row(scroll);
@@ -2307,9 +2390,11 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
                 break;
             }
             let Some(buf_idx) = index.line_at(i) else {
-                rows.push(Line::styled("-".repeat(inner_w), theme::dim()));
+                rows.push(Line::styled("-".repeat(content_w), theme::dim()));
+                marks.push(None);
                 continue;
             };
+            let selected = app.logs.line_selected(buf_idx);
             let l = app.logs.display_line(buf_idx);
             let severity = app.logs.record_severity(buf_idx);
             let record = app.logs.record_parts(buf_idx).zip(severity);
@@ -2329,23 +2414,24 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
                     ),
                 };
                 let parts = if wrap {
-                    wrap_line(line, inner_w)
+                    wrap_line(line, content_w)
                 } else {
                     vec![line]
                 };
                 for sub in parts {
                     let r = row + offset;
-                    offset += 1;
                     if r >= scroll && r < scroll + inner_h {
                         rows.push(sub);
+                        marks.push(selected.map(|cursor| cursor && offset == 0));
                     }
+                    offset += 1;
                 }
             }
         }
     }
 
     let flags = format!(
-        "{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}",
         match app.logs.json {
             crate::app::JsonView::Raw => "",
             crate::app::JsonView::Record => " record",
@@ -2365,6 +2451,11 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         },
         if app.logs.wrap { " wrap" } else { "" },
         if app.logs.timestamps { " ts" } else { "" },
+        if selecting {
+            format!(" ▌{} selected", app.logs.selected_lines())
+        } else {
+            String::new()
+        },
         // Provider views manage the window in their own title suffix.
         match app.logs.anchor_label() {
             Some(l) if !app.provider_logs_active() => format!(" ⏱{l}"),
@@ -2396,7 +2487,7 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     app.logs.max_hscroll = if wrap {
         0
     } else {
-        widest.saturating_sub(inner_w)
+        widest.saturating_sub(content_w)
     };
     let hscroll = app.logs.view.hscroll.min(app.logs.max_hscroll);
     app.logs.view.hscroll = hscroll;
@@ -2404,6 +2495,13 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         rows = rows
             .into_iter()
             .map(|line| skip_columns(line, hscroll))
+            .collect();
+    }
+    if selecting {
+        rows = rows
+            .into_iter()
+            .zip(marks)
+            .map(|(line, mark)| selection_row(line, mark))
             .collect();
     }
     let block = if fullscreen {
@@ -3034,65 +3132,40 @@ fn draw_diff(
     view: &mut crate::app::Scrollable,
     area: Rect,
 ) {
-    let inner_w = area.width.saturating_sub(if fullscreen { 0 } else { 2 }) as usize;
-    let inner_h = area.height.saturating_sub(if fullscreen { 1 } else { 2 }) as usize;
-    view.set_viewport(inner_w, inner_h);
-    let (start, end, row_offset) = view.visible_source_window();
-    let lines: Vec<Line> = view
-        .lines
-        .iter()
-        .skip(start)
-        .take(end - start)
-        .map(|l| {
-            let line = strip_ansi_if_present(l);
+    draw_document(
+        frame,
+        show_scrollbars,
+        fullscreen,
+        view,
+        area,
+        theme::peach(),
+        |line| {
             let color = match line.chars().next() {
                 Some('+') => theme::green(),
                 Some('-') => theme::red(),
                 _ => theme::overlay1(),
             };
-            let line = Line::from(Span::styled(line.into_owned(), Style::default().fg(color)));
-            highlight_matches(line, &view.filter)
-        })
-        .collect();
-    let lines = if view.wrap {
-        visible_wrapped_rows(lines, inner_w, row_offset, inner_h)
-    } else {
-        lines
-    };
-    let block = Block::default()
-        .borders(if fullscreen {
-            Borders::NONE
-        } else {
-            Borders::ALL
-        })
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::peach()))
-        .title(Span::styled(doc_title(view), theme::title()));
-    let p = Paragraph::new(lines).block(block);
-    let p = if view.wrap {
-        p
-    } else {
-        p.scroll((0, view.hscroll.min(u16::MAX as usize) as u16))
-    };
-    frame.render_widget(p, area);
-    if !fullscreen {
-        draw_document_scrollbars(frame, show_scrollbars, view, area);
-    }
+            Line::from(Span::styled(line.to_owned(), Style::default().fg(color)))
+        },
+    );
 }
 
 /// Doc-view title, extended with the active search query and the current
 /// match position (` title · /query [2/5] `, or `[no matches]`), vim-style.
 fn doc_title(view: &crate::app::Scrollable) -> String {
+    let selected = view.selection().map_or_else(String::new, |selection| {
+        format!("▌{} selected ", selection.range().count())
+    });
     if view.filter.is_empty() {
-        return format!(" {} ", view.title);
+        return format!(" {} {selected}", view.title);
     }
     let matches = view.match_lines();
     if matches.is_empty() {
-        format!(" {} · /{} [no matches] ", view.title, view.filter)
+        format!(" {} · /{} [no matches] {selected}", view.title, view.filter)
     } else {
         let cur = view.match_idx.min(matches.len() - 1) + 1;
         format!(
-            " {} · /{} [{}/{}] ",
+            " {} · /{} [{}/{}] {selected}",
             view.title,
             view.filter,
             cur,
@@ -3316,7 +3389,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
         } else if scope == "table" && action == Action::Logs {
             "logs (marked pods, or current row)"
         } else if scope == "table" && action == Action::ActionMenu {
-            "action menu: Flux suspend/resume/reconcile (includes HelmChart and flux-operator kinds; HelmRelease, ResourceSetInputProvider, FluxInstance: + force reconcile); Argo CD suspend/resume (Application: + refresh, hard refresh, sync, sync with prune); CronJobs trigger/suspend/resume; pods file transfer"
+            "action menu: Flux suspend/resume/reconcile (includes HelmChart, flux-operator kinds, and tofu-controller Terraform; HelmRelease, ResourceSetInputProvider, FluxInstance: + force reconcile); Argo CD suspend/resume (Application: + refresh, hard refresh, sync, sync with prune); CronJobs trigger/suspend/resume; pods file transfer"
         } else if scope == "port_forward_picker" && action == Action::Edit {
             "edit local port of the selected mapping"
         } else if scope == "logs" && action == Action::Lookback {
@@ -3325,6 +3398,18 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
             "scroll left (unwrapped lines)"
         } else if scope == "logs" && action == Action::Right {
             "scroll right (unwrapped lines)"
+        } else if scope == "logs" && action == Action::SelectLines {
+            "select whole lines the filter shows; movement keys extend it and autoscroll pauses"
+        } else if action == Action::SelectLines {
+            "select whole lines; movement and match keys extend it"
+        } else if scope == "logs" && action == Action::Copy {
+            "copy the shown lines, or only the selected ones"
+        } else if action == Action::Copy && matches!(scope, "detail" | "diff" | "events") {
+            "copy the document, or only the selected lines"
+        } else if scope == "logs" && action == Action::Back {
+            "cancel the selection, or go back"
+        } else if action == Action::Back && matches!(scope, "detail" | "diff" | "events") {
+            "cancel the selection, then clear the search, then go back"
         } else if action == Action::LogMarker {
             "add visual marker at the log tail (excluded from copy/save)"
         } else if action == Action::Fullscreen {
@@ -3404,7 +3489,10 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
         ":rollout-history",
         "deployment/statefulset/daemonset revisions: ⏎ diff · r rollback",
     ));
-    lines.push(bind(":events", "browse all events"));
+    lines.push(bind(
+        ":events",
+        "browse events in this namespace · 0 for all",
+    ));
     lines.push(bind(":pf", "view/stop background port-forwards"));
     lines.push(bind(":skin", "preview and switch color skin"));
     lines.push(bind(
@@ -3414,6 +3502,10 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
     lines.push(bind(
         ":reload · :config · :info",
         "reload config · config sources + warnings · runtime diagnostics",
+    ));
+    lines.push(bind(
+        ":config edit [base|cluster|context]",
+        "open that config file in $EDITOR, reload when it closes",
     ));
     lines.push(bind(
         ":check-update",
@@ -4034,11 +4126,14 @@ fn draw_copy_picker(frame: &mut Frame, app: &mut App, area: Rect) {
 /// takes an explicit, visible choice.
 fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
-    let count = app.marked.len().max(1);
-    let target = if count == 1 {
-        "current selection".to_string()
+    let target = if let [(name, _)] = app.action_menu_targets.as_slice() {
+        name.clone()
     } else {
-        format!("{count} marked {}", app.kind_plural)
+        format!(
+            "{} marked {}",
+            app.action_menu_targets.len(),
+            app.kind_plural
+        )
     };
     let items: Vec<Text> = app
         .action_menu_items()
@@ -5348,6 +5443,10 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(s.label.clone(), Style::default().fg(theme::peach())),
                 Span::styled("  layout", theme::dim()),
             ])),
+            SuggestKind::ConfigArg => Text::from(Line::from(vec![
+                Span::styled(s.label.clone(), Style::default().fg(theme::peach())),
+                Span::styled("  config", theme::dim()),
+            ])),
             // Saved bookmarks read as a distinct, high-value jump (a ★ tag).
             SuggestKind::Bookmark => Text::from(Line::from(vec![
                 Span::styled(
@@ -6185,6 +6284,24 @@ fn navigation_hint(app: &App, width: u16) -> Line<'static> {
             ],
         );
     }
+    let selecting = match scope {
+        "logs" => app.logs.selecting(),
+        "detail" | "diff" | "events" => app.detail.selection().is_some(),
+        _ => false,
+    };
+    if selecting {
+        return key_hint(
+            app,
+            scope,
+            &[
+                (Action::Down, "extend"),
+                (Action::Up, "extend"),
+                (Action::SelectionOtherEnd, "other end"),
+                (Action::CopyLines, "copy"),
+                (Action::Back, "cancel"),
+            ],
+        );
+    }
     let preferred = match scope {
         "logs" => &[
             Action::Back,
@@ -6860,6 +6977,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn help_shows_the_contexts_action_unbound_until_configured() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+            .unwrap();
+        let row = |app: &App| {
+            build_help(app, 120)
+                .0
+                .iter()
+                .map(Line::to_string)
+                .find(|line| line.ends_with("context switcher"))
+                .unwrap()
+        };
+        assert!(row(&app).contains("unbound"), "{}", row(&app));
+        let cfg: crate::config::Config =
+            toml::from_str("[keys.table]\ncontexts = 'ctrl-y'").unwrap();
+        app.keymap = crate::keymap::Keymap::compile(&cfg.keys).unwrap();
+        assert!(row(&app).contains("ctrl-y"), "{}", row(&app));
+    }
+
+    #[tokio::test]
     async fn help_cache_tracks_inputs_and_reuses_lines_when_scrolling() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use ratatui::{Terminal, backend::TestBackend};
@@ -7508,6 +7647,65 @@ mod tests {
         assert!(text.contains("secrets"), "{text}");
         assert!(!text.contains("argo view"), "{text}");
         assert_eq!(text.matches("yaml").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn machinedeployment_header_hint_matches_enter_target() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for configured in [false, true] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+            app.cluster.register_kind(
+                "cluster.x-k8s.io",
+                "MachineDeployment",
+                "machinedeployments",
+                true,
+            );
+            app.cluster
+                .register_kind("cluster.x-k8s.io", "Machine", "machines", true);
+            if configured {
+                app.user_views.insert(
+                    "machinedeployments".to_string(),
+                    crate::views::View {
+                        drill: Some(crate::views::Drill {
+                            kind: "secrets".to_string(),
+                            labels: None,
+                            fields: None,
+                        }),
+                        ..Default::default()
+                    },
+                );
+            }
+            app.switch_kind("machinedeployments.cluster.x-k8s.io");
+            let obj = serde_json::from_value(serde_json::json!({
+                "apiVersion": "cluster.x-k8s.io/v1beta1",
+                "kind": "MachineDeployment",
+                "metadata": {"name": "workers", "namespace": "default"},
+                "spec": {"selector": {"matchLabels": {"app": "x"}}}
+            }))
+            .unwrap();
+            app.handle_msg(crate::store::Msg::Applied {
+                generation: app.generation,
+                key: crate::store::row_key(&obj),
+                obj: Box::new(obj),
+            });
+            app.table_state.select(Some(0));
+
+            let target = if configured { "secrets" } else { "machines" };
+            let text = header_hints(&app)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(&format!("enter {target}")), "{text}");
+            assert_eq!(text.contains("machines"), !configured, "{text}");
+            assert_eq!(text.matches("yaml").count(), 1, "{text}");
+
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            assert_eq!(app.kind_plural, target);
+        }
     }
 
     #[test]

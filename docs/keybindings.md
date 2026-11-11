@@ -28,6 +28,18 @@ or that the mode already uses is skipped there, so in the example `ctrl-d`
 moves half a page and `ctrl-u` still clears the line. A mode setting, such as
 `[keys.namespaces]`, is used as written.
 
+## Example: a key for the context switcher
+
+```toml
+[keys.table]
+contexts = "ctrl-x"
+```
+
+`contexts` opens the same context picker as `:ctx` from a resource table. It
+has no default binding, because built-in keys take priority over bookmarks,
+workspaces, plugins, and imported k9s hotkeys, and a default key could take one
+already in use. Other views open the picker with `:ctx`.
+
 ## Values and scopes
 
 - A string sets one key combination. An array sets multiple combinations.
@@ -286,53 +298,59 @@ for those operations.
 
 ### `[keys.detail]`
 
-| Action           | Default bindings              |
-| ---------------- | ----------------------------- |
-| `auto_refresh`   | `r`                           |
-| `back`           | `esc`                         |
-| `close`          | `q`                           |
-| `copy`           | `c`                           |
-| `decode_secret`  | `x`                           |
-| `down`           | `j`, `down`                   |
-| `edit`           | `e`                           |
-| `filter`         | `/`                           |
-| `first`          | `g`, `home`                   |
-| `half_page_down` | unbound                       |
-| `half_page_up`   | unbound                       |
-| `last`           | `G`, `end`                    |
-| `left`           | `h`, `left`                   |
-| `next_match`     | `n`                           |
-| `page_down`      | `pagedown`, `space`, `ctrl-f` |
-| `page_up`        | `pageup`, `ctrl-b`            |
-| `previous_match` | `N`                           |
-| `right`          | `l`, `right`                  |
-| `save`           | `ctrl-s`                      |
-| `up`             | `k`, `up`                     |
-| `wrap`           | `w`                           |
+| Action                | Default bindings              |
+| --------------------- | ----------------------------- |
+| `auto_refresh`        | `r`                           |
+| `back`                | `esc`                         |
+| `close`               | `q`                           |
+| `copy`                | `c`                           |
+| `copy_lines`          | `y`                           |
+| `decode_secret`       | `x`                           |
+| `down`                | `j`, `down`                   |
+| `edit`                | `e`                           |
+| `filter`              | `/`                           |
+| `first`               | `g`, `home`                   |
+| `half_page_down`      | unbound                       |
+| `half_page_up`        | unbound                       |
+| `last`                | `G`, `end`                    |
+| `left`                | `h`, `left`                   |
+| `next_match`          | `n`                           |
+| `page_down`           | `pagedown`, `space`, `ctrl-f` |
+| `page_up`             | `pageup`, `ctrl-b`            |
+| `previous_match`      | `N`                           |
+| `right`               | `l`, `right`                  |
+| `save`                | `ctrl-s`                      |
+| `select_lines`        | `V`                           |
+| `selection_other_end` | `o`                           |
+| `up`                  | `k`, `up`                     |
+| `wrap`                | `w`                           |
 
 ### `[keys.diff]`
 
-| Action           | Default bindings              |
-| ---------------- | ----------------------------- |
-| `apply`          | `a`                           |
-| `back`           | `esc`                         |
-| `close`          | `q`                           |
-| `copy`           | `c`                           |
-| `down`           | `j`, `down`                   |
-| `filter`         | `/`                           |
-| `first`          | `g`, `home`                   |
-| `half_page_down` | unbound                       |
-| `half_page_up`   | unbound                       |
-| `last`           | `G`, `end`                    |
-| `left`           | `h`, `left`                   |
-| `next_match`     | `n`                           |
-| `page_down`      | `pagedown`, `space`, `ctrl-f` |
-| `page_up`        | `pageup`, `ctrl-b`            |
-| `previous_match` | `N`                           |
-| `right`          | `l`, `right`                  |
-| `save`           | `ctrl-s`                      |
-| `up`             | `k`, `up`                     |
-| `wrap`           | `w`                           |
+| Action                | Default bindings              |
+| --------------------- | ----------------------------- |
+| `apply`               | `a`                           |
+| `back`                | `esc`                         |
+| `close`               | `q`                           |
+| `copy`                | `c`                           |
+| `copy_lines`          | `y`                           |
+| `down`                | `j`, `down`                   |
+| `filter`              | `/`                           |
+| `first`               | `g`, `home`                   |
+| `half_page_down`      | unbound                       |
+| `half_page_up`        | unbound                       |
+| `last`                | `G`, `end`                    |
+| `left`                | `h`, `left`                   |
+| `next_match`          | `n`                           |
+| `page_down`           | `pagedown`, `space`, `ctrl-f` |
+| `page_up`             | `pageup`, `ctrl-b`            |
+| `previous_match`      | `N`                           |
+| `right`               | `l`, `right`                  |
+| `save`                | `ctrl-s`                      |
+| `select_lines`        | `V`                           |
+| `selection_other_end` | `o`                           |
+| `up`                  | `k`, `up`                     |
+| `wrap`                | `w`                           |
 
 ### `[keys.dir]`
 
@@ -363,26 +381,29 @@ for those operations.
 
 ### `[keys.events]`
 
-| Action           | Default bindings              |
-| ---------------- | ----------------------------- |
-| `back`           | `esc`                         |
-| `close`          | `q`                           |
-| `copy`           | `c`                           |
-| `down`           | `j`, `down`                   |
-| `filter`         | `/`                           |
-| `first`          | `g`, `home`                   |
-| `half_page_down` | unbound                       |
-| `half_page_up`   | unbound                       |
-| `last`           | `G`, `end`                    |
-| `left`           | `h`, `left`                   |
-| `next_match`     | `n`                           |
-| `page_down`      | `pagedown`, `space`, `ctrl-f` |
-| `page_up`        | `pageup`, `ctrl-b`            |
-| `previous_match` | `N`                           |
-| `right`          | `l`, `right`                  |
-| `save`           | `ctrl-s`                      |
-| `up`             | `k`, `up`                     |
-| `wrap`           | `w`                           |
+| Action                | Default bindings              |
+| --------------------- | ----------------------------- |
+| `back`                | `esc`                         |
+| `close`               | `q`                           |
+| `copy`                | `c`                           |
+| `copy_lines`          | `y`                           |
+| `down`                | `j`, `down`                   |
+| `filter`              | `/`                           |
+| `first`               | `g`, `home`                   |
+| `half_page_down`      | unbound                       |
+| `half_page_up`        | unbound                       |
+| `last`                | `G`, `end`                    |
+| `left`                | `h`, `left`                   |
+| `next_match`          | `n`                           |
+| `page_down`           | `pagedown`, `space`, `ctrl-f` |
+| `page_up`             | `pageup`, `ctrl-b`            |
+| `previous_match`      | `N`                           |
+| `right`               | `l`, `right`                  |
+| `save`                | `ctrl-s`                      |
+| `select_lines`        | `V`                           |
+| `selection_other_end` | `o`                           |
+| `up`                  | `k`, `up`                     |
+| `wrap`                | `w`                           |
 
 ### `[keys.explain]`
 
@@ -495,38 +516,41 @@ for those operations.
 
 ### `[keys.logs]`
 
-| Action           | Default bindings    |
-| ---------------- | ------------------- |
-| `all_containers` | `a`                 |
-| `anchor_0`       | `0`                 |
-| `anchor_1`       | `1`                 |
-| `anchor_2`       | `2`                 |
-| `anchor_3`       | `3`                 |
-| `anchor_4`       | `4`                 |
-| `anchor_5`       | `5`                 |
-| `back`           | `esc`               |
-| `clear`          | `z`                 |
-| `close`          | `q`                 |
-| `copy`           | `c`                 |
-| `down`           | `j`, `down`         |
-| `filter`         | `/`                 |
-| `first`          | `g`, `home`         |
-| `follow`         | `s`, `f`            |
-| `fullscreen`     | `F`                 |
-| `half_page_down` | unbound             |
-| `half_page_up`   | unbound             |
-| `last`           | `G`, `end`          |
-| `left`           | `h`, `left`         |
-| `lookback`       | `T`                 |
-| `page_down`      | `pagedown`, `space` |
-| `page_up`        | `pageup`            |
-| `right`          | `l`, `right`        |
-| `save`           | `ctrl-s`            |
-| `stream`         | `x`                 |
-| `json`           | `J`                 |
-| `timestamps`     | `t`                 |
-| `up`             | `k`, `up`           |
-| `wrap`           | `w`                 |
+| Action                | Default bindings              |
+| --------------------- | ----------------------------- |
+| `all_containers`      | `a`                           |
+| `anchor_0`            | `0`                           |
+| `anchor_1`            | `1`                           |
+| `anchor_2`            | `2`                           |
+| `anchor_3`            | `3`                           |
+| `anchor_4`            | `4`                           |
+| `anchor_5`            | `5`                           |
+| `back`                | `esc`                         |
+| `clear`               | `z`                           |
+| `close`               | `q`                           |
+| `copy`                | `c`                           |
+| `copy_lines`          | `y`                           |
+| `down`                | `j`, `down`                   |
+| `filter`              | `/`                           |
+| `first`               | `g`, `home`                   |
+| `follow`              | `s`, `f`                      |
+| `fullscreen`          | `F`                           |
+| `half_page_down`      | unbound                       |
+| `half_page_up`        | unbound                       |
+| `last`                | `G`, `end`                    |
+| `left`                | `h`, `left`                   |
+| `lookback`            | `T`                           |
+| `page_down`           | `pagedown`, `space`, `ctrl-f` |
+| `page_up`             | `pageup`, `ctrl-b`            |
+| `right`               | `l`, `right`                  |
+| `save`                | `ctrl-s`                      |
+| `select_lines`        | `V`                           |
+| `selection_other_end` | `o`                           |
+| `stream`              | `x`                           |
+| `json`                | `J`                           |
+| `timestamps`          | `t`                           |
+| `up`                  | `k`, `up`                     |
+| `wrap`                | `w`                           |
 
 ### `[keys.namespaces]`
 
@@ -657,6 +681,7 @@ for those operations.
 | `approve`            | `V`                  |
 | `attach`             | `a`                  |
 | `back`               | `esc`                |
+| `contexts`           | unbound              |
 | `copy_cell`          | `Y`                  |
 | `copy_name`          | `c`                  |
 | `cordon`             | `C`                  |

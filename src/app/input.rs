@@ -526,6 +526,7 @@ impl App {
             // `f`/Shift-F = port-forward.
             (Some(Action::PortForward), _) => self.request_port_forward(),
             (Some(Action::Namespaces), _) => self.open_namespaces(),
+            (Some(Action::Contexts), _) => self.open_contexts(),
             (Some(Action::NamespaceSelected), _) => self.select_resource_namespace(),
             // Browser-style view history: [ back, ] forward.
             (Some(Action::HistoryBack), _) => self.history_back(),
@@ -663,6 +664,7 @@ impl App {
             SuggestKind::Namespace => namespace_word(&self.command).unwrap_or(1),
             SuggestKind::Context => 1,
             SuggestKind::Layout => layout_word(&self.command).unwrap_or(1),
+            SuggestKind::ConfigArg => config_edit::config_word(&self.command),
             _ => 0,
         };
         let span = self.command.split_whitespace().nth(slot).map(|word| {
@@ -708,6 +710,10 @@ impl App {
         match source {
             Mode::Logs => self.stop_log_stream(),
             Mode::Events => self.stop_event_stream(),
+            Mode::FluxMenu => {
+                self.action_menu_targets.clear();
+                self.action_menu_objects.clear();
+            }
             _ => {}
         }
         self.cancel_explain_request();
@@ -786,6 +792,20 @@ impl App {
                     self.set_layout(&s.label);
                 }
             }
+            // A highlighted word replaces the one being typed. With nothing
+            // typed in its place, the line runs as it is, so `:config ` and
+            // `:config edit ` keep their bare meaning.
+            Some(SuggestKind::ConfigArg) => {
+                let slot = config_edit::config_word(&raw);
+                let mut words: Vec<&str> = raw.split_whitespace().collect();
+                if let Some(s) = picked.as_ref()
+                    && (words.len() > slot || navigated)
+                {
+                    words.truncate(slot);
+                    words.push(&s.label);
+                }
+                self.run_palette_command(&words.join(" "));
+            }
             // A name owned by a CRD resolves to the CRD even when a
             // built-in command shares it — the cluster's vocabulary
             // outranks ours, and the suggestion list already ranks the
@@ -831,7 +851,8 @@ impl App {
                         | SuggestKind::Context
                         | SuggestKind::Bookmark
                         | SuggestKind::Workspace
-                        | SuggestKind::Layout => {}
+                        | SuggestKind::Layout
+                        | SuggestKind::ConfigArg => {}
                     }
                 } else if !head.is_empty() {
                     self.switch_kind_ns(&head, ns_arg);
@@ -1010,6 +1031,14 @@ impl App {
             self.switch_kind_ns(first, parts.next());
             return true;
         }
+        // `:config edit [level]` opens a config file; bare `:config` shows
+        // the sources.
+        if let Some((first, args)) = cmd.split_once(char::is_whitespace)
+            && matches!(first, "config" | "cfg")
+        {
+            self.run_config_command(args);
+            return true;
+        }
         if let Some(args) = cmd.strip_prefix("policy ") {
             self.open_policy(args.trim());
             return true;
@@ -1090,6 +1119,10 @@ impl App {
         }) {
             if is_ctx_command(&head) {
                 self.suggest_contexts(&arg);
+                return;
+            }
+            if matches!(head.as_str(), "config" | "cfg") && self.cluster.resolve(&head).is_none() {
+                self.suggest_config_args();
                 return;
             }
             if head == "layout" && self.cluster.resolve(&head).is_none() {
@@ -1460,6 +1493,9 @@ impl App {
             ));
             return;
         }
+        if detail && self.key_doc_selection(key) {
+            return;
+        }
         let target = if detail {
             &mut self.detail
         } else {
@@ -1537,10 +1573,10 @@ impl App {
             (Some(Action::Left), _) => target.scroll_h(-5),
             (Some(Action::Right), _) => target.scroll_h(5),
             (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => {
-                target.scroll_by(a.page_size(20) as i32)
+                target.scroll_by(a.page_size(DOCUMENT_PAGE) as i32)
             }
             (Some(a @ (Action::PageUp | Action::HalfPageUp)), _) => {
-                target.scroll_by(-(a.page_size(20) as i32))
+                target.scroll_by(-(a.page_size(DOCUMENT_PAGE) as i32))
             }
             (Some(Action::First), _) => {
                 target.scroll = 0;
@@ -1559,6 +1595,9 @@ impl App {
     }
 
     pub(super) fn key_logs(&mut self, key: KeyInput) {
+        if self.key_log_selection(key) {
+            return;
+        }
         if key.action == Some(Action::LogWarnings) {
             self.logs.toggle_warnings();
             return;

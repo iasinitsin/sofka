@@ -79,6 +79,9 @@ impl App {
 /// this; resuming follow trims back to the configured `[logs] buffer`.
 const MAX_LOG_LINES_PAUSED: usize = 100_000;
 
+/// Lines one page key moves in a document view.
+const DOCUMENT_PAGE: usize = 20;
+
 /// Log streams batch lines before sending them through the UI channel. This
 /// avoids one wake-up/message per line under high-volume workloads while still
 /// flushing quickly for low-volume logs.
@@ -101,6 +104,10 @@ const ARGOCD_GROUP: &str = "argoproj.io";
 /// The flux-operator CRD group (ResourceSet, ResourceSetInputProvider,
 /// FluxInstance). These kinds pause through an annotation, not `spec.suspend`.
 const FLUX_OPERATOR_GROUP: &str = "fluxcd.controlplane.io";
+
+/// The tofu-controller CRD group (Terraform). Its plural is generic enough
+/// that only this group gets the Flux handling.
+const TOFU_CONTROLLER_GROUP: &str = "infra.contrib.fluxcd.io";
 
 /// Items in the Flux action menu (`t`), in display order. Deliberately a menu
 /// — not a single-key toggle — so suspending something always takes an
@@ -300,6 +307,16 @@ type UpdateFetcher = fn(
     Box<dyn std::future::Future<Output = Result<crate::update::Release, String>> + Send>,
 >;
 
+/// Runs one `helm` command. Tests can replace it to avoid running Helm.
+type HelmRunner = std::sync::Arc<
+    dyn Fn(
+            Vec<String>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 fn default_update_fetcher(
     force: bool,
 ) -> std::pin::Pin<
@@ -347,6 +364,7 @@ impl Cascade {
 enum ConfirmAction {
     /// One or more `(name, ns)` targets to delete (bulk when marked).
     Delete {
+        kind: Kind,
         targets: Vec<(String, String)>,
         force: bool,
         cascade: Cascade,
@@ -362,7 +380,7 @@ enum ConfirmAction {
     },
     /// Edit a Flux-managed object (`kubectl edit`) after warning that the edit
     /// will be reverted on the next reconcile.
-    Edit { argv: Vec<String> },
+    Edit { argv: Vec<String>, label: String },
     /// Patch the keys changed in the decoded Secret editor.
     SecretEdit {
         kind: Kind,
@@ -681,6 +699,10 @@ pub struct Scrollable {
     /// YAML view with a `/` search active that was thousands of allocations
     /// at up to 62 Hz.
     match_cache: RefCell<Option<MatchCache>>,
+    /// `V` line selection over source line indices.
+    selection: Option<LineSelection>,
+    /// The selection cursor moved; the next draw scrolls it into view.
+    reveal_cursor: bool,
 }
 
 struct MatchCache {
@@ -740,6 +762,8 @@ pub enum SuggestKind {
     Workspace,
     /// A named layout for `:layout <name>` or `:<kind> -o <name>`.
     Layout,
+    /// A word after `:config`: `edit`, then the level.
+    ConfigArg,
 }
 
 /// A built-in palette action, plus the names/aliases that select it. The first
@@ -1200,6 +1224,7 @@ impl Scrollable {
             .map(|viewport| (viewport.width, viewport.height));
         self.lines = lines;
         self.scroll_h(0);
+        self.clamp_selection();
         self.revision = self.revision.wrapping_add(1);
         self.viewport = None;
         if let Some((width, height)) = dimensions {
@@ -1303,6 +1328,9 @@ pub struct LogIndex {
     consumed: usize,
     /// Buffer indices in display order. None is a visual marker row.
     shown: Vec<Option<u32>>,
+    /// Where each log line sits in [`Self::shown`], markers left out, so a
+    /// line selection finds lines by binary search.
+    lines: Vec<u32>,
     consumed_markers: usize,
     /// Cumulative display rows *through* `shown[i]`, so the first row of
     /// `shown[i]` is `ends[i-1]` (0 for i == 0).
@@ -1356,6 +1384,7 @@ impl LogIndex {
         self.consumed = 0;
         self.consumed_markers = 0;
         self.shown.clear();
+        self.lines.clear();
         self.ends.clear();
         self.total_rows = 0;
     }
@@ -1408,6 +1437,12 @@ pub struct LogsView {
     source: Option<LogSource>,
     /// Filter/wrap index over [`Self::view`], maintained incrementally.
     index: LogIndex,
+    /// `V` line selection over stable line positions, like [`Self::markers`].
+    selection: Option<LineSelection>,
+    /// Autoscroll before the selection paused it, restored when it ends.
+    selection_follow: bool,
+    /// The selection cursor moved; the next draw scrolls it into view.
+    reveal_cursor: bool,
 }
 
 impl Default for LogsView {
@@ -1435,6 +1470,9 @@ impl Default for LogsView {
             max_hscroll: 0,
             source: None,
             index: LogIndex::default(),
+            selection: None,
+            selection_follow: false,
+            reveal_cursor: false,
         }
     }
 }
@@ -1474,6 +1512,7 @@ impl LogsView {
     }
 
     fn clear_lines(&mut self) {
+        self.end_selection();
         self.view.clear_lines();
         self.line_meta.clear();
         self.json_budget = logs::JSON_CACHE_LIMIT;
@@ -1487,6 +1526,7 @@ impl LogsView {
             return;
         }
         self.line_offset += count;
+        self.clamp_selection();
         let removed_markers = self.markers.partition_point(|&pos| pos < self.line_offset);
         if !self.follow {
             let rows: usize = self
@@ -1585,6 +1625,7 @@ impl LogsView {
             {
                 continue;
             }
+            index.lines.push(index.shown.len() as u32);
             index.shown.push(Some(i as u32));
             let display = line_meta
                 .get(i)
@@ -2205,6 +2246,8 @@ pub struct App {
     document_edit_task: Option<JoinHandle<()>>,
     document_edit_request: u64,
     secret_edit: Option<secret_edit::SecretEdit>,
+    /// `:config edit` is waiting for the editor to close.
+    config_edit: bool,
     reload_after_suspend: bool,
     pub(super) refresh_generation: u64,
     document_source: Option<refresh::RefreshSource>,
@@ -2423,6 +2466,8 @@ pub struct App {
     pub pf_picker_state: ListState,
     /// The `(ns, name)` target the port-forward picker is acting on.
     pub(super) pf_picker_target: Option<(String, String)>,
+    pub(super) action_menu_targets: Vec<(String, String)>,
+    pub(super) action_menu_objects: Vec<DynamicObject>,
     /// Saved `[[forwards]]` from config: shown in `:pf` even while stopped,
     /// startable with one keystroke, autostarted on connect when configured.
     pub forwards_cfg: Vec<crate::config::Forward>,
@@ -2692,6 +2737,7 @@ pub struct App {
     /// The latest release the last update check found.
     pub latest_release: Option<crate::update::Release>,
     update_fetcher: UpdateFetcher,
+    helm_runner: HelmRunner,
     /// Active column layout for the current view; rebuilt by
     /// [`App::refresh_view_spec`] whenever kind/views/wide change.
     spec: crate::columns::ViewSpec,
@@ -2803,6 +2849,7 @@ impl App {
             document_edit_task: None,
             document_edit_request: 0,
             secret_edit: None,
+            config_edit: false,
             reload_after_suspend: false,
             refresh_generation: 0,
             document_source: None,
@@ -2900,6 +2947,8 @@ impl App {
             pf_picker_in_use: Vec::new(),
             pf_picker_state: ListState::default(),
             pf_picker_target: None,
+            action_menu_targets: Vec::new(),
+            action_menu_objects: Vec::new(),
             notify_cfg: crate::config::NotifyConfig::default(),
             keymap: Keymap::default(),
             pf_state: ListState::default(),
@@ -3047,6 +3096,7 @@ impl App {
             save_dir: None,
             latest_release: None,
             update_fetcher: default_update_fetcher,
+            helm_runner: std::sync::Arc::new(|argv| Box::pin(actions::run_helm(argv))),
             spec: crate::columns::build_spec("", "", None, None, false),
             pinned_columns: None,
         }
@@ -3149,13 +3199,16 @@ mod input;
 mod journal;
 mod layouts;
 mod lifecycle;
+mod line_select;
 mod log_follow;
+pub use line_select::LineSelection;
 mod logs;
 pub use logs::{JsonView, RecordPart, RecordSpan};
 mod metrics_history;
 mod mouse;
 mod namespace_patterns;
 pub use namespace_patterns::NamespacePatternAction;
+mod config_edit;
 mod navigation;
 mod notify;
 pub mod ns_resources;

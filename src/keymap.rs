@@ -45,9 +45,11 @@ actions! {
     Close => ("close", "close view"),
     Command => ("command", "command palette"),
     Compact => ("compact", "toggle compact mode"),
+    Contexts => ("contexts", "context switcher"),
     Complete => ("complete", "fill the highlighted suggestion"),
     Copy => ("copy", "copy"),
     CopyCell => ("copy_cell", "copy cell"),
+    CopyLines => ("copy_lines", "copy the selected lines"),
     CopyName => ("copy_name", "copy name"),
     Cordon => ("cordon", "cordon"),
     Debug => ("debug", "debug"),
@@ -124,6 +126,8 @@ actions! {
     RestartOrRefresh => ("restart_or_refresh", "restart, sync, rollback, or refresh"),
     Right => ("right", "right"),
     Save => ("save", "save"),
+    SelectLines => ("select_lines", "start or cancel a line selection"),
+    SelectionOtherEnd => ("selection_other_end", "move to the other end of the selection"),
     SetImage => ("set_image", "set image"),
     Shell => ("shell", "shell"),
     ShellOrScale => ("shell_or_scale", "shell or scale through /scale"),
@@ -180,6 +184,7 @@ impl Action {
                 "resourcesets",
                 "fluxinstances",
                 "resourcesetinputproviders",
+                "terraforms",
                 "applications",
                 "applicationsets",
             ]),
@@ -382,6 +387,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("detail", Action::Back, &["esc"]),
     ("detail", Action::Close, &["q"]),
     ("detail", Action::Copy, &["c"]),
+    ("detail", Action::CopyLines, &["y"]),
     ("detail", Action::DecodeSecret, &["x"]),
     ("detail", Action::Down, &["j", "down"]),
     ("detail", Action::Edit, &["e"]),
@@ -397,6 +403,8 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("detail", Action::PreviousMatch, &["N"]),
     ("detail", Action::Right, &["l", "right"]),
     ("detail", Action::Save, &["ctrl-s"]),
+    ("detail", Action::SelectLines, &["V"]),
+    ("detail", Action::SelectionOtherEnd, &["o"]),
     ("detail", Action::Up, &["k", "up"]),
     ("detail", Action::Wrap, &["w"]),
     ("diff", Action::AutoRefresh, &["r"]),
@@ -405,6 +413,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("diff", Action::Back, &["esc"]),
     ("diff", Action::Close, &["q"]),
     ("diff", Action::Copy, &["c"]),
+    ("diff", Action::CopyLines, &["y"]),
     ("diff", Action::Down, &["j", "down"]),
     ("diff", Action::Filter, &["/"]),
     ("diff", Action::First, &["g", "home"]),
@@ -417,6 +426,8 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("diff", Action::PreviousMatch, &["N"]),
     ("diff", Action::Right, &["l", "right"]),
     ("diff", Action::Save, &["ctrl-s"]),
+    ("diff", Action::SelectLines, &["V"]),
+    ("diff", Action::SelectionOtherEnd, &["o"]),
     ("diff", Action::Up, &["k", "up"]),
     ("diff", Action::Wrap, &["w"]),
     ("dir", Action::Accept, &["enter"]),
@@ -441,6 +452,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("events", Action::Back, &["esc"]),
     ("events", Action::Close, &["q"]),
     ("events", Action::Copy, &["c"]),
+    ("events", Action::CopyLines, &["y"]),
     ("events", Action::Down, &["j", "down"]),
     ("events", Action::Filter, &["/"]),
     ("events", Action::First, &["g", "home"]),
@@ -453,6 +465,8 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("events", Action::PreviousMatch, &["N"]),
     ("events", Action::Right, &["l", "right"]),
     ("events", Action::Save, &["ctrl-s"]),
+    ("events", Action::SelectLines, &["V"]),
+    ("events", Action::SelectionOtherEnd, &["o"]),
     ("events", Action::Up, &["k", "up"]),
     ("events", Action::Wrap, &["w"]),
     ("explain", Action::Accept, &["enter"]),
@@ -528,6 +542,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("logs", Action::Clear, &["z"]),
     ("logs", Action::Close, &["q"]),
     ("logs", Action::Copy, &["c"]),
+    ("logs", Action::CopyLines, &["y"]),
     ("logs", Action::Down, &["j", "down"]),
     ("logs", Action::Filter, &["/"]),
     ("logs", Action::First, &["g", "home"]),
@@ -538,10 +553,12 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("logs", Action::Lookback, &["T"]),
     ("logs", Action::LogMarker, &["m"]),
     ("logs", Action::LogWarnings, &["ctrl-z"]),
-    ("logs", Action::PageDown, &["pagedown", "space"]),
-    ("logs", Action::PageUp, &["pageup"]),
+    ("logs", Action::PageDown, &["pagedown", "space", "ctrl-f"]),
+    ("logs", Action::PageUp, &["pageup", "ctrl-b"]),
     ("logs", Action::Right, &["l", "right"]),
     ("logs", Action::Save, &["ctrl-s"]),
+    ("logs", Action::SelectLines, &["V"]),
+    ("logs", Action::SelectionOtherEnd, &["o"]),
     ("logs", Action::Stream, &["x"]),
     ("logs", Action::Json, &["J"]),
     ("logs", Action::Timestamps, &["t"]),
@@ -627,6 +644,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("table", Action::Approve, &["V"]),
     ("table", Action::Attach, &["a"]),
     ("table", Action::Back, &["esc"]),
+    ("table", Action::Contexts, &[]),
     ("table", Action::CopyCell, &["Y"]),
     ("table", Action::CopyName, &["c"]),
     ("table", Action::Cordon, &["C"]),
@@ -1176,6 +1194,30 @@ mod tests {
     #[test]
     fn defaults_have_no_conflicts() {
         assert_eq!(compile("").unwrap(), Keymap::default());
+    }
+
+    #[test]
+    fn contexts_is_an_unbound_table_action_with_normal_validation() {
+        assert_eq!(
+            Keymap::default().label("table", Action::Contexts),
+            "unbound"
+        );
+        let map = compile("[keys.table]\ncontexts = 'ctrl-y'").unwrap();
+        assert_eq!(
+            map.action(
+                "table",
+                &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)
+            ),
+            Some(Action::Contexts)
+        );
+        assert_eq!(
+            compile("[keys.table]\ncontexts = 'n'").unwrap_err(),
+            vec!["keys.table: n conflicts between contexts and namespaces"]
+        );
+        assert_eq!(
+            compile("[keys.logs]\ncontexts = 'ctrl-y'").unwrap_err(),
+            vec!["keys.logs.contexts: unsupported action"]
+        );
     }
 
     #[test]
