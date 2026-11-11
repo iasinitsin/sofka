@@ -66,8 +66,13 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `o`                                                          | show the node the selected row names (pods built in; other kinds via `[views."…"].node`)                                                                                                                              |
 | `ctrl-r`                                                     | refresh the watch                                                                                                                                                                                                     |
 | `y` / `d` / `E`                                              | view YAML / describe (native opt-in) / live events                                                                                                                                                                    |
+| `:events`                                                    | Browse events in the current namespace. Press `0` for all namespaces.                                                                                                                                                 |
+| `:plugin-activity`                                           | Reopen the active plugin panel or retained report. See [Plugin commands](#plugin-commands).                                                                                                                           |
+| `:diff`                                                      | Compare the live resource with last-applied data, if present; otherwise, use the previous revision observed by this session's watch. Without either baseline, there is nothing to diff.                               |
 | `x`                                                          | secrets: show `data` base64-decoded (as `stringData`) · PVCs: browse the volume                                                                                                                                       |
 | `X` / `T`                                                    | explain why the selection is unhealthy / session-local state-change timeline                                                                                                                                          |
+| `:explain`                                                   | Explain why the selected resource is unhealthy.                                                                                                                                                                       |
+| `:timeline`                                                  | Show the selected object's state changes from this session, with timestamps.                                                                                                                                          |
 | `u` / `:adjacent`                                            | adjacent view: owners, children, and the objects the selection names or is named by (`⏎` opens one)                                                                                                                   |
 | `c` (adjacent view)                                          | Discover direct children of a namespaced custom resource. Search starts on request. Results can be incomplete; see the limits in [Features](features.md).                                                             |
 | `:gitops` / `:flux`                                          | Flux owner, source, revisions & reconciliation chain for the selection (`⏎` to jump)                                                                                                                                  |
@@ -82,11 +87,15 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `:journal` / `:audit`                                        | session-local log of the mutating actions you've taken                                                                                                                                                                |
 | `:rightsize`                                                 | historical right-sizing: P50/P95/P99 usage → suggested requests + patch preview (needs a metrics backend)                                                                                                             |
 | `:ctx` / `:ctx <name>`                                       | context switcher popup (type to filter, `r` renames, `space` toggles fleet membership) / switch directly (the name tab-completes)                                                                                     |
+| `contexts` (table)                                           | context switcher, same as `:ctx`; unbound by default, see [key bindings](keybindings.md#example-a-key-for-the-context-switcher)                                                                                       |
 | `:helm`                                                      | Helm releases (native storage-Secret decode): ⏎ history → values · `y` manifest · `d` notes · `r` rollback                                                                                                            |
 | `:rollout-history`                                           | Deployment, StatefulSet, or DaemonSet revisions: ⏎ diff against the live template · `r` rollback                                                                                                                      |
 | `:fleet`                                                     | cross-context health dashboard (opt-in: `[fleet]` contexts or `space` in `:ctx`; `⏎` switches, `r` refreshes)                                                                                                         |
+| `:pulse`                                                     | Show cluster health tiles, refreshed every 5 seconds.                                                                                                                                                                 |
+| `:xray`                                                      | Show a tree from the current kind through owner references to pods and containers.                                                                                                                                    |
 | `:skin`                                                      | pick a color skin with live preview; `esc` restores the previous skin (`:skin gruvbox-dark` applies directly)                                                                                                         |
 | `:reload` / `:config` / `:info`                              | reload config from disk · config sources + warnings · runtime diagnostics                                                                                                                                             |
+| `:config edit [base\|cluster\|context]`                      | open that level's config file for this context in `$EDITOR`; reload when it closes                                                                                                                                    |
 | `:check-update`                                              | check for a newer sofka release and show the upgrade command                                                                                                                                                          |
 | `l` / `p`                                                    | logs (marked pods, or current row; a pod with a `kubectl.kubernetes.io/default-container` annotation shows that container; workload = all matching pods) / previous-container logs                                    |
 | `L` / `:vlogs`                                               | VictoriaLogs history for the selection (pod, container, workload, service, namespace), or its Cloud Logging / log UI link                                                                                             |
@@ -106,13 +115,14 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `i`                                                          | set container image; on a Flux HelmRelease, set `spec.chart.spec.version`                                                                                                                                             |
 | `r`                                                          | rollout restart (marked workloads, or current) / force-sync (ExternalSecrets/PushSecrets) / rollback (Helm or rollout history) / refresh (elsewhere)                                                                  |
 | `f` / `shift-f`                                              | port-forward (pods/services) — picker shows declared ports, marks busy local ports `in use`, or "Custom…" for remote and local ports; active forwards show `●` next to the name                                       |
-| `t`                                                          | Flux and flux-operator: suspend/resume/reconcile (+ force where supported) · ArgoCD: suspend/resume (+ refresh, hard refresh, sync, sync with prune for App) · CronJobs: trigger/suspend/resume · pods: file transfer |
+| `:pf`                                                        | View or stop background port-forwards.                                                                                                                                                                                |
+| `t`                                                          | Flux, flux-operator, Terraform: suspend/resume/reconcile (+ force on some) · ArgoCD: suspend/resume (+ refresh, hard refresh, sync, sync with prune for App) · CronJobs: trigger/suspend/resume · pods: file transfer |
 | `V` / `N`                                                    | CertificateSigningRequests: approve / deny (marked rows, or current); confirm shows requester, signer and usages; already decided requests are skipped                                                                |
 | `C` / `U` / `D`                                              | nodes: cordon / uncordon / open drain options                                                                                                                                                                         |
 | `ctrl-d` / `ctrl-k`                                          | delete / force-delete (marked rows, or current); in confirm: `f` toggles force, `c` cycles cascade (background → foreground → orphan)                                                                                 |
 | `w`                                                          | toggle wide-only columns (kubectl `-o wide`), including node IP addresses and labels                                                                                                                                  |
 | `←` / `→`                                                    | scroll sideways by 5 text positions; NAMESPACE/NAME stay fixed; arrows show more content                                                                                                                              |
-| `:q`, `ctrl-c`                                               | quit                                                                                                                                                                                                                  |
+| `:quit` / `:q`, `ctrl-c`                                     | quit                                                                                                                                                                                                                  |
 | `?`                                                          | help                                                                                                                                                                                                                  |
 | _(config)_                                                   | plugin / bookmark / workspace key chords — `ctrl-`/`alt-`/`shift-`/`fN`; listed in `?` help                                                                                                                           |
 
@@ -202,8 +212,8 @@ was started from. See [Manifest browser](features.md#manifest-browser).
 
 ## Logs view
 
-`/` filter (substring · `/regex/` · `!invert`) · `s`/`f` autoscroll · `w` wrap · `←`/`→` or `h`/`l` scroll sideways (unwrapped) ·
-`J` JSON view (raw/record/pretty) · `Ctrl+Z` warning/error filter · `m` visual marker · `t` timestamps · `x` stop/resume stream · `z` clear buffer · `c` copy buffer ·
+`/` filter (substring · `/regex/` · `!invert`) · `s`/`f` autoscroll · `w` wrap · `ctrl-f`/`ctrl-b` page · `←`/`→` or `h`/`l` scroll sideways (unwrapped) ·
+`J` JSON view (raw/record/pretty) · `Ctrl+Z` warning/error filter · `m` visual marker · `t` timestamps · `x` stop/resume stream · `z` clear buffer · `c` copy buffer · `V` select lines ·
 `a` default/all containers (pods with a default-container annotation) ·
 `ctrl-s` save to a file in `save_dir` · `F` fullscreen (no chrome, clean text selection) ·
 `0`–`5` time anchors (tail · 1m · 5m · 15m · 30m · 1h) · `T` custom lookback (`s`/`m`/`h`/`d`/`w`, compound like `1h30m`, decimal like `1.5h`, or `tail` for kubelet logs)
@@ -221,6 +231,20 @@ buffer is cleared or replaced, or when their position is trimmed. Marker count
 is limited to the active log buffer cap. Manual terminal selection can include
 visible markers.
 
+`V` selects whole lines, starting on the first visible line. `j` / `k`, `g` /
+`G`, `space`, and `ctrl-f` / `ctrl-b` (or `PgDn` / `PgUp`) move the cursor and
+extend the selection. `o` moves the cursor to the other end. Selected lines
+have a background and a gutter marker, with `▶` on the cursor line. `y` or `c`
+copies the selected lines and ends the selection; the status line says how many were
+copied. `esc` or `V` cancels it and stays in the view. The selection covers the
+lines the filter shows. Copied lines are the raw lines `c` copies: wrap and
+sideways scroll do not matter, the JSON view copies raw records, and markers
+are left out. Autoscroll pauses while the selection is open and the stream
+keeps filling the buffer; it resumes when the selection ends, and `s` ends the
+selection and resumes it at once. New lines do not move the selection. If
+buffer trimming removes the start of the selection, it starts at the oldest
+kept line.
+
 ## Describe
 
 `d` uses kubectl by default. Enable the experimental `deskribe` backend with
@@ -237,6 +261,15 @@ and reload behavior. Helm rows continue to show release notes.
 highlighted. `n` / `N` go to the next or previous match. `w` wraps. `c` copies
 the document. `ctrl-s` saves it to a file. `esc` backs out - the first press
 clears an active search.
+
+`V` selects whole lines, starting on the current search match, or on the first
+visible line when no search is active. `j` / `k`, `g` / `G`, `ctrl-f` /
+`ctrl-b`, and `n` / `N` move the cursor and extend the selection. `o` moves the
+cursor to the other end. Selected lines have a background and a gutter marker,
+with `▶` on the cursor line. `y` or `c` copies the selected lines whole, whatever
+the wrap and sideways scroll, and ends the selection. `esc` or `V` cancels it;
+with a search active, the next `esc` clears the search. A refresh that shortens the document keeps the
+selection on the lines that remain.
 
 `ctrl-s` writes the whole document as rendered, whatever the search or scroll
 position. `managedFields` are included only after `m` shows them, and a Helm

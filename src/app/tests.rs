@@ -10,11 +10,13 @@ use tokio::sync::mpsc::{self, Receiver};
 mod clipboard;
 mod context_badge;
 mod credentials;
+mod delete;
 mod dir;
 mod exec_auth;
 mod flux;
 mod kubeconfig;
 mod label_filter;
+mod line_select;
 mod log_follow;
 mod namespace_patterns;
 mod node_roles;
@@ -34,9 +36,85 @@ mod save;
 mod scale;
 mod server_table;
 mod synchronized_output;
+mod terraform;
 mod update;
 mod watch_status;
 mod workloads;
+
+/// Commands omitted from `docs/keys.md`, each with a reason.
+const UNDOCUMENTED_COMMANDS: &[&str] = &[];
+
+fn table_view_commands(doc: &str) -> Vec<&str> {
+    doc.lines()
+        .skip_while(|line| line.trim() != "## Table views")
+        .skip(1)
+        .take_while(|line| !line.starts_with("## "))
+        .filter_map(|line| {
+            let row = line.trim().strip_prefix('|')?;
+            let (end, _) = row
+                .match_indices('|')
+                .find(|(index, _)| !row[..*index].ends_with('\\'))?;
+            Some(&row[..end])
+        })
+        .flat_map(|key| key.split('`').skip(1).step_by(2))
+        .filter_map(|code| code.strip_prefix(':'))
+        .filter_map(|command| command.split([' ', '[']).next())
+        .collect()
+}
+
+fn missing_palette_commands(doc: &str) -> Vec<&'static str> {
+    let documented = table_view_commands(doc);
+    PALETTE_COMMANDS
+        .iter()
+        .filter_map(|command| command.names.first().copied())
+        .filter(|name| !UNDOCUMENTED_COMMANDS.contains(name))
+        .filter(|name| !documented.contains(name))
+        .collect()
+}
+
+#[test]
+fn every_palette_command_is_in_the_keys_doc() {
+    let missing = missing_palette_commands(include_str!("../../docs/keys.md"));
+    assert!(
+        missing.is_empty(),
+        "commands missing from docs/keys.md: {missing:?}"
+    );
+}
+
+#[test]
+fn palette_doc_parser_reads_only_table_view_keys() {
+    let doc = r#"## Table views
+Use `:prose` here.
+| Key | Action |
+| --- | --- |
+| `enter` | Open `:description`. |
+| `:gitops` / `:flux` | Show owners. |
+| `:find <text>` | Find objects. |
+| `:snapshot [text\|json\|yaml]` / `:snapshots` | Save the view. |
+| `:notify[note]` | Set a note. |
+## Other views
+| `:other` | Another command. |
+"#;
+    assert_eq!(
+        table_view_commands(doc),
+        ["gitops", "flux", "find", "snapshot", "snapshots", "notify"]
+    );
+}
+
+#[test]
+fn palette_doc_check_rejects_missing_gitops_and_argocd_rows() {
+    let doc = include_str!("../../docs/keys.md");
+    for name in ["gitops", "argocd"] {
+        let row_prefix = format!("| `:{name}`");
+        let without_row = doc
+            .lines()
+            .filter(|line| !line.starts_with(&row_prefix))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(without_row.contains(&format!("`:{name}`")));
+        assert_eq!(missing_palette_commands(&without_row), [name]);
+    }
+}
 
 fn obj(v: serde_json::Value) -> DynamicObject {
     serde_json::from_value(v).unwrap()
@@ -55,6 +133,7 @@ fn test_app() -> (App, Receiver<Msg>) {
             .spawn()
     };
     app.update_fetcher = |_force| Box::pin(async { Err("no network in tests".to_string()) });
+    app.helm_runner = std::sync::Arc::new(|_argv| Box::pin(async { Ok(()) }));
     (app, rx)
 }
 
@@ -4638,10 +4717,15 @@ async fn adjacent_owner_actions_keep_the_api_group() {
     assert_eq!(app.adjacent_items[1].plural, "clusters.cluster.x-k8s.io");
     app.handle_key(press(KeyCode::Char('d'))).unwrap();
     let (_, argv) = app.describe_source.as_ref().unwrap();
-    assert!(
-        argv.windows(3)
-            .any(|args| args == ["describe", "clusters.postgresql.cnpg.io", "db"])
-    );
+    assert!(argv.windows(6).any(|args| args
+        == [
+            "describe",
+            "-n",
+            "default",
+            "--",
+            "clusters.postgresql.cnpg.io",
+            "db"
+        ]));
     app.handle_key(press(KeyCode::Char('q'))).unwrap();
     app.cluster.client = Cluster::fake().client;
     app.handle_key(press(KeyCode::Enter)).unwrap();
@@ -5771,6 +5855,65 @@ async fn builtin_drill_list_matches_the_enter_arms() {
 }
 
 #[tokio::test]
+async fn a_configured_drill_wins_over_the_machinedeployment_drill() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "cluster.x-k8s.io",
+        "MachineDeployment",
+        "machinedeployments",
+        true,
+    );
+    app.user_views = HashMap::from([(
+        "machinedeployments".to_string(),
+        crate::views::View {
+            drill: Some(crate::views::Drill {
+                kind: "secrets".to_string(),
+                labels: None,
+                fields: None,
+            }),
+            ..Default::default()
+        },
+    )]);
+    app.switch_kind("machinedeployments.cluster.x-k8s.io");
+    apply(
+        &mut app,
+        json!({"apiVersion": "cluster.x-k8s.io/v1beta1", "kind": "MachineDeployment",
+               "metadata": {"name": "workers", "namespace": "default"},
+               "spec": {"selector": {"matchLabels": {"app": "x"}}}}),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "secrets");
+}
+
+#[tokio::test]
+async fn machinedeployments_still_drill_to_machines_without_a_configured_drill() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "cluster.x-k8s.io",
+        "MachineDeployment",
+        "machinedeployments",
+        true,
+    );
+    app.cluster
+        .register_kind("cluster.x-k8s.io", "Machine", "machines", true);
+    app.switch_kind("machinedeployments.cluster.x-k8s.io");
+    apply(
+        &mut app,
+        json!({"apiVersion": "cluster.x-k8s.io/v1beta1", "kind": "MachineDeployment",
+               "metadata": {"name": "workers", "namespace": "default"},
+               "spec": {"selector": {"matchLabels": {"app": "x"}}}}),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "machines");
+    assert_eq!(app.namespace, "default");
+    assert_eq!(app.labels.as_deref(), Some("app=x"));
+}
+
+#[tokio::test]
 async fn configured_drill_to_an_unknown_kind_warns_and_stays() {
     let (mut app, _rx) = test_app();
     app.user_views = views_with_drill("certificates", "widgets", "cert={name}");
@@ -6486,6 +6629,68 @@ async fn cursor_on_a_marked_row_uses_the_mark_color() {
 }
 
 #[tokio::test]
+async fn cursor_row_is_a_lavender_bar_with_base_text() {
+    use crate::theme;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
+
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for (name, ready, state) in [
+        ("a-healthy", true, json!({"running": {}})),
+        (
+            "b-broken",
+            false,
+            json!({"waiting": {"reason": "CrashLoopBackOff"}}),
+        ),
+    ] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default"},
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{
+                        "ready": ready, "restartCount": 0, "state": state
+                    }]
+                }
+            }),
+        );
+    }
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(
+        app.selected().and_then(|o| o.metadata.name).as_deref(),
+        Some("b-broken")
+    );
+
+    for background in [false, true] {
+        theme::set_background(background);
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let hit = app.table_hit.borrow().clone().unwrap();
+        let buf = term.backend().buffer();
+        let y = (hit.rows_y..hit.rows_y + hit.rows_h)
+            .find(|&y| buf[(hit.x_min, y)].symbol() == "▌")
+            .expect("cursor row marker");
+        assert_eq!(y, hit.rows_y + 1, "background={background}");
+
+        for x in hit.x_min..hit.x_max {
+            let cell = &buf[(x, y)];
+            assert_eq!(cell.bg, theme::lavender(), "x={x} background={background}");
+            assert_eq!(cell.fg, theme::base(), "x={x} background={background}");
+            assert!(cell.modifier.contains(Modifier::BOLD), "x={x}");
+        }
+
+        let other = hit.rows_y;
+        assert_ne!(buf[(hit.x_min, other)].symbol(), "▌");
+        assert!((hit.x_min..hit.x_max).all(|x| buf[(x, other)].bg != theme::lavender()));
+    }
+    theme::set_background(false);
+}
+
+#[tokio::test]
 async fn delete_confirm_force_can_toggle() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
@@ -6505,6 +6710,9 @@ async fn delete_confirm_force_can_toggle() {
         Some(ConfirmAction::Delete { force: false, .. })
     ));
 
+    app.switch_kind("deployments");
+    app.mode = Mode::Confirm;
+
     app.handle_key(press(KeyCode::Char('f'))).unwrap();
     assert!(app.confirm_label.starts_with("Force delete pod web"));
     assert!(matches!(
@@ -6518,6 +6726,99 @@ async fn delete_confirm_force_can_toggle() {
         app.confirm_action,
         Some(ConfirmAction::Delete { force: false, .. })
     ));
+}
+
+#[tokio::test]
+async fn a_confirmed_delete_uses_the_kind_it_was_requested_for() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Service",
+               "metadata": {"name": "web", "namespace": "default"}}),
+    );
+    let (sent, mut requests) = mpsc::unbounded_channel();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let sent = sent.clone();
+            async move {
+                let method = req.method().clone();
+                let path = req.uri().path().to_string();
+                if method == http::Method::DELETE {
+                    sent.send((method, path)).unwrap();
+                }
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            json!({"apiVersion":"v1","kind":"Status","status":"Success"})
+                                .to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+
+    app.switch_kind("deployments");
+    assert_eq!(app.kind_plural, "deployments");
+    assert!(matches!(
+        app.confirm_action,
+        Some(ConfirmAction::Delete { .. })
+    ));
+    app.mode = Mode::Confirm;
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+
+    let (method, path) = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(method, http::Method::DELETE);
+    assert_eq!(path, "/api/v1/namespaces/default/services/web");
+    assert!(
+        app.journal
+            .lines()
+            .iter()
+            .any(|line| line.ends_with("web in default"))
+    );
+}
+
+#[tokio::test]
+async fn bulk_delete_journal_uses_the_saved_kind() {
+    for force in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("services");
+        for name in ["a", "b"] {
+            apply(
+                &mut app,
+                json!({"apiVersion": "v1", "kind": "Service",
+                       "metadata": {"name": name, "namespace": "default"}}),
+            );
+        }
+        app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        app.handle_key(press(KeyCode::Down)).unwrap();
+        app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+        assert_eq!(app.mode, Mode::Confirm);
+
+        app.switch_kind("deployments");
+        app.mode = Mode::Confirm;
+        if force {
+            app.handle_key(press(KeyCode::Char('f'))).unwrap();
+            assert!(app.confirm_label.starts_with("Force delete 2 services"));
+        }
+        app.handle_key(press(KeyCode::Char('y'))).unwrap();
+
+        assert_eq!(app.journal.len(), 1);
+        let journal = app.journal.lines().join("\n");
+        let action = if force { "force-delete" } else { "delete" };
+        assert!(journal.contains(action), "{journal}");
+        assert!(journal.ends_with("2 services"), "{journal}");
+        assert!(!journal.contains("deployments"), "{journal}");
+    }
 }
 
 #[tokio::test]
@@ -6543,8 +6844,12 @@ async fn delete_confirm_cascade_can_cycle() {
         })
     ));
 
+    app.switch_kind("deployments");
+    app.mode = Mode::Confirm;
+
     app.handle_key(press(KeyCode::Char('c'))).unwrap();
     assert_eq!(app.mode, Mode::Confirm, "c must cycle, not cancel");
+    assert!(app.confirm_label.starts_with("Delete pod web in default"));
     assert!(app.confirm_label.contains("(cascade: foreground)"));
     assert!(matches!(
         app.confirm_action,
@@ -6555,6 +6860,7 @@ async fn delete_confirm_cascade_can_cycle() {
     ));
 
     app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.confirm_label.starts_with("Delete pod web in default"));
     assert!(app.confirm_label.contains("(orphan dependents)"));
     assert!(matches!(
         app.confirm_action,
@@ -6575,6 +6881,10 @@ async fn delete_confirm_cascade_can_cycle() {
 
     // Full circle back to background.
     app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(
+        app.confirm_label
+            .starts_with("Force delete pod web in default")
+    );
     assert!(matches!(
         app.confirm_action,
         Some(ConfirmAction::Delete {
@@ -6763,6 +7073,126 @@ async fn refreshing_mid_action_drops_the_orphaned_progress_flash() {
         err: false,
     });
     assert!(app.flash.is_empty(), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_failure_that_lands_after_a_refresh_is_still_reported() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let claim = app.claim_status("deleting 3 pods…");
+    let stale = app.generation;
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_ne!(app.generation, stale);
+    assert!(app.flash.is_empty(), "{}", app.flash);
+
+    app.handle_msg(Msg::Flash {
+        generation: stale,
+        claim,
+        message: "delete web failed: forbidden".into(),
+        err: true,
+    });
+    assert!(app.flash.contains("delete web failed"), "{}", app.flash);
+    assert!(app.flash_err);
+    assert_eq!(
+        app.last_action_error.as_deref(),
+        Some("delete web failed: forbidden")
+    );
+}
+
+#[tokio::test]
+async fn a_late_failure_does_not_replace_a_finished_message() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let claim = app.claim_status("deleting 3 pods…");
+    let stale = app.generation;
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_ne!(app.generation, stale);
+    app.set_flash("something else");
+
+    app.handle_msg(Msg::Flash {
+        generation: stale,
+        claim,
+        message: "delete web failed: forbidden".into(),
+        err: true,
+    });
+    assert_eq!(app.flash, "something else");
+    assert!(!app.flash_err);
+    assert_eq!(
+        app.last_action_error.as_deref(),
+        Some("delete web failed: forbidden")
+    );
+}
+
+#[tokio::test]
+async fn a_late_failure_preserves_the_current_action_claim() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let old = app.claim_status("deleting web…");
+    let stale = app.generation;
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_ne!(app.generation, stale);
+    let current = app.claim_status("deleting api…");
+
+    app.handle_msg(Msg::Flash {
+        generation: stale,
+        claim: old,
+        message: "delete web failed: forbidden".into(),
+        err: true,
+    });
+    assert_eq!(app.flash, "delete web failed: forbidden");
+    assert!(app.flash_err);
+
+    app.handle_msg(Msg::Flash {
+        generation: app.generation,
+        claim: current,
+        message: "deleted api".into(),
+        err: false,
+    });
+    assert_eq!(app.flash, "deleted api");
+    assert!(!app.flash_err);
+    assert_eq!(
+        app.last_action_error.as_deref(),
+        Some("delete web failed: forbidden")
+    );
+}
+
+#[tokio::test]
+async fn a_late_secret_edit_reports_failure_without_reloading_the_document() {
+    let (mut app, _rx) = decoded_secret_app();
+    let object = app.document_source.as_ref().unwrap().object.clone();
+    let claim = app.claim_status("updating secret creds…");
+    let stale = app.generation;
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_ne!(app.generation, stale);
+    apply(&mut app, serde_json::to_value(object).unwrap());
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(app.document_source.is_some());
+    assert!(app.document_reload_task.is_none());
+
+    app.handle_msg(Msg::SecretEditApplied {
+        generation: stale,
+        claim,
+        result: Ok("secret creds updated".into()),
+    });
+    assert!(app.flash.is_empty(), "{}", app.flash);
+    assert!(app.last_action_error.is_none());
+    assert!(app.document_reload_task.is_none());
+
+    app.handle_msg(Msg::SecretEditApplied {
+        generation: stale,
+        claim,
+        result: Err("secret creds changed since it was read".into()),
+    });
+    assert_eq!(app.flash, "secret creds changed since it was read");
+    assert!(app.flash_err);
+    assert_eq!(
+        app.last_action_error.as_deref(),
+        Some("secret creds changed since it was read")
+    );
+    assert!(app.document_reload_task.is_none());
 }
 
 #[tokio::test]
@@ -12847,8 +13277,7 @@ async fn shellouts_pin_to_active_context() {
     };
     // Pinned to the context sofka connected with, not kubectl's default.
     assert_eq!(&argv[..3], ["kubectl", "--context", "test"]);
-    assert!(argv.contains(&"edit".to_string()));
-    assert_eq!(argv.last().unwrap(), "default"); // -n <ns>
+    assert_eq!(argv[3..], ["edit", "-n", "default", "--", "pods", "p"]);
 }
 
 #[tokio::test]
@@ -12881,6 +13310,79 @@ async fn snapshot_captures_current_columns_and_rows() {
     // Every captured row carries a cell per column.
     assert!(rows.iter().all(|r| r.len() == columns.len()));
     assert!(rows.iter().any(|r| r.contains(&"api-1".to_string())));
+}
+
+#[tokio::test]
+async fn bundle_preview_masks_credentials_and_reports_redaction_limits() {
+    for redact in [false, true] {
+        let (mut app, mut rx) = app_with_pod();
+        let (env_name, env_value, logs) = if redact {
+            (
+                "DB_PASSWORD",
+                "hunter2",
+                "Authorization: Bearer abc.def.ghi\npassword=dummy-password\n\x1b[31mred\x1b[0m",
+            )
+        } else {
+            ("LOG_LEVEL", "debug", "plain log line")
+        };
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "a", "namespace": "default"},
+                "spec": {"containers": [{"name": "app", "args": ["keep-this-arg"],
+                    "env": [{"name": env_name, "value": env_value}]}]}}),
+        );
+        app.cluster.client = kube::Client::new(
+            tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let (status, body) = if request.uri().path().ends_with("/log") {
+                    (200, logs.to_string())
+                } else {
+                    (
+                        404,
+                        json!({"kind": "Status", "apiVersion": "v1",
+                            "status": "Failure", "reason": "NotFound", "code": 404})
+                        .to_string(),
+                    )
+                };
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .status(status)
+                            .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
+        );
+        palette(&mut app, "bundle");
+        let msg = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = rx.recv().await.expect("channel closed");
+                if matches!(msg, Msg::Bundle { .. }) {
+                    break msg;
+                }
+            }
+        })
+        .await
+        .expect("bundle did not report");
+        app.handle_msg(msg);
+        assert_eq!(app.mode, Mode::Detail);
+        let text = &app.pending_bundle.as_ref().unwrap().1;
+        assert!(text.contains("keep-this-arg"));
+        if redact {
+            for value in ["hunter2", "abc.def.ghi", "dummy-password", "\x1b"] {
+                assert!(!text.contains(value), "{value:?}");
+            }
+            assert!(text.contains("2 log line(s) with credential-like text masked"));
+            assert!(text.contains("1 literal env value(s) with credential-like names"));
+            assert!(text.contains(crate::bundle::REDACTED));
+        } else {
+            assert!(text.contains("debug"));
+            assert!(text.contains("plain log line"));
+            assert!(text.contains("no known credential fields found; ConfigMap data and container args are included as-is, review before sharing"));
+        }
+    }
 }
 
 #[tokio::test]
@@ -14308,6 +14810,200 @@ async fn helm_ctrl_d_opens_uninstall_confirm_not_generic_delete() {
 }
 
 #[tokio::test]
+async fn helm_uninstall_pins_the_context_and_namespace() {
+    let (mut app, _rx) = test_app();
+    let (sent, mut ran) = mpsc::unbounded_channel::<Vec<String>>();
+    app.helm_runner = std::sync::Arc::new(move |argv| {
+        let sent = sent.clone();
+        Box::pin(async move {
+            sent.send(argv).unwrap();
+            Ok(())
+        })
+    });
+    app.open_helm_releases();
+    apply(
+        &mut app,
+        helm_release_secret("myapp", "default", 1, "deployed"),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+
+    let argv = tokio::time::timeout(Duration::from_secs(2), ran.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        argv,
+        [
+            "helm",
+            "--kube-context",
+            "test",
+            "uninstall",
+            "myapp",
+            "-n",
+            "default"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn helm_uninstall_of_marked_releases_runs_once_per_release() {
+    let (mut app, mut rx) = test_app();
+    let (sent, mut ran) = mpsc::unbounded_channel::<Vec<String>>();
+    app.helm_runner = std::sync::Arc::new(move |argv| {
+        let sent = sent.clone();
+        Box::pin(async move {
+            sent.send(argv).unwrap();
+            Ok(())
+        })
+    });
+    app.open_helm_releases();
+    for name in ["myapp", "other"] {
+        apply(
+            &mut app,
+            helm_release_secret(name, "default", 1, "deployed"),
+        );
+    }
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+
+    let mut commands = Vec::new();
+    for _ in 0..2 {
+        commands.push(
+            tokio::time::timeout(Duration::from_secs(2), ran.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    commands.sort();
+    for (argv, name) in commands.iter().zip(["myapp", "other"]) {
+        assert_eq!(
+            argv,
+            &[
+                "helm",
+                "--kube-context",
+                "test",
+                "uninstall",
+                name,
+                "-n",
+                "default"
+            ]
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = rx.recv().await.unwrap();
+            let done = matches!(msg, Msg::Flash { .. });
+            app.handle_msg(msg);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!app.flash_err);
+    assert_eq!(app.flash, "uninstalled 2 Helm releases");
+    assert!(matches!(
+        ran.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn helm_rollback_passes_the_revision() {
+    let (mut app, _rx) = test_app();
+    let (sent, mut ran) = mpsc::unbounded_channel::<Vec<String>>();
+    app.helm_runner = std::sync::Arc::new(move |argv| {
+        let sent = sent.clone();
+        Box::pin(async move {
+            sent.send(argv).unwrap();
+            Ok(())
+        })
+    });
+    app.open_helm_releases();
+    apply(
+        &mut app,
+        helm_release_secret("myapp", "default", 2, "deployed"),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    apply(
+        &mut app,
+        helm_release_secret("myapp", "default", 1, "superseded"),
+    );
+    apply(
+        &mut app,
+        helm_release_secret("myapp", "default", 2, "deployed"),
+    );
+    let old_idx = app
+        .rows()
+        .iter()
+        .position(|o| crate::helm::revision(o) == Some(1))
+        .unwrap();
+    app.table_state.select(Some(old_idx));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+
+    let argv = tokio::time::timeout(Duration::from_secs(2), ran.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        argv,
+        [
+            "helm",
+            "--kube-context",
+            "test",
+            "rollback",
+            "myapp",
+            "1",
+            "-n",
+            "default"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn helm_failure_is_reported() {
+    let (mut app, mut rx) = test_app();
+    app.helm_runner = std::sync::Arc::new(|_argv| Box::pin(async { Err("boom".into()) }));
+    app.open_helm_releases();
+    apply(
+        &mut app,
+        helm_release_secret("myapp", "default", 1, "deployed"),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = rx.recv().await.unwrap();
+            let done = matches!(msg, Msg::Flash { .. });
+            app.handle_msg(msg);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(app.flash_err);
+    assert!(app.flash.contains("boom"), "{}", app.flash);
+}
+
+#[tokio::test]
 async fn helm_r_key_opens_rollback_confirm_with_selected_revision() {
     let (mut app, _rx) = test_app();
     app.open_helm_releases();
@@ -14581,6 +15277,144 @@ fn edit_argv(app: &mut App) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn edit_argv_ends_options_before_the_name() {
+    for name in ["-o=yaml", "-n"] {
+        for managed in [false, true] {
+            let (mut app, _rx) = test_app();
+            app.cluster.register_kind(
+                "rbac.authorization.k8s.io",
+                "ClusterRole",
+                "clusterroles",
+                false,
+            );
+            app.switch_kind("clusterroles");
+            let mut object = json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRole",
+                "metadata": {"name": name}
+            });
+            if managed {
+                object["metadata"]["labels"] = json!({
+                    "kustomize.toolkit.fluxcd.io/name": "apps",
+                    "kustomize.toolkit.fluxcd.io/namespace": "flux-system"
+                });
+            }
+            apply(&mut app, object);
+            app.table_state.select(Some(0));
+            app.handle_key(press(KeyCode::Char('e'))).unwrap();
+            if managed {
+                assert_eq!(app.mode, Mode::Confirm);
+                assert!(app.pending.is_none());
+                assert!(app.journal.is_empty());
+                app.handle_key(press(KeyCode::Char('y'))).unwrap();
+            }
+            let argv = edit_argv(&mut app);
+            let separator = argv.iter().position(|arg| arg == "--").unwrap();
+            assert_eq!(
+                argv[separator..],
+                ["--", "clusterroles.v1.rbac.authorization.k8s.io", name]
+            );
+            assert!(separator < argv.iter().position(|arg| arg == name).unwrap());
+            assert_eq!(app.journal.len(), 1);
+            assert!(app.journal.lines()[1].ends_with(name));
+        }
+    }
+}
+
+#[tokio::test]
+async fn confirmed_edit_journal_uses_the_object_not_context_options() {
+    for context in ["--", "-n", "edit"] {
+        for namespaced in [false, true] {
+            let (mut app, _rx) = test_app();
+            app.cluster = Cluster::fake_with_context(context);
+            let mut object = json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRole",
+                "metadata": {
+                    "name": "-n",
+                    "labels": {
+                        "kustomize.toolkit.fluxcd.io/name": "apps",
+                        "kustomize.toolkit.fluxcd.io/namespace": "flux-system"
+                    }
+                }
+            });
+            let (resource, label) = if namespaced {
+                object["apiVersion"] = json!("v1");
+                object["kind"] = json!("Pod");
+                object["metadata"]["name"] = json!("web");
+                object["metadata"]["namespace"] = json!("default");
+                app.switch_kind("pods");
+                ("pods", "web in default")
+            } else {
+                app.cluster.register_kind(
+                    "rbac.authorization.k8s.io",
+                    "ClusterRole",
+                    "clusterroles",
+                    false,
+                );
+                app.switch_kind("clusterroles");
+                ("clusterroles.v1.rbac.authorization.k8s.io", "-n")
+            };
+            apply(&mut app, object);
+            app.table_state.select(Some(0));
+            app.handle_key(press(KeyCode::Char('e'))).unwrap();
+            assert_eq!(app.mode, Mode::Confirm);
+            assert!(app.pending.is_none());
+            assert!(app.journal.is_empty());
+            app.handle_key(press(KeyCode::Char('y'))).unwrap();
+
+            let argv = edit_argv(&mut app);
+            let mut expected = vec!["kubectl", "--context", context, "edit"];
+            if namespaced {
+                expected.extend(["-n", "default"]);
+            }
+            expected.extend(["--", resource, if namespaced { "web" } else { "-n" }]);
+            assert_eq!(argv, expected);
+            assert_eq!(app.journal.len(), 1);
+            let entry = &app.journal.lines()[1];
+            assert!(entry.ends_with(label), "context {context:?}: {entry}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn describe_argv_ends_options_before_the_name() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "rbac.authorization.k8s.io",
+        "ClusterRole",
+        "clusterroles",
+        false,
+    );
+    app.switch_kind("clusterroles");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "-o=yaml"}
+        }),
+    );
+    app.table_state.select(Some(0));
+    assert!(!app.native_describe);
+    app.handle_key(press(KeyCode::Char('d'))).unwrap();
+    app.describe_task.as_ref().unwrap().abort();
+    let (_, argv) = app.describe_source.as_ref().unwrap();
+    assert_eq!(
+        argv,
+        &[
+            "kubectl",
+            "--context",
+            "test",
+            "describe",
+            "--",
+            "clusterroles.v1.rbac.authorization.k8s.io",
+            "-o=yaml"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn edit_from_yaml_view_targets_the_displayed_object() {
     let (mut app, _rx) = app_with_pod();
     apply(
@@ -14596,7 +15430,7 @@ async fn edit_from_yaml_view_targets_the_displayed_object() {
     press_document_edit(&mut app);
     let argv = edit_argv(&mut app);
     let edit = argv.iter().position(|arg| arg == "edit").unwrap();
-    assert_eq!(argv[edit..], ["edit", "pods", "a", "-n", "default"]);
+    assert_eq!(argv[edit..], ["edit", "-n", "default", "--", "pods", "a"]);
     assert_eq!(app.mode, Mode::Detail);
     assert_eq!(app.journal.len(), 1);
 }
@@ -14607,7 +15441,7 @@ async fn edit_from_describe_view_opens_the_editor() {
     press_document_edit(&mut app);
     let argv = edit_argv(&mut app);
     let edit = argv.iter().position(|arg| arg == "edit").unwrap();
-    assert_eq!(argv[edit..], ["edit", "pods", "web", "-n", "default"]);
+    assert_eq!(argv[edit..], ["edit", "-n", "default", "--", "pods", "web"]);
     assert_eq!(app.mode, Mode::Detail);
 }
 
@@ -14631,6 +15465,8 @@ async fn edit_from_yaml_view_confirms_flux_managed_objects_over_the_document() {
     app.handle_key(press(KeyCode::Char('y'))).unwrap();
     assert_eq!(app.mode, Mode::Detail);
     assert!(edit_argv(&mut app).contains(&"edit".to_string()));
+    assert_eq!(app.journal.len(), 1);
+    assert!(app.journal.lines()[1].ends_with("a in default"));
     assert!(!app.confirm_over_document());
 }
 
@@ -15103,7 +15939,7 @@ async fn a_stale_edit_read_does_not_answer_the_next_document() {
         result: Ok(Box::new(second)),
     });
     let argv = edit_argv(&mut app);
-    assert_eq!(argv[argv.len() - 3], "b");
+    assert_eq!(argv.last().unwrap(), "b");
 }
 
 #[tokio::test]
@@ -15633,6 +16469,66 @@ async fn shell_plugin_script_is_not_interpolated() {
             "a;id".into()
         ]
     );
+}
+
+#[tokio::test]
+async fn imported_shell_plugin_keeps_unquoted_values_in_one_argument() {
+    let dir = std::env::temp_dir().join(format!("sofka-import-shell-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugins.yaml"),
+        r#"plugins:
+  print:
+    shortCut: Ctrl-G
+    command: /bin/sh
+    args: [-ec, 'printf "[%s]" $NAME prefix$NAME/suffix "$NAME"']
+"#,
+    )
+    .unwrap();
+    let sources = crate::k9s_import::Sources::at(&dir).unwrap();
+    let plan = crate::k9s_import::plan(&sources, &Default::default());
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+    let cfg: crate::config::Config = plan.effective.unwrap().try_into().unwrap();
+    assert!(crate::config::plugin_warnings(&cfg.plugins).is_empty());
+
+    let name = "a * [x]; $(printf unexpected)";
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+               "metadata": {"name": name, "namespace": "default"}}),
+    );
+    app.table_state.select(Some(0));
+    app.plugins = cfg.plugins;
+    app.handle_key(ctrl(KeyCode::Char('g'))).unwrap();
+    let Some(Suspend::Shell(argv)) = &app.pending else {
+        panic!("plugin did not run");
+    };
+    assert_eq!(
+        argv,
+        &[
+            "/bin/sh",
+            "-ec",
+            r#"printf "[%s]" "${1}" prefix"${1}"/suffix "${1}""#,
+            "sofka",
+            name
+        ]
+    );
+    #[cfg(unix)]
+    {
+        let result = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        assert!(result.stderr.is_empty(), "{result:?}");
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap(),
+            format!("[{name}][prefix{name}/suffix][{name}]")
+        );
+    }
 }
 
 #[tokio::test]
@@ -18894,6 +19790,157 @@ async fn toggling_the_faults_filter_keeps_the_selected_object() {
     );
 }
 
+fn faults_batch_app() -> (App, Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    app.switch_kind("pods");
+    for (name, faulty) in [
+        ("a-ok", false),
+        ("b-crash", true),
+        ("c-ok", false),
+        ("d-crash", true),
+    ] {
+        let mut pod = faults_test_pod(name);
+        if faulty {
+            pod["status"]["containerStatuses"][0]["state"] =
+                json!({"waiting": {"reason": "CrashLoopBackOff"}});
+        }
+        apply(&mut app, pod);
+    }
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(selected_name(&app).as_deref(), Some("d-crash"));
+    (app, rx)
+}
+
+#[tokio::test]
+async fn faults_filter_keeps_the_selection_across_a_batch() {
+    let (mut app, _rx) = faults_batch_app();
+    let batch: Vec<_> = ["a-crash", "b-crash", "c-ok"]
+        .into_iter()
+        .map(|name| {
+            let mut pod = faults_test_pod(name);
+            pod["status"]["containerStatuses"][0]["state"] =
+                json!({"waiting": {"reason": "CrashLoopBackOff"}});
+            let o = obj(pod);
+            Msg::Applied {
+                generation: app.generation,
+                key: row_key(&o),
+                obj: Box::new(o),
+            }
+        })
+        .collect();
+    app.handle_msgs(batch);
+    assert_eq!(selected_name(&app).as_deref(), Some("d-crash"));
+    assert_eq!(row_names(&app), ["a-crash", "b-crash", "c-ok", "d-crash"]);
+}
+
+#[tokio::test]
+async fn faults_filter_batch_keeps_a_completed_filter_reselect() {
+    for trailing_update in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let crash = |name: &str| {
+            let mut pod = faults_test_pod(name);
+            pod["status"]["containerStatuses"][0]["state"] =
+                json!({"waiting": {"reason": "CrashLoopBackOff"}});
+            pod
+        };
+        for name in ["b-crash", "d-crash"] {
+            apply(&mut app, crash(name));
+        }
+        app.handle_msg(Msg::Synced {
+            generation: app.generation,
+        });
+        app.handle_key(press(KeyCode::End)).unwrap();
+        type_filter(&mut app, "-l app=web");
+        apply(&mut app, crash("b-crash"));
+        app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+        assert_eq!(selected_name(&app).as_deref(), Some("b-crash"));
+        assert_eq!(
+            app.filter_reselect
+                .as_ref()
+                .map(|pending| pending.key.as_str()),
+            Some("default/d-crash")
+        );
+
+        let generation = app.generation;
+        let applied = |name| {
+            let o = obj(crash(name));
+            Msg::Applied {
+                generation,
+                key: row_key(&o),
+                obj: Box::new(o),
+            }
+        };
+        let mut batch = vec![
+            Msg::Reset { generation },
+            applied("b-crash"),
+            applied("d-crash"),
+            Msg::Synced { generation },
+        ];
+        if trailing_update {
+            batch.push(applied("a-crash"));
+        }
+        app.handle_msgs(batch);
+        assert!(app.filter_reselect.is_none());
+        assert_eq!(
+            selected_name(&app).as_deref(),
+            Some("d-crash"),
+            "trailing update: {trailing_update}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn faults_filter_batch_drops_a_selection_that_was_deleted() {
+    let (mut app, _rx) = faults_batch_app();
+    let (mut single, _single_rx) = faults_batch_app();
+    single.handle_msg(Msg::Deleted {
+        generation: single.generation,
+        key: "default/d-crash".into(),
+    });
+    app.handle_msgs([Msg::Deleted {
+        generation: app.generation,
+        key: "default/d-crash".into(),
+    }]);
+    assert_eq!(selected_name(&app), selected_name(&single));
+    assert_eq!(app.table_state.selected(), single.table_state.selected());
+    assert_eq!(row_names(&app), row_names(&single));
+    assert_eq!(selected_name(&app), None);
+}
+
+#[tokio::test]
+async fn faults_filter_batch_leaves_selection_unchanged_when_filter_is_off() {
+    let (mut app, _rx) = faults_batch_app();
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    let selected = app.table_state.selected();
+    let o = obj(faults_test_pod("b-crash"));
+    app.handle_msgs([Msg::Applied {
+        generation: app.generation,
+        key: row_key(&o),
+        obj: Box::new(o),
+    }]);
+    assert_eq!(app.table_state.selected(), selected);
+    assert_eq!(selected_name(&app).as_deref(), Some("d-crash"));
+}
+
+#[tokio::test]
+async fn faults_filter_batch_does_not_restore_after_a_generation_change() {
+    let (mut app, _rx) = faults_batch_app();
+    let generation = app.generation;
+    app.handle_msgs([
+        Msg::Synced { generation },
+        Msg::ContextSwitched {
+            generation,
+            name: "test".into(),
+            result: Ok(Box::new(Cluster::fake())),
+        },
+    ]);
+    assert_ne!(app.generation, generation);
+    assert_eq!(app.table_state.selected(), Some(0));
+    assert_eq!(selected_name(&app), None);
+}
+
 #[tokio::test]
 async fn toggling_the_faults_filter_during_a_relist_keeps_the_fallback_row() {
     let (mut app, _rx) = test_app();
@@ -20573,6 +21620,246 @@ fn join_selectors_merges_drill_and_filter() {
 fn write_config(dir: &std::path::Path, text: &str) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("config.toml"), text).unwrap();
+}
+
+/// A test app whose config lives in an empty directory of its own.
+fn config_edit_app(name: &str) -> (App, Receiver<Msg>, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("sofka-config-edit-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut app, rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    (app, rx, dir)
+}
+
+/// The file `:config edit` handed to the editor.
+fn config_editor_file(app: &mut App) -> std::path::PathBuf {
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("no editor queued: {}", app.flash);
+    };
+    std::path::PathBuf::from(argv.last().unwrap())
+}
+
+/// Stand in for the editor: save `text`, then return from the suspend.
+fn close_config_editor(app: &mut App, path: &std::path::Path, text: &str) {
+    std::fs::write(path, text).unwrap();
+    app.handle_command_result(None, Ok(()), None);
+    app.after_suspend();
+}
+
+#[tokio::test]
+async fn config_edit_opens_each_level_for_the_current_context() {
+    let (mut app, _rx, dir) = config_edit_app("levels");
+    let cluster = dir.join("clusters").join("test-cluster");
+    for (command, expected) in [
+        ("config edit", dir.join("config.toml")),
+        ("cfg edit base", dir.join("config.toml")),
+        ("config edit cluster", cluster.join("config.toml")),
+        (
+            "config edit context",
+            cluster.join("test").join("config.toml"),
+        ),
+    ] {
+        palette(&mut app, command);
+        assert_eq!(config_editor_file(&mut app), expected, "{command}");
+        app.after_suspend();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn config_edit_opens_an_existing_yaml_file_as_is() {
+    let (mut app, _rx, dir) = config_edit_app("yaml");
+    let cluster = dir.join("clusters").join("test-cluster");
+    std::fs::create_dir_all(&cluster).unwrap();
+    std::fs::write(cluster.join("config.yml"), "readonly: true\n").unwrap();
+    palette(&mut app, "config edit cluster");
+    let path = config_editor_file(&mut app);
+    assert_eq!(path, cluster.join("config.yml"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "readonly: true\n");
+    assert!(!cluster.join("config.toml").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn config_edit_creates_a_missing_file_and_its_directories() {
+    let (mut app, _rx, dir) = config_edit_app("create");
+    palette(&mut app, "config edit context");
+    let path = config_editor_file(&mut app);
+    assert_eq!(path, dir.join("clusters/test-cluster/test/config.toml"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn config_edit_reloads_when_the_editor_closes() {
+    let (mut app, _rx, dir) = config_edit_app("reload");
+    palette(&mut app, "config edit");
+    let path = config_editor_file(&mut app);
+    close_config_editor(&mut app, &path, "favorite_namespaces = [\"kube-system\"]\n");
+    assert_eq!(app.namespace_favorites, ["kube-system"]);
+    assert_eq!(app.flash, "config reloaded");
+    assert!(app.pending.is_none());
+
+    palette(&mut app, "config edit context");
+    let path = config_editor_file(&mut app);
+    close_config_editor(&mut app, &path, "favorite_namespaces = [\"apps\"]\n");
+    assert_eq!(app.namespace_favorites, ["apps"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn config_edit_keeps_the_previous_config_when_the_new_one_is_invalid() {
+    let (mut app, _rx, dir) = config_edit_app("invalid");
+    palette(&mut app, "config edit");
+    let path = config_editor_file(&mut app);
+    close_config_editor(&mut app, &path, "favorite_namespaces = [\"kube-system\"]\n");
+    palette(&mut app, "config edit");
+    let path = config_editor_file(&mut app);
+    close_config_editor(&mut app, &path, "readonly = \"yes\"\n");
+    assert!(app.flash.contains("config reload failed"), "{}", app.flash);
+    assert!(!app.config_warnings.is_empty());
+    assert_eq!(app.namespace_favorites, ["kube-system"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn config_edit_does_not_reload_after_a_failed_editor() {
+    let (mut app, _rx, dir) = config_edit_app("failed");
+    palette(&mut app, "config edit");
+    let path = config_editor_file(&mut app);
+    std::fs::write(&path, "favorite_namespaces = [\"kube-system\"]\n").unwrap();
+    app.handle_command_result(None, Err(std::io::Error::other("exit status 1")), None);
+    app.after_suspend();
+    assert!(app.namespace_favorites.is_empty());
+    assert!(app.flash.contains("editor failed"), "{}", app.flash);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_edit_creates_a_missing_file_readable_only_by_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut app, _rx, dir) = config_edit_app("private");
+    palette(&mut app, "config edit cluster");
+    let path = config_editor_file(&mut app);
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_edit_refuses_a_symlinked_file() {
+    let (mut app, _rx, dir) = config_edit_app("symlink");
+    let source = dir.join("source.toml");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&source, "readonly = true\n").unwrap();
+    std::os::unix::fs::symlink(&source, dir.join("config.toml")).unwrap();
+    palette(&mut app, "config edit");
+    assert!(app.pending.is_none());
+    assert!(app.flash_err);
+    assert!(app.flash.contains("is managed"), "{}", app.flash);
+    assert!(app.flash.contains("edit it at its source"), "{}", app.flash);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn config_edit_refuses_a_file_it_cannot_write() {
+    let (mut app, _rx, dir) = config_edit_app("readonly-file");
+    let path = dir.join("config.toml");
+    write_config(&dir, "readonly = true\n");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    // A superuser can write the file anyway; there is nothing to refuse.
+    if std::fs::OpenOptions::new().write(true).open(&path).is_err() {
+        palette(&mut app, "config edit");
+        assert!(app.pending.is_none());
+        assert!(app.flash.contains("is managed"), "{}", app.flash);
+    }
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn config_edit_refuses_conflicting_files_and_points_to_config() {
+    let (mut app, _rx, dir) = config_edit_app("conflict");
+    write_config(&dir, "readonly = true\n");
+    std::fs::write(dir.join("config.yaml"), "readonly: true\n").unwrap();
+    palette(&mut app, "config edit");
+    assert!(app.pending.is_none());
+    assert!(
+        app.flash.contains("conflicting config files"),
+        "{}",
+        app.flash
+    );
+    assert!(app.flash.contains(":config"), "{}", app.flash);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn config_edit_works_in_read_only_mode() {
+    let (mut app, _rx, dir) = config_edit_app("read-only-mode");
+    app.readonly = true;
+    palette(&mut app, "config edit");
+    assert_eq!(config_editor_file(&mut app), dir.join("config.toml"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn config_edit_rejects_unknown_arguments() {
+    let (mut app, _rx, dir) = config_edit_app("usage");
+    for command in ["config edit prod", "config open", "config edit base extra"] {
+        palette(&mut app, command);
+        assert!(app.pending.is_none(), "{command}");
+        assert!(
+            app.flash.starts_with("usage: :config"),
+            "{command}: {}",
+            app.flash
+        );
+    }
+    assert!(!dir.exists());
+}
+
+#[tokio::test]
+async fn config_palette_completes_edit_then_the_level() {
+    let (mut app, _rx, dir) = config_edit_app("complete");
+    let labels = |app: &App| {
+        app.cmd_suggestions
+            .iter()
+            .map(|s| s.label.clone())
+            .collect::<Vec<_>>()
+    };
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    type_text(&mut app, "config ");
+    assert_eq!(labels(&app), ["edit"]);
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    assert_eq!(app.command, "config edit");
+    type_text(&mut app, " ");
+    assert_eq!(labels(&app), ["base", "cluster", "context"]);
+    type_text(&mut app, "clu");
+    assert_eq!(labels(&app)[0], "cluster");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        config_editor_file(&mut app),
+        dir.join("clusters/test-cluster/config.toml")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn config_with_a_trailing_space_still_opens_the_sources() {
+    let (mut app, _rx, dir) = config_edit_app("bare");
+    palette(&mut app, "config ");
+    assert!(app.pending.is_none());
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(app.detail.title.starts_with("config"));
+    palette(&mut app, "config edit ");
+    assert_eq!(config_editor_file(&mut app), dir.join("config.toml"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -34198,12 +35485,11 @@ async fn edit_and_describe_use_selected_api_resource() {
                 } else {
                     "edit".into()
                 },
-                target,
-                "example".into(),
             ];
             if namespaced {
                 expected.extend(["-n".into(), "default".into()]);
             }
+            expected.extend(["--".into(), target, "example".into()]);
             assert_eq!(argv, expected);
         }
     }
@@ -35357,6 +36643,45 @@ async fn configured_paging_preserves_view_behavior_and_text_input() {
     app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
     assert!(app.prompt_input.is_empty());
     assert_eq!(app.mode, Mode::Prompt);
+}
+
+const CONTEXTS_KEY: &str = "[keys.table]\ncontexts = \"ctrl-y\"\n";
+
+#[tokio::test]
+async fn contexts_action_is_unbound_and_leaves_its_key_to_bookmarks() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+    assert_eq!(app.keymap.label("table", Action::Contexts), "unbound");
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_ne!(app.mode, Mode::Contexts);
+    assert!(app.pending_bookmark.is_some());
+}
+
+#[tokio::test]
+async fn configured_contexts_key_opens_the_context_picker_like_ctx() {
+    let (mut app, _rx) = test_app();
+    app.all_contexts = vec!["test".into(), "west".into()];
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+    use_keys(&mut app, CONTEXTS_KEY);
+    assert_eq!(app.keymap.label("table", Action::Contexts), "ctrl-y");
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Contexts);
+    assert!(app.pending_bookmark.is_none());
+    app.handle_msg(Msg::Contexts {
+        generation: app.generation,
+        list: vec!["test".into(), "west".into()],
+    });
+    for c in "west".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.context_switch_target,
+        Some((app.generation, "west".into()))
+    );
+    assert_eq!(app.kind_plural, "deployments");
 }
 
 const HALF_PAGE_KEYS: &str = r#"
@@ -37832,6 +39157,7 @@ async fn container_trends_follow_keys_and_reject_stale_samples() {
 async fn popups_preserve_surrounding_cells_on_open_close_and_resize() {
     use ratatui::{Terminal, backend::TestBackend};
     let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
     app.compact = true;
     apply(
         &mut app,
@@ -43062,9 +44388,12 @@ async fn named_layouts_prefer_the_namespace_variant() {
     assert_eq!(app.namespace, "prod");
     assert!(has_header(&app, "PRODIMAGE"));
     assert!(!has_header(&app, "IMAGE"));
-    type_resource_query(&mut app, "pods -n dev");
+    type_resource_query(&mut app, "pods -n dev -o images");
     assert_eq!(app.active_layout(), Some("images"));
     assert!(has_header(&app, "IMAGE"));
+    type_resource_query(&mut app, "pods -n prod");
+    assert_eq!(app.active_layout(), None);
+    assert!(has_header(&app, "STATUS"));
 }
 
 #[tokio::test]
@@ -43147,14 +44476,33 @@ async fn palette_completes_layout_names_and_lists_kind_layout_entries() {
 }
 
 #[tokio::test]
+async fn selecting_a_resource_without_a_layout_opens_the_default_layout() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    palette(&mut app, "pods:images");
+    assert_eq!(app.active_layout(), Some("images"));
+    assert!(app.flash.contains("pods:images"), "{}", app.flash);
+
+    palette(&mut app, "services");
+    palette(&mut app, "pods");
+    assert_eq!(app.active_layout(), None);
+    assert!(has_header(&app, "STATUS"));
+    assert!(!has_header(&app, "IMAGE"));
+    assert_eq!(app.flash, "Viewing pods");
+
+    palette(&mut app, "pods:images");
+    palette(&mut app, "pods");
+    assert_eq!(app.active_layout(), None);
+    assert!(has_header(&app, "STATUS"));
+}
+
+#[tokio::test]
 async fn back_navigation_restores_the_layout_of_each_view() {
     let (mut app, _rx) = test_app();
     install_views(&mut app, LAYOUT_VIEWS);
     type_resource_query(&mut app, "pods -o images");
     palette(&mut app, "deployments");
     palette(&mut app, "pods");
-    assert_eq!(app.active_layout(), Some("images"), "remembered per kind");
-    palette(&mut app, "layout default");
     palette(&mut app, "deployments");
 
     app.handle_key(press(KeyCode::Char('['))).unwrap();
@@ -43190,6 +44538,12 @@ async fn bookmark_applies_its_layout() {
             layout: Some("images".into()),
             ..Default::default()
         },
+        crate::config::Bookmark {
+            key: Some("ctrl-o".into()),
+            name: "pods".into(),
+            resource: "pods".into(),
+            ..Default::default()
+        },
     ];
     app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
     assert_eq!(app.kind_plural, "pods");
@@ -43205,6 +44559,11 @@ async fn bookmark_applies_its_layout() {
         "{}",
         app.flash
     );
+
+    app.handle_key(ctrl(KeyCode::Char('o'))).unwrap();
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.active_layout(), None);
+    assert!(has_header(&app, "STATUS"));
 }
 
 #[tokio::test]

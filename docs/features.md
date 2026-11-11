@@ -184,6 +184,18 @@ include those conditions. Row filters can search the route paths.
   copying, and refresh still work. The document setting is kept for the current
   session, including new documents, and is separate from the Logs setting.
 
+- **Line selection** - `V` in logs, YAML, describe, diff, and events starts a
+  selection of whole lines at a cursor. The cursor starts on the current search
+  match, or on the first visible line. `j`/`k`, `g`/`G`, and `ctrl-f`/`ctrl-b`
+  extend it, and so do `n`/`N` in document views. `o` moves to the other end.
+  Selected lines have a background and a marker in a left gutter. `y` or `c`
+  copies them and ends the selection, `esc` cancels it. Lines are copied whole,
+  as `c` copies them: wrap and sideways scroll do not matter, JSON logs copy as
+  raw records, and log markers are left out. In logs the selection covers the
+  lines the filter shows. Autoscroll pauses while it is open and the stream
+  keeps filling the buffer. The selection stays on its lines when new lines
+  arrive; if trimming removes its start, it starts at the oldest kept line.
+
 - **Document wrapping** - set `detail_wrap = true` to enable line wrapping at
   startup. The `w` key changes wrapping for the session. New documents, reloads,
   and context switches keep the selected setting.
@@ -406,8 +418,10 @@ include those conditions. Row filters can search the route paths.
   - CronJobs: suspended or terminating, or the last scheduled run finished
     without succeeding.
   - Flux Kustomizations, HelmReleases, Git/Helm/OCI repositories, Buckets,
-    ResourceSets, FluxInstances, and ResourceSetInputProviders: suspended,
-    terminating, or a `Ready` condition that is not `True`.
+    ResourceSets, FluxInstances, ResourceSetInputProviders, and tofu-controller
+    Terraforms: suspended, terminating, or a `Ready` condition that is not
+    `True`. A Terraform plan that waits for approval sets `Ready=Unknown`, so
+    it shows too.
   - Argo CD Applications: health other than `Healthy`, sync other than
     `Synced`, or terminating. ApplicationSets: any status other than `Synced`,
     or terminating.
@@ -466,7 +480,9 @@ include those conditions. Row filters can search the route paths.
   apply to the first successful selection only. These commands require
   interactive mode.
 - **Namespace switcher** (`n`) with pinned favourites (★) and per-context
-  session recents (·) above the rest, plus a context switcher (`:ctx`). In the
+  session recents (·) above the rest, plus a context switcher (`:ctx`, or the
+  unbound `contexts` table action; see
+  [key bindings](keybindings.md#example-a-key-for-the-context-switcher)). In the
   resource table, `1` to `9` select the first nine configured favourites in fixed
   configuration order. The picker lists these shortcuts in a column before the
   names, and while its filter is empty the same digits select the favourite
@@ -678,7 +694,11 @@ include those conditions. Row filters can search the route paths.
   even when the specification has not changed. It sets
   `reconcile.fluxcd.io/requestedAt` and `reconcile.fluxcd.io/forceAt` to the same
   new timestamp. The status message confirms the request was sent; it does not
-  wait for the Helm operation to finish. `⏎` on a
+  wait for the Helm operation to finish. tofu-controller **Terraform** objects
+  (`tf`) get the plain menu, as `tfctl` suspends, resumes, and reconciles them.
+  Their list shows REVISION from `status.lastAppliedRevision` and PLAN, the
+  pending plan id that `spec.approvePlan` takes, with ` (destroy)` after it for
+  a destroy plan. sofka does not approve or replan. `⏎` on a
   **HelmRelease** opens the revision history of the Helm release it manages
   (resolved the way helm-controller composes `releaseName`/`storageNamespace`):
   `⏎` shows a revision's values, `y` the rendered manifest, `d` the NOTES, `r`
@@ -738,7 +758,11 @@ include those conditions. Row filters can search the route paths.
   object a ResourceSet applied finds its owner from the
   `resourceset.fluxcd.controlplane.io/name` label. An object a FluxInstance
   applied finds it from `fluxcd.controlplane.io/name`, as `flux-operator trace`
-  does.
+  does. A tofu-controller **Terraform** shows its own `sourceRef` and its
+  `dependsOn` Terraforms, also when a Kustomization applied it. That
+  Kustomization still shows as the owner, and the Terraform's state follows in
+  its own section. A Terraform has no Managed resources section, because its
+  inventory lists cloud resources, not Kubernetes objects.
 - **Argo CD view** (`:argocd` / `:argo`) - the state of the selected Application:
   sync and health, the project and destination, every source it deploys from with
   the revision actually deployed from that source, every object in
@@ -951,7 +975,9 @@ include those conditions. Row filters can search the route paths.
   mutates. See [Providers](providers.md#right-sizing-metrics-provider).
 - **Fleet dashboard** (`:fleet`) - an opt-in health summary across contexts,
   side by side: node readiness, unhealthy pods, Flux failures, and Argo CD
-  Applications that are `OutOfSync` or not `Healthy`. A cluster without the Flux
+  Applications that are `OutOfSync` or not `Healthy`. Flux failures count
+  Kustomizations, HelmReleases, and, when tofu-controller is installed,
+  Terraforms with `Ready=False`. A cluster without the Flux
   or Argo CD CRDs shows `—` rather than a zero. Contexts come from config or
   `space` in the `:ctx` switcher. `⏎` on a row with a non-zero Argo CD count
   switches to that context and lands straight on the Applications behind it,
@@ -1238,7 +1264,9 @@ read-only mode and recorded in `:journal`.
   and previews each skin as you move; `enter` keeps it, `esc` restores the
   previous one.
 - **Config file** (TOML or YAML) with per-cluster and per-context overrides and live
-  `:reload`. See [Configuration](configuration.md).
+  `:reload`. `:config edit [base|cluster|context]` opens the current context's
+  file at that level in `$EDITOR` and reloads when the editor closes. See
+  [Configuration](configuration.md#edit-config-from-the-tui).
 
 ## Diagnostics
 

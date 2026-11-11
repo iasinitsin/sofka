@@ -1560,9 +1560,9 @@ const PLUGIN_PLACEHOLDERS: &[&str] = &[
 
 /// Validation warnings for plugins: an unparseable key chord (see
 /// [`crate::keys::KeyChord::parse`]), an unknown `output` mode, a malformed
-/// `timeout`, or a placeholder in a `shell = true` script. A bad chord
+/// `timeout`, or a placeholder in shell script text. A bad chord
 /// disables just that plugin; a bad output/timeout falls back to the default;
-/// a script placeholder is left for `sh` to expand. Reported, never fatal.
+/// script warnings do not change execution. Reported, never fatal.
 pub fn plugin_warnings(plugins: &[Plugin]) -> Vec<String> {
     let mut warns = Vec::new();
     for p in plugins {
@@ -1599,6 +1599,25 @@ pub fn plugin_warnings(plugins: &[Plugin]) -> Vec<String> {
         {
             warns.push(format!(
                 "plugin {:?}: shell command contains {placeholder}, which sofka does not expand there — pass it in args and use \"$1\"",
+                p.name
+            ));
+        }
+        if !p.shell
+            && let Some(shell) = Path::new(&p.command).file_name().and_then(|s| s.to_str())
+            && crate::k9s_import::SHELLS.contains(&shell)
+            && let Some(placeholder) = p
+                .args
+                .windows(2)
+                .filter(|pair| crate::k9s_import::shell_command_flag(shell, &pair[0]))
+                .find_map(|pair| PLUGIN_PLACEHOLDERS.iter().find(|p| pair[1].contains(**p)))
+        {
+            let instruction = if shell == "fish" {
+                "append it as its own argument immediately after the script and read it as \"$argv[1]\""
+            } else {
+                "append a name for $0 after the script, then append the value as its own argument and read it as \"$1\""
+            };
+            warns.push(format!(
+                "plugin {:?}: {placeholder} is pasted into the script text given to {shell} -c, where an object name is parsed as shell syntax; {instruction}",
                 p.name
             ));
         }
@@ -1749,14 +1768,26 @@ impl ConfigLoader {
     /// and the `:config` view.
     pub fn override_paths(&self, context: &str, cluster: &str) -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        if let (Some(dir), false) = (&self.dir, cluster.is_empty()) {
-            let cluster_dir = dir.join("clusters").join(sanitize(cluster));
+        if let Some(cluster_dir) = self.cluster_dir(cluster) {
             paths.extend(document::paths(&cluster_dir));
-            if !context.is_empty() {
-                paths.extend(document::paths(&cluster_dir.join(sanitize(context))));
+            if let Some(context_dir) = self.context_dir(context, cluster) {
+                paths.extend(document::paths(&context_dir));
             }
         }
         paths
+    }
+
+    /// `clusters/<cluster>`, or `None` without a config directory or a
+    /// cluster name.
+    pub fn cluster_dir(&self, cluster: &str) -> Option<PathBuf> {
+        let dir = self.dir.as_ref()?;
+        (!cluster.is_empty()).then(|| dir.join("clusters").join(sanitize(cluster)))
+    }
+
+    /// `clusters/<cluster>/<context>`, or `None` when either name is empty.
+    pub fn context_dir(&self, context: &str, cluster: &str) -> Option<PathBuf> {
+        let cluster_dir = self.cluster_dir(cluster)?;
+        (!context.is_empty()).then(|| cluster_dir.join(sanitize(context)))
     }
 
     /// Merge override files for the given kubeconfig cluster/context over the
@@ -1993,6 +2024,12 @@ fn state_of(result: Result<Option<toml::Value>, String>) -> &'static str {
         Ok(None) => "absent",
         Err(_) => "invalid - skipped",
     }
+}
+
+/// The one config file of the level in `dir`, existing or not: `config.toml`
+/// when the level has none yet, an error when it has more than one.
+pub fn level_file(dir: &Path) -> Result<PathBuf, String> {
+    document::select(dir)
 }
 
 /// Read an optional override file. Report conflicts, read errors, and parse errors.
@@ -2511,6 +2548,69 @@ mod tests {
             w[0].contains("\"script\"") && w[0].contains("$NAMESPACE"),
             "{w:?}"
         );
+    }
+
+    #[test]
+    fn plugin_script_placeholder_warns() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            key = "ctrl-x"
+            name = "script"
+            command = "bash"
+            args = ["-l", "-c", "echo $NAME $NAMESPACE"]
+        "#,
+        )
+        .unwrap();
+        for shell in crate::k9s_import::SHELLS {
+            cfg.plugins[0].command = format!("/bin/{shell}");
+            for flag in ["-c", "-lc", "-ec"] {
+                cfg.plugins[0].args[1] = flag.into();
+                let w = plugin_warnings(&cfg.plugins);
+                assert_eq!(w.len(), 1, "{w:?}");
+                assert!(w[0].contains("plugin \"script\":"), "{w:?}");
+                assert!(
+                    w[0].contains("$NAMESPACE is pasted into the script text"),
+                    "{w:?}"
+                );
+                assert!(w[0].contains(&format!("{shell} -c")), "{w:?}");
+                if *shell == "fish" {
+                    assert!(w[0].contains("read it as \"$argv[1]\""), "{w:?}");
+                    assert!(w[0].contains("immediately after the script"), "{w:?}");
+                    assert!(!w[0].contains("$0") && !w[0].contains("$1"), "{w:?}");
+                } else {
+                    assert!(w[0].contains("read it as \"$1\""), "{w:?}");
+                    assert!(w[0].contains("a name for $0 after the script"), "{w:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plugin_positional_script_does_not_warn() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            key = "ctrl-x"
+            name = "positional"
+            command = "bash"
+            args = ["-c", 'echo "$1"', "sofka", "$NAME"]
+
+            [[plugins]]
+            key = "ctrl-y"
+            name = "direct"
+            command = "echo"
+            args = ["-c", "echo $NAME"]
+
+            [[plugins]]
+            key = "ctrl-z"
+            name = "no-script"
+            command = "bash"
+            args = ["$NAME"]
+        "#,
+        )
+        .unwrap();
+        assert!(plugin_warnings(&cfg.plugins).is_empty());
     }
 
     #[test]

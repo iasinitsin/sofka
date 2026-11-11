@@ -384,6 +384,13 @@ impl std::fmt::Display for ConnectError {
 /// it obtained, as the AWS CLI does for assumed roles, so the next detached
 /// run succeeds without input. Call only while sofka is not drawing.
 pub async fn authenticate_interactively(context: Option<&str>) -> Result<()> {
+    authenticate_interactively_until(context, std::future::pending()).await
+}
+
+pub(crate) async fn authenticate_interactively_until(
+    context: Option<&str>,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     let kubeconfig = Kubeconfig::read().context("reading kubeconfig")?;
     let options = KubeConfigOptions {
         context: context.map(str::to_string),
@@ -397,10 +404,13 @@ pub async fn authenticate_interactively(context: Option<&str>) -> Result<()> {
         .auth_info
         .exec
         .context("the context does not use an exec auth plugin")?;
-    run_exec_interactively(&exec).await
+    run_exec_interactively(&exec, cancelled).await
 }
 
-async fn run_exec_interactively(exec: &kube::config::ExecConfig) -> Result<()> {
+async fn run_exec_interactively(
+    exec: &kube::config::ExecConfig,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     if exec.interactive_mode == Some(kube::config::ExecInteractiveMode::Never) {
         anyhow::bail!("the kubeconfig sets interactiveMode: Never for this exec plugin");
     }
@@ -435,10 +445,15 @@ async fn run_exec_interactively(exec: &kube::config::ExecConfig) -> Result<()> {
     for name in exec.drop_env.iter().flatten() {
         cmd.env_remove(name);
     }
-    let status = cmd
-        .status()
-        .await
-        .with_context(|| format!("running {command}"))?;
+    let mut child = cmd.spawn().with_context(|| format!("running {command}"))?;
+    let status = tokio::select! {
+        biased;
+        _ = cancelled => {
+            child.kill().await?;
+            anyhow::bail!("Authentication stopped.");
+        }
+        result = child.wait() => result.with_context(|| format!("running {command}"))?,
+    };
     if !status.success() {
         anyhow::bail!("{} exited with {status}", exec_command_line(exec));
     }
@@ -2096,6 +2111,13 @@ pub const ALIASES: &[(&str, &str)] = &[
 
 #[cfg(any(test, feature = "bench"))]
 impl Cluster {
+    pub fn fake_with_context(context: &str) -> Self {
+        let mut cluster = Self::fake();
+        cluster.context = context.into();
+        cluster.cli_context = Some(context.into());
+        cluster
+    }
+
     /// Keep `config` for credential renewal, as a connect does when the
     /// client holds an exec-issued certificate.
     pub fn keep_credential_source(&mut self, config: Config, certificate: &[u8]) {
@@ -2257,6 +2279,25 @@ impl Cluster {
             self.catalog.push(qualified);
         }
         self.catalog.sort();
+    }
+
+    /// Register a kind the way discovery does, with the CRD's `shortNames`.
+    pub fn register_discovered_kind(
+        &mut self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        plural: &str,
+        short_names: &[&str],
+    ) {
+        self.register_kind_version(group, version, kind, plural, true);
+        let mut discovery = self.fake_discovery();
+        for resource in &mut discovery.0.resources {
+            if resource.kind.ar.group == group && resource.kind.ar.kind == kind {
+                resource.short_names = short_names.iter().map(|s| s.to_string()).collect();
+            }
+        }
+        self.apply_discovery(discovery);
     }
 
     /// The discovery a real cluster serving this fixture's kinds would return.
@@ -2535,7 +2576,9 @@ pub(crate) mod tests {
             .unwrap()
         };
 
-        super::run_exec_interactively(&exec(None, 0)).await.unwrap();
+        super::run_exec_interactively(&exec(None, 0), std::future::pending())
+            .await
+            .unwrap();
         let info = std::fs::read_to_string(&out).unwrap();
         assert!(info.contains(r#""interactive":true"#), "{info}");
         assert!(
@@ -2544,14 +2587,15 @@ pub(crate) mod tests {
         );
         assert!(info.ends_with(" mfa"), "{info}");
 
-        let error = super::run_exec_interactively(&exec(Some("IfAvailable"), 3))
-            .await
-            .unwrap_err();
+        let error =
+            super::run_exec_interactively(&exec(Some("IfAvailable"), 3), std::future::pending())
+                .await
+                .unwrap_err();
         assert!(error.to_string().starts_with("OUT="), "{error}");
         assert!(error.to_string().contains("exit status: 3"), "{error}");
 
         std::fs::remove_file(&out).unwrap();
-        let error = super::run_exec_interactively(&exec(Some("Never"), 0))
+        let error = super::run_exec_interactively(&exec(Some("Never"), 0), std::future::pending())
             .await
             .unwrap_err();
         assert!(

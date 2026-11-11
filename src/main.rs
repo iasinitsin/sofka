@@ -377,13 +377,19 @@ async fn run_main(args: Args, proxy_warnings: Vec<String>) -> Result<()> {
             eprintln!("The exec auth plugin needs input; running it on this terminal…");
             match k8s::authenticate_interactively(args.context.as_deref()).await {
                 Ok(()) => connected = connect().await,
-                Err(auth) => eprintln!("\x1b[33mwarning:\x1b[0m authentication failed: {auth:#}"),
+                Err(auth) => eprintln!(
+                    "\x1b[33mwarning:\x1b[0m authentication failed: {}",
+                    diagnostics::printable(&format!("{auth:#}"))
+                ),
             }
         }
         match connected {
             Ok(c) => (c, None),
             Err(e) if args.check || args.snapshot => {
-                eprintln!("\x1b[31merror:\x1b[0m {e:#}");
+                eprintln!(
+                    "\x1b[31merror:\x1b[0m {}",
+                    diagnostics::printable(&format!("{e:#}"))
+                );
                 applog::shutdown();
                 std::process::exit(1);
             }
@@ -392,7 +398,10 @@ async fn run_main(args: Args, proxy_warnings: Vec<String>) -> Result<()> {
                 (Cluster::disconnected(None), None)
             }
             Err(e) => {
-                eprintln!("\x1b[33mwarning:\x1b[0m {e:#}");
+                eprintln!(
+                    "\x1b[33mwarning:\x1b[0m {}",
+                    diagnostics::printable(&format!("{e:#}"))
+                );
                 (
                     Cluster::disconnected(args.context.as_deref()),
                     Some(format!("{e:#}")),
@@ -407,7 +416,7 @@ async fn run_main(args: Args, proxy_warnings: Vec<String>) -> Result<()> {
         .iter()
         .chain(&cluster.discovery_warnings)
     {
-        eprintln!("\x1b[33mwarning:\x1b[0m {w}");
+        eprintln!("\x1b[33mwarning:\x1b[0m {}", diagnostics::printable(w));
     }
     // Per-cluster/per-context override files merge over the base config.
     let resolved = loader.resolve(&cluster.context, &cluster.cluster_name);
@@ -692,7 +701,7 @@ async fn run_main(args: Args, proxy_warnings: Vec<String>) -> Result<()> {
     let result = run(&mut terminal, &mut app, &mut rx).await;
     // Still inside the runtime, so this actually completes — a spawned delete
     // would not, and the helper pod would sit out its TTL holding the volume.
-    app.shutdown_pvc_helper().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), app.shutdown_pvc_helper()).await;
     // Disable before leaving the alternate screen so the shell never sees
     // mouse-report sequences (harmless if capture was never enabled).
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
@@ -1183,12 +1192,13 @@ fn starting_namespace(
 /// drawn, and the backlog delayed the next change of direction. `dirty` is
 /// left set when the redraw is owed to the frame tick, and cleared when the
 /// frame was drawn here. No keys leaves it untouched.
-fn dispatch(
+async fn dispatch(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     keys: Vec<crossterm::event::KeyEvent>,
     captured: bool,
     dirty: &mut bool,
+    termination: &mut terminal::Termination,
 ) -> Result<()> {
     if keys.is_empty() {
         return Ok(());
@@ -1197,7 +1207,10 @@ fn dispatch(
     for key in keys {
         let mode = app.mode;
         app.handle_key(key)?;
-        take_suspend(terminal, app, captured);
+        take_suspend(terminal, app, captured, termination).await;
+        if app.should_quit {
+            return Ok(());
+        }
         // A new popup or view learns its scroll limits when drawn. Draw it
         // now so the next key does not clamp against the old view's limits.
         drawn = app.mode != mode;
@@ -1224,19 +1237,32 @@ fn dispatch(
 /// its shell is requested from a message, not from the keystroke that asked
 /// for it). A command can queue another as it finishes: the decoded Secret
 /// editor reopens on a document that does not parse.
-fn take_suspend(terminal: &mut ratatui::DefaultTerminal, app: &mut App, captured: bool) {
+async fn take_suspend(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    captured: bool,
+    termination: &mut terminal::Termination,
+) {
     while let Some(command) = app.pending.take() {
         let (argv, recovery) = match command {
             app::Suspend::Shell(argv) => (argv, None),
             app::Suspend::Recovery { argv, failure } => (argv, Some(failure)),
             app::Suspend::Authenticate { context, switch } => {
-                terminal::authenticate(terminal, app, context, switch, captured);
+                terminal::authenticate(terminal, app, context, switch, captured, termination).await;
+                if termination.requested() {
+                    app.should_quit = true;
+                    return;
+                }
                 terminal_title::set(app.terminal_title().as_deref());
                 continue;
             }
         };
         let target = app.shell_target.take();
-        let result = terminal::suspend_and_run(terminal, &argv, captured);
+        let result = terminal::suspend_and_run(terminal, &argv, captured, termination).await;
+        if termination.requested() {
+            app.should_quit = true;
+            return;
+        }
         app.handle_command_result(target, result, recovery);
         app.after_suspend();
         terminal_title::set(app.terminal_title().as_deref());
@@ -1248,6 +1274,7 @@ async fn run(
     app: &mut App,
     rx: &mut mpsc::Receiver<store::Msg>,
 ) -> Result<()> {
+    let mut termination = terminal::Termination::new()?;
     let mut reader = crossterm::event::EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut activity_frame = tokio::time::interval(Duration::from_millis(100));
@@ -1287,10 +1314,22 @@ async fn run(
             }
             // No more alternate-scroll sequences either way: release any Esc
             // still waiting for a tail that can no longer come.
-            dispatch(terminal, app, repair.flush(), captured, &mut dirty)?;
+            dispatch(
+                terminal,
+                app,
+                repair.flush(),
+                captured,
+                &mut dirty,
+                &mut termination,
+            )
+            .await?;
         }
 
         tokio::select! {
+            _ = termination.wait() => {
+                app.should_quit = true;
+                return Ok(());
+            }
             maybe_event = reader.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
@@ -1304,11 +1343,11 @@ async fn run(
                         } else {
                             repair.push(key)
                         };
-                        dispatch(terminal, app, keys, captured, &mut dirty)?;
+                        dispatch(terminal, app, keys, captured, &mut dirty, &mut termination).await?;
                     }
                     Some(Ok(Event::Mouse(m))) if captured => {
                         app.handle_mouse(m)?;
-                        take_suspend(terminal, app, captured);
+                        take_suspend(terminal, app, captured, &mut termination).await;
                         dirty = true;
                     }
                     Some(Err(_)) | None => return Ok(()),
@@ -1320,16 +1359,15 @@ async fn run(
                 }
             }
             Some(msg) = rx.recv() => {
-                app.handle_msg(msg);
                 // Batch any other queued updates before the next redraw.
-                while let Ok(m) = rx.try_recv() {
-                    app.handle_msg(m);
-                }
+                app.handle_msgs(
+                    std::iter::once(msg).chain(std::iter::from_fn(|| rx.try_recv().ok())),
+                );
                 if let Some(text) = app.take_notification() {
                     app.run_notify_command(&text);
                     ring_notification(&text, &app.notify_cfg);
                 }
-                take_suspend(terminal, app, captured);
+                take_suspend(terminal, app, captured, &mut termination).await;
                 dirty = true;
             }
             _ = activity_frame.tick(), if app.plugin_activity_visible() => {
@@ -1354,7 +1392,7 @@ async fn run(
             // A held Esc was a real keypress after all, not the head of a
             // split escape sequence: act on it.
             _ = tokio::time::sleep(altscroll::Repair::TIMEOUT), if repair.pending() => {
-                dispatch(terminal, app, repair.flush(), captured, &mut dirty)?;
+                dispatch(terminal, app, repair.flush(), captured, &mut dirty, &mut termination).await?;
             }
         }
     }

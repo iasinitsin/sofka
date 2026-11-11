@@ -29,6 +29,9 @@ impl App {
             self.request_helm_uninstall();
             return;
         }
+        let Some(kind) = self.kind.clone() else {
+            return;
+        };
         let targets = self.action_targets();
         if targets.is_empty() {
             return;
@@ -48,6 +51,7 @@ impl App {
         };
         self.begin_guarded(
             ConfirmAction::Delete {
+                kind,
                 targets,
                 force,
                 cascade,
@@ -136,14 +140,16 @@ impl App {
 
     pub(super) fn do_delete(
         &mut self,
+        kind: Kind,
         targets: Vec<(String, String)>,
         force: bool,
         cascade: Cascade,
     ) {
-        let Some(kind) = self.kind.clone() else {
-            return;
+        let label = if targets.len() > 1 {
+            format!("{} {}", targets.len(), kind.ar.plural)
+        } else {
+            self.action_label(&targets)
         };
-        let label = self.action_label(&targets);
         self.note_action(if force { "force-delete" } else { "delete" }, label);
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
@@ -151,13 +157,13 @@ impl App {
         let progress = if targets.len() == 1 {
             format!("deleting {}…", targets[0].0)
         } else {
-            format!("deleting {} {}…", targets.len(), self.kind_plural)
+            format!("deleting {} {}…", targets.len(), kind.ar.plural)
         };
         let claim = self.claim_status(progress);
         let done_label = if targets.len() == 1 {
             format!("deleted {}", targets[0].0)
         } else {
-            format!("deleted {} {}", targets.len(), self.kind_plural)
+            format!("deleted {} {}", targets.len(), kind.ar.plural)
         };
         tokio::spawn(async move {
             let mut dp = DeleteParams {
@@ -463,14 +469,22 @@ impl App {
         self.start_watch();
     }
 
-    /// Copy the (filtered) log buffer to the clipboard (k9s `c` in logs).
+    /// Copy the (filtered) log buffer to the clipboard (k9s `c` in logs),
+    /// or only the selected lines while a `V` selection is open.
     pub(super) fn copy_logs(&mut self) {
-        let text = self.filtered_log_text();
-        if text.is_empty() {
+        let selecting = self.logs.selecting();
+        let (text, n) = if selecting {
+            self.logs.selected_text()
+        } else {
+            self.logs.shown_text(0..=usize::MAX)
+        };
+        if n == 0 {
             self.flash_warn("no log lines to copy");
             return;
         }
-        let n = text.lines().count();
+        if selecting {
+            self.end_log_selection();
+        }
         self.copy_to_clipboard_async(
             text,
             format!("copied {n} log lines"),
@@ -549,29 +563,29 @@ impl App {
     }
 
     pub(super) fn filtered_log_text(&self) -> String {
-        self.logs
-            .view
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(i, l)| self.logs.matches(l, self.logs.line_meta.get(*i)))
-            .map(|(_, l)| l)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.logs.shown_text(0..=usize::MAX).0
     }
 
     /// Copy the current single-document view (YAML/describe/diff/events) to
     /// the clipboard (k9s `c` in those views). Copies the whole document — the
     /// `/` search highlights in place, it doesn't filter, so there is no
-    /// "matching subset" to copy.
+    /// "matching subset" to copy. An open `V` selection copies only its lines.
     pub(super) fn copy_doc(&mut self) {
-        let text = self.doc_text();
-        if text.is_empty() {
+        let selected = self
+            .detail
+            .selection()
+            .map(|selection| selection.range().count());
+        let text = if selected.is_some() {
+            self.detail.selected_text()
+        } else {
+            self.doc_text()
+        };
+        if selected.is_none() && text.is_empty() {
             self.flash_warn("nothing to copy");
             return;
         }
-        let n = text.lines().count();
+        self.detail.selection = None;
+        let n = selected.unwrap_or_else(|| text.lines().count());
         self.copy_to_clipboard_async(
             text,
             format!("copied {n} lines"),
@@ -960,17 +974,21 @@ impl App {
         // warn (and confirm) before opening the editor.
         let flux = flux_managed_by(obj);
         let mut argv = self.kubectl_base();
-        argv.extend(["edit".into(), resource, name]);
+        argv.push("edit".into());
         if !ns.is_empty() {
             argv.push("-n".into());
             argv.push(ns);
         }
+        argv.extend(["--".into(), resource, name]);
         match flux {
             Some(owner) => {
                 self.confirm_label = format!(
                     "⚠ Managed by {owner} — your edit will be reverted on the next reconcile. Edit anyway?"
                 );
-                self.confirm_action = Some(ConfirmAction::Edit { argv });
+                self.confirm_action = Some(ConfirmAction::Edit {
+                    argv,
+                    label: edit_label,
+                });
                 self.mode = Mode::Confirm;
             }
             None => {
@@ -2226,12 +2244,15 @@ impl App {
             return;
         }
         if !self.flux_suspendable() && !self.cronjob_kind() && !self.argocd_kind() {
-            self.flash_warn("suspend/resume only applies to CronJobs, Flux resources (ks/hr/HelmCharts/git-, helm-, oci-repos, buckets, image automation, alerts, receivers, ResourceSets, input providers, FluxInstances), and ArgoCD Applications/ApplicationSets");
+            self.flash_warn("suspend/resume only applies to CronJobs, Flux resources (ks/hr/HelmCharts/git-, helm-, oci-repos, buckets, image automation, alerts, receivers, ResourceSets, input providers, FluxInstances, Terraforms), and ArgoCD Applications/ApplicationSets");
             return;
         }
-        if self.action_targets().is_empty() {
+        let targets = self.action_targets();
+        if targets.is_empty() {
             return;
         }
+        self.action_menu_targets = targets;
+        self.action_menu_objects = self.action_target_objects();
         self.flux_menu_state.select(Some(0));
         self.mode = Mode::FluxMenu;
     }
@@ -2240,7 +2261,11 @@ impl App {
         let items = self.action_menu_items();
         let len = items.len();
         match (key.action, key.code) {
-            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
+                self.action_menu_targets.clear();
+                self.action_menu_objects.clear();
+                self.mode = Mode::Table;
+            }
             (Some(Action::Down), _) => list_step(&mut self.flux_menu_state, len, true),
             (Some(Action::Up), _) => list_step(&mut self.flux_menu_state, len, false),
             (Some(a @ (Action::PageDown | Action::HalfPageDown)), _) => list_page(
@@ -2261,10 +2286,11 @@ impl App {
                     .selected()
                     .and_then(|i| items.get(i))
                     .copied();
+                let targets = std::mem::take(&mut self.action_menu_targets);
+                let objects = std::mem::take(&mut self.action_menu_objects);
                 self.mode = Mode::Table;
                 match choice {
                     Some("Suspend") => {
-                        let targets = self.action_targets();
                         if self.argocd_kind() {
                             self.do_argocd_suspend(targets, true);
                         } else {
@@ -2272,7 +2298,6 @@ impl App {
                         }
                     }
                     Some("Resume") => {
-                        let targets = self.action_targets();
                         if self.argocd_kind() {
                             self.do_argocd_suspend(targets, false);
                         } else {
@@ -2280,19 +2305,16 @@ impl App {
                         }
                     }
                     Some("Reconcile now" | "Force reconcile") => {
-                        let targets = self.action_targets();
                         self.do_flux_reconcile(targets, choice == Some("Force reconcile"));
                     }
                     Some("Refresh" | "Hard refresh") => {
-                        let targets = self.action_targets();
                         self.do_argocd_refresh(targets, choice == Some("Hard refresh"));
                     }
                     Some("Sync now") => {
-                        let targets = self.action_targets();
                         self.do_argocd_sync(targets, false);
                     }
-                    Some("Sync with prune") => self.request_argocd_sync_prune(),
-                    Some("Trigger now") => self.do_trigger_cronjobs(),
+                    Some("Sync with prune") => self.request_argocd_sync_prune(targets),
+                    Some("Trigger now") => self.do_trigger_cronjobs(objects),
                     _ => {} // "Cancel" or nothing selected — do nothing.
                 }
             }
@@ -2551,8 +2573,7 @@ impl App {
 
     /// Ask before a pruning sync: it deletes every resource the Application
     /// manages that is no longer in Git. Gated by `prune` guardrails.
-    pub(super) fn request_argocd_sync_prune(&mut self) {
-        let targets = self.action_targets();
+    pub(super) fn request_argocd_sync_prune(&mut self, targets: Vec<(String, String)>) {
         if targets.is_empty() {
             return; // see `do_flux_suspend`
         }
@@ -2586,8 +2607,7 @@ impl App {
     /// --from=cronjob/…` does, manual-instantiate annotation and owner
     /// reference included. Works on suspended CronJobs too (the suspend flag
     /// only gates the schedule, not manually created Jobs).
-    pub(super) fn do_trigger_cronjobs(&mut self) {
-        let objs = self.action_target_objects();
+    pub(super) fn do_trigger_cronjobs(&mut self, objs: Vec<DynamicObject>) {
         // Seconds-resolution suffix: unique enough for a manual action, and a
         // repeat trigger of the same CronJob within a second fails loudly
         // with AlreadyExists rather than silently double-running.
@@ -2825,6 +2845,21 @@ impl App {
         }
     }
 
+    /// Report a failed action that started before the view changed.
+    /// Keep the current status claim so its action can still report its result.
+    pub(super) fn report_stale_failure(&mut self, message: String) {
+        self.last_action_error = Some(message.clone());
+        if self.flash.is_empty() || self.flash.ends_with('…') {
+            let owner = self.status_claim.take();
+            self.set_flash(message.clone());
+            self.flash_err = true;
+            self.status_claim = owner.map(|mut owner| {
+                owner.text = message;
+                owner
+            });
+        }
+    }
+
     /// Refresh a still-running operation's progress without giving up the
     /// claim its result has to present. Unlike [`Self::set_claimed_status`]
     /// the claim stays pending, so the operation still reports when it lands.
@@ -3044,12 +3079,13 @@ impl App {
             ns,
         ]);
         let claim = self.claim_status(format!("rolling back {name} to revision {revision}…"));
+        let runner = self.helm_runner.clone();
         let tx = self.tx.clone();
         let genr = self.generation;
         // No manual re-watch on success: the live `secrets` watch backing the
         // helm/helmhistory view picks up the new revision Secret on its own.
         tokio::spawn(async move {
-            match run_helm(&argv).await {
+            match runner(argv).await {
                 Ok(_) => {
                     let _ = tx
                         .send(Msg::Flash {
@@ -3117,6 +3153,7 @@ impl App {
             format!("uninstalled {} Helm releases", targets.len())
         };
         let helm_base = self.helm_base();
+        let runner = self.helm_runner.clone();
         let tx = self.tx.clone();
         let genr = self.generation;
         tokio::spawn(async move {
@@ -3124,7 +3161,7 @@ impl App {
             for (name, ns) in targets {
                 let mut argv = helm_base.clone();
                 argv.extend(["uninstall".to_string(), name.clone(), "-n".to_string(), ns]);
-                if let Err(e) = run_helm(&argv).await {
+                if let Err(e) = runner(argv).await {
                     failed = true;
                     let _ = tx
                         .send(Msg::Flash {
@@ -3289,7 +3326,7 @@ fn port_label(port: i64, qualifiers: &[(&str, &str)]) -> String {
 }
 /// Run a `helm` subprocess to completion, following the same
 /// missing-binary/non-zero-exit handling as `describe()`'s `kubectl` shell-out.
-async fn run_helm(argv: &[String]) -> std::result::Result<(), String> {
+pub(super) async fn run_helm(argv: Vec<String>) -> std::result::Result<(), String> {
     match tokio::process::Command::new(&argv[0])
         .args(&argv[1..])
         .output()

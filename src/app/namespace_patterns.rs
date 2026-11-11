@@ -129,6 +129,12 @@ impl App {
                 return;
             }
         };
+        if self.mode != Mode::Table {
+            self.flash_warn(&format!(
+                "namespaces for {pattern} arrived while a dialog was open; run the command again"
+            ));
+            return;
+        }
         names.sort();
         names.dedup();
         self.namespace_patterns.insert(pattern.clone(), names);
@@ -150,6 +156,7 @@ impl App {
                     self.save_history_filter();
                     self.namespace = pattern;
                     self.set_root_view(kind);
+                    self.reset_layout();
                     self.remember_namespace();
                     self.record_history();
                     self.start_watch();
