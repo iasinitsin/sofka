@@ -171,8 +171,8 @@ include those conditions. Row filters can search the route paths.
   [Views](views.md#built-in-and-metric-columns).
 
 - **Scroll position** appears on the borders of long resource tables, document
-  views, logs, and pickers. Tables and unwrapped documents also show horizontal
-  position. Wrapped views use display rows. Scrollbars use thin lines. They
+  views, logs, and pickers. Tables, unwrapped documents, and unwrapped logs also
+  show horizontal position. Wrapped views use display rows. Scrollbars use thin lines. They
   appear during keyboard or mouse scrolling and hide after 700 ms without
   scrolling. They stay hidden when content fits. Fullscreen logs and documents
   keep their borderless layout for text selection.
@@ -211,6 +211,12 @@ include those conditions. Row filters can search the route paths.
 - **Optional header** - set `hide_header = true` in the configuration to hide
   the header and logo, including the one-line header in compact mode.
 
+- **Header logo makes room** - the logo on the right of the header gives up its
+  column when the key hints, the context line (with its badge and
+  `[read-only]`), the cluster URL, or the resource title would not fit beside
+  it. Namespace favourites take whatever room is left, so they do not count.
+  When everything fits, the logo stays.
+
 - **Connect** to the current kubeconfig context, including exec credential
   plugins (GKE, EKS, and friends).
 - **MFA prompts from exec plugins** - a plugin that asks for input, such as
@@ -233,6 +239,9 @@ include those conditions. Row filters can search the route paths.
   Resource names and built-in aliases take priority over discovered short names.
   Shared short names use group priority, then alphabetical group and resource
   order. User aliases override discovered aliases.
+  When a group serves one kind under two names, the name that can be listed is
+  the one sofka shows: OpenShift's `templates`, not the create-only
+  `processedtemplates`.
   Discovery runs at connect. When a `:` lookup matches no known kind, sofka runs
   discovery again in the background and retries the lookup, so a CRD installed
   while sofka runs opens without a restart. It does this at most once every 5
@@ -292,7 +301,7 @@ include those conditions. Row filters can search the route paths.
 - **Curated columns** for common kinds (pods, deployments, replicasets,
   statefulsets, daemonsets, services, nodes, namespaces, configmaps, secrets,
   jobs, cronjobs, PVC/PV, ingresses, endpoints, CustomResourceDefinitions,
-  Flux and flux-operator objects), with
+  Flux and flux-operator objects, Karpenter NodePools and NodeClaims), with
   a NAME/AGE fallback for everything else. STATUS columns use a fixed width of
   26 characters, or 27 for Nodes, so status changes do not move adjacent
   columns. A configured column width takes priority. Column widths use the full filtered list so
@@ -347,8 +356,9 @@ include those conditions. Row filters can search the route paths.
   [Views and thresholds](views.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,
-  CRD → its custom resources, Argo CD Application or ApplicationSet → the Argo
-  CD view, unless a `[views."applications"].drill` is configured. `esc` goes back.
+  CRD → its custom resources, Karpenter NodePool → its NodeClaims, Argo CD
+  Application or ApplicationSet → the Argo CD view. A configured
+  `[views."…"].drill` replaces the NodePool and Argo CD drills. `esc` goes back.
   Workload pod selection includes both `matchLabels` and `matchExpressions`.
   Drill-down, logs, Explain, and diagnostic bundles apply all requirements,
   including `In`, `NotIn`, `Exists`, and `DoesNotExist`. Services use their
@@ -425,6 +435,8 @@ include those conditions. Row filters can search the route paths.
   - Argo CD Applications: health other than `Healthy`, sync other than
     `Synced`, or terminating. ApplicationSets: any status other than `Synced`,
     or terminating.
+  - Events (core and `events.k8s.io`): every type other than `Normal`, so
+    `Warning` and custom types stay visible.
 
   The table title shows `[faults]` while the filter is on. It works with the
   text filter and current namespace or drill scope. Press `Ctrl+Z` again to
@@ -529,6 +541,11 @@ include those conditions. Row filters can search the route paths.
 - **Compact mode** (`ctrl-e`) - collapse the seven-line header and the footer
   into one info line (kind · count · namespace · context, with a flash and the
   live indicator), so a tiled pane is almost all table.
+- **Suspend to the shell** (`suspend`, unbound by default) - give the terminal
+  back to the shell and stop sofka for job control; `fg` resumes it and redraws.
+  Port-forwards, watches, and log streams pause while it is stopped. See
+  [key bindings](keybindings.md#example-ctrlz-to-suspend-to-the-shell) to put it
+  on `ctrl-z`.
 
 ## Metrics and health
 
@@ -997,6 +1014,10 @@ include those conditions. Row filters can search the route paths.
   StatefulSet policies, Pod scheduling groups, and Node-local ResourceSlice
   summaries. Node resource accounting includes Pod-level budgets and resize
   status; older API compatibility paths remain available.
+- **Events faults filter** - `Ctrl+Z` in the events view (`E`) shows only
+  events that are not `Normal` and adds `[faults]` to the title. Live updates
+  keep the filter applied, and it stays on for later events views during the
+  session. Press `Ctrl+Z` again to show every event.
 - **Edit from a document** - `e` in the YAML or describe view edits the
   displayed resource with `kubectl edit`, so a table row that moved while the
   watch was filling cannot change the target. The document is read again when
@@ -1172,8 +1193,8 @@ lifetime, and resources are configurable:
 
 ```toml
 [pvc_explore]
-image = "busybox:1.37"   # helper-pod image
-ttl = "30m"              # how long it lives before deleting itself
+image = "busybox:1.37" # helper-pod image
+ttl = "30m" # how long it lives before deleting itself
 cpu_request = "100m"
 cpu_limit = "100m"
 memory_request = "128Mi"
