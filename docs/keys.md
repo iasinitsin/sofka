@@ -50,11 +50,12 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `S` / `I`                                                    | sort-column picker (fuzzy; ⏎ on the active column inverts) / invert sort direction; saved per kind by default (`remember_sort = false` disables this)                                                                 |
 | `A`                                                          | sort by `AGE`; press again to invert; uses the sort memory setting                                                                                                                                                    |
 | `ctrl-e`                                                     | compact mode: collapse the header + footer (for tiled/multiplexed panes)                                                                                                                                              |
+| `suspend`                                                    | stop sofka and return to the shell; `fg` resumes it; unbound by default, see [key bindings](keybindings.md#example-ctrlz-to-suspend-to-the-shell)                                                                     |
 | `space`                                                      | mark/unmark row for bulk actions                                                                                                                                                                                      |
 | `shift-up` / `shift-down`                                    | extend or reduce the marked range from the starting row                                                                                                                                                               |
 | `ctrl-space`                                                 | mark every row from the last `space` mark to the cursor                                                                                                                                                               |
 | `/`                                                          | filter: text · `a\|b` · `~fuzzy` · `/regex/` · `!inverse` · `label:text` local label search · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                                                 |
-| `Ctrl+Z`                                                     | toggle faults filter in pod, workload, Flux, and Argo CD views; configured actions take precedence; combine with `/`; press again to turn off                                                                         |
+| `Ctrl+Z`                                                     | toggle faults filter in pod, workload, Flux, Argo CD, and Events views; configured actions take precedence; combine with `/`; press again to turn off                                                                 |
 | `:workloads [ns]` / `:wk`                                    | deployments, statefulsets, daemonsets, cronjobs, jobs and pods in one table; row keys act on the row's own kind                                                                                                       |
 | `:ns-resources [ns]`                                         | namespaced kinds with objects in the namespace (default: current; `all`/`*` = all namespaces) and how many; `⏎` opens the kind in that namespace, `r` counts again                                                    |
 | `R` (namespaces view)                                        | open `:ns-resources` for the selected namespace                                                                                                                                                                       |
@@ -262,6 +263,11 @@ highlighted. `n` / `N` go to the next or previous match. `w` wraps. `c` copies
 the document. `ctrl-s` saves it to a file. `esc` backs out - the first press
 clears an active search.
 
+In the events view, `ctrl-z` shows only events whose type is not `Normal`, and
+the title shows `[faults]`. Live updates keep the filter applied, and it stays
+on for later events views during the session. Press `ctrl-z` again to show
+every event. Use `keys.events.faults` to change the key binding.
+
 `V` selects whole lines, starting on the current search match, or on the first
 visible line when no search is active. `j` / `k`, `g` / `G`, `ctrl-f` /
 `ctrl-b`, and `n` / `N` move the cursor and extend the selection. `o` moves the
@@ -445,6 +451,12 @@ configs, conflicts, and invalid values.
 Interactive actions (`e`, `s` for shell, `a`) suspend the TUI and shell out to
 `kubectl`. `e` in the manifest browser suspends it for your editor. Delete, scale, restart, set-image, suspend, resume, reconcile, and
 port-forward go through the kube API (or a backgrounded process) directly.
+
+The `suspend` action, when bound, gives the terminal back to the shell and
+stops sofka with `SIGTSTP`, so the shell's job control takes over. `fg` resumes
+it and redraws the screen. Port-forwards, watches, and log streams pause while
+sofka is stopped. Windows has no job control; there the action only shows a
+message.
 
 If the first PVC listing fails because required tools are missing, sofka tries
 other suitable containers, then offers a helper pod. Accept or cancel the

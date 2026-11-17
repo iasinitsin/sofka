@@ -12,8 +12,10 @@ mod context_badge;
 mod credentials;
 mod delete;
 mod dir;
+mod discovery;
 mod exec_auth;
 mod flux;
+mod karpenter;
 mod kubeconfig;
 mod label_filter;
 mod line_select;
@@ -35,6 +37,7 @@ mod rollout;
 mod save;
 mod scale;
 mod server_table;
+mod suspend;
 mod synchronized_output;
 mod terraform;
 mod update;
@@ -132,6 +135,7 @@ fn test_app() -> (App, Receiver<Msg>) {
             .stderr(std::process::Stdio::null())
             .spawn()
     };
+    app.pf_port_binder = std::sync::Arc::new(|_, _| Ok(()));
     app.update_fetcher = |_force| Box::pin(async { Err("no network in tests".to_string()) });
     app.helm_runner = std::sync::Arc::new(|_argv| Box::pin(async { Ok(()) }));
     (app, rx)
@@ -2377,9 +2381,7 @@ async fn port_forward_handle_key_f_opens_picker() {
 
 #[tokio::test]
 async fn port_forward_picker_select_port_starts_forward() {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let port = 8080;
     let (mut app, _rx) = test_app();
     app.switch_kind("services");
     apply(
@@ -2400,29 +2402,50 @@ async fn port_forward_picker_select_port_starts_forward() {
     assert_eq!(app.port_forwards[0].target, "svc/web");
 }
 
-fn occupy_forward_port() -> (std::net::TcpListener, Option<std::net::TcpListener>) {
-    let ipv4 = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = ipv4.local_addr().unwrap().port();
-    let ipv6 = match std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)) {
-        Ok(listener) => Some(listener),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
-            ) =>
-        {
-            None
+type BusyPorts =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(std::net::IpAddr, u16)>>>;
+
+const LOOPBACKS: [std::net::IpAddr; 2] = [
+    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+];
+
+/// Stubs the port-forward preflight with local addresses the test marks as
+/// taken. Real sockets would make these tests flaky: a released port stays
+/// bound while a child spawned by a sibling test still holds its copy.
+fn stub_busy_ports(app: &mut App) -> BusyPorts {
+    let busy = BusyPorts::default();
+    let taken = busy.clone();
+    app.pf_port_binder = std::sync::Arc::new(move |address, port| {
+        if taken.lock().unwrap().contains(&(address, port)) {
+            Err(std::io::ErrorKind::AddrInUse.into())
+        } else {
+            Ok(())
         }
-        Err(error) => panic!("IPv6 listener failed: {error}"),
-    };
-    (ipv4, ipv6)
+    });
+    busy
+}
+
+fn occupy_port(busy: &BusyPorts, port: u16) {
+    busy.lock()
+        .unwrap()
+        .extend(LOOPBACKS.map(|address| (address, port)));
+}
+
+#[test]
+fn default_port_binder_reports_a_held_port_in_use() {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let error = super::default_port_binder(LOOPBACKS[0], port).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
 }
 
 #[tokio::test]
 async fn port_forward_picker_keeps_selection_when_local_port_is_in_use() {
-    let listeners = occupy_forward_port();
-    let port = listeners.0.local_addr().unwrap().port();
+    let port = 8080;
     let (mut app, _rx) = test_app();
+    let busy = stub_busy_ports(&mut app);
+    occupy_port(&busy, port);
     app.switch_kind("services");
     apply(
         &mut app,
@@ -2442,7 +2465,7 @@ async fn port_forward_picker_keeps_selection_when_local_port_is_in_use() {
     assert!(app.flash_err);
     assert!(app.port_forwards.is_empty());
 
-    drop(listeners);
+    busy.lock().unwrap().clear();
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Table);
     assert_eq!(app.port_forwards.len(), 1);
@@ -2451,9 +2474,9 @@ async fn port_forward_picker_keeps_selection_when_local_port_is_in_use() {
 
 #[tokio::test]
 async fn port_forward_conflict_can_be_fixed_by_editing_only_the_local_port() {
-    let listeners = occupy_forward_port();
-    let remote = listeners.0.local_addr().unwrap().port();
+    let remote = 8080;
     let (mut app, _rx) = test_app();
+    occupy_port(&stub_busy_ports(&mut app), remote);
     app.switch_kind("services");
     apply(
         &mut app,
@@ -2479,9 +2502,7 @@ async fn port_forward_conflict_can_be_fixed_by_editing_only_the_local_port() {
     assert_eq!(app.flash, format!("port {remote} is already in use"));
     assert!(app.port_forwards.is_empty());
 
-    let free = occupy_forward_port();
-    let local = free.0.local_addr().unwrap().port();
-    drop(free);
+    let local = 18080;
     for _ in 0..app.prompt_input.len() {
         app.handle_key(press(KeyCode::Backspace)).unwrap();
     }
@@ -2519,9 +2540,7 @@ async fn port_forward_local_edit_preserves_input_after_spawn_failure() {
     app.handle_key(press(KeyCode::Char('f'))).unwrap();
     app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char('e'))).unwrap();
-    let free = occupy_forward_port();
-    let local = free.0.local_addr().unwrap().port().to_string();
-    drop(free);
+    let local = "19090".to_string();
     for _ in 0..app.prompt_input.len() {
         app.handle_key(press(KeyCode::Backspace)).unwrap();
     }
@@ -2628,12 +2647,10 @@ fn type_prompt(app: &mut App, input: &str) {
 
 #[tokio::test]
 async fn port_forward_custom_asks_remote_then_prefilled_local_port() {
-    let listeners = occupy_forward_port();
-    let busy = listeners.0.local_addr().unwrap().port();
-    let free = occupy_forward_port();
-    let local = free.0.local_addr().unwrap().port();
-    drop(free);
+    let busy = 8080;
+    let local = 18080;
     let (mut app, _rx) = test_app();
+    occupy_port(&stub_busy_ports(&mut app), busy);
     app.switch_kind("services");
     apply(
         &mut app,
@@ -2695,9 +2712,7 @@ async fn port_forward_custom_asks_remote_then_prefilled_local_port() {
 
 #[tokio::test]
 async fn port_forward_custom_named_remote_port_leaves_local_empty() {
-    let free = occupy_forward_port();
-    let local = free.0.local_addr().unwrap().port();
-    drop(free);
+    let local = 18080;
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
     apply(
@@ -2764,12 +2779,10 @@ async fn port_forward_custom_prompts_return_to_picker_on_esc() {
 
 #[tokio::test]
 async fn port_forward_picker_marks_local_ports_already_in_use() {
-    let listeners = occupy_forward_port();
-    let busy = listeners.0.local_addr().unwrap().port();
-    let free = occupy_forward_port();
-    let open = free.0.local_addr().unwrap().port();
-    drop(free);
+    let busy = 8080;
+    let open = 9090;
     let (mut app, _rx) = test_app();
+    occupy_port(&stub_busy_ports(&mut app), busy);
     app.switch_kind("pods");
     apply(
         &mut app,
@@ -2819,20 +2832,13 @@ async fn port_forward_picker_marks_local_ports_already_in_use() {
 
 #[tokio::test]
 async fn port_forward_picker_allows_one_available_loopback_family() {
-    for occupy_ipv4 in [true, false] {
-        let (ipv4, ipv6) = occupy_forward_port();
-        let Some(ipv6) = ipv6 else {
-            return;
-        };
-        let port = ipv4.local_addr().unwrap().port();
-        let _occupied = if occupy_ipv4 {
-            drop(ipv6);
-            ipv4
-        } else {
-            drop(ipv4);
-            ipv6
-        };
+    let port = 8080;
+    for occupied in LOOPBACKS {
         let (mut app, _rx) = test_app();
+        stub_busy_ports(&mut app)
+            .lock()
+            .unwrap()
+            .insert((occupied, port));
         app.switch_kind("pods");
         apply(
             &mut app,
@@ -2854,9 +2860,7 @@ async fn port_forward_picker_allows_one_available_loopback_family() {
 
 #[tokio::test]
 async fn port_forward_picker_pod_target_no_svc_prefix() {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let port = 8080;
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
     apply(
@@ -3129,9 +3133,7 @@ async fn port_forward_marker_renders_in_table() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let port = 8080;
     let (mut app, _rx) = test_app();
     app.switch_kind("services");
     apply(
@@ -3452,6 +3454,134 @@ async fn narrow_header_drops_the_logo_before_the_key_hints() {
         );
         assert_eq!(header.contains("sofka v"), logo, "logo at width {width}");
     }
+}
+
+#[tokio::test]
+async fn header_logo_gives_way_when_the_info_would_be_cut_off() {
+    // At 130 columns the hints and the logo both fit and leave the info 56
+    // columns, of which the field labels take 12. At 80 columns the hints sit
+    // on the footer and the info gets 52 columns beside the logo.
+    fn header(width: u16, setup: impl FnOnce(&mut App)) -> String {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for c in "pods".chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, "pods");
+        setup(&mut app);
+        screen_text(&mut app, width, 24)
+            .lines()
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    let badge = |label: &str| {
+        let label = label.to_string();
+        move |app: &mut App| {
+            app.readonly = true;
+            app.context_badge = Some(crate::config::ContextBadge { label, color: None });
+        }
+    };
+
+    let fits = header(130, |_| {});
+    assert!(fits.contains("prev logs"), "{fits}");
+    assert!(fits.contains("sofka v"), "{fits}");
+
+    for (case, width, logo, expected, setup) in [
+        (
+            "context at the limit",
+            130,
+            true,
+            "c".repeat(44),
+            Box::new(|app: &mut App| app.cluster.context = "c".repeat(44))
+                as Box<dyn FnOnce(&mut App)>,
+        ),
+        (
+            "context past the limit",
+            130,
+            false,
+            "c".repeat(45),
+            Box::new(|app: &mut App| app.cluster.context = "c".repeat(45)),
+        ),
+        (
+            "cluster URL at the limit",
+            130,
+            true,
+            format!("https://{}", "u".repeat(36)),
+            Box::new(|app: &mut App| {
+                app.cluster.cluster_url = format!("https://{}", "u".repeat(36));
+            }),
+        ),
+        (
+            "cluster URL past the limit",
+            130,
+            false,
+            format!("https://{}", "u".repeat(37)),
+            Box::new(|app: &mut App| {
+                app.cluster.cluster_url = format!("https://{}", "u".repeat(37));
+            }),
+        ),
+        (
+            "badge and read-only at the limit",
+            130,
+            true,
+            format!("test  [{}]  [read-only]", "b".repeat(23)),
+            Box::new(badge(&"b".repeat(23))),
+        ),
+        (
+            "badge and read-only past the limit",
+            130,
+            false,
+            format!("test  [{}]  [read-only]", "b".repeat(24)),
+            Box::new(badge(&"b".repeat(24))),
+        ),
+        (
+            "resource title at the limit",
+            130,
+            true,
+            format!("pods  ‹ {}", "s".repeat(36)),
+            Box::new(|app: &mut App| app.scope_label = Some("s".repeat(36))),
+        ),
+        (
+            "resource title past the limit",
+            130,
+            false,
+            format!("pods  ‹ {}", "s".repeat(37)),
+            Box::new(|app: &mut App| app.scope_label = Some("s".repeat(37))),
+        ),
+        (
+            "context at the limit without hints",
+            80,
+            true,
+            "c".repeat(40),
+            Box::new(|app: &mut App| app.cluster.context = "c".repeat(40)),
+        ),
+        (
+            "context past the limit without hints",
+            80,
+            false,
+            "c".repeat(41),
+            Box::new(|app: &mut App| app.cluster.context = "c".repeat(41)),
+        ),
+    ] {
+        let text = header(width, setup);
+        assert_eq!(text.contains("sofka v"), logo, "logo for {case}:\n{text}");
+        assert!(text.contains(&expected), "{case} is cut off:\n{text}");
+        assert_eq!(
+            text.contains("prev logs"),
+            width == 130,
+            "hints for {case}:\n{text}"
+        );
+    }
+
+    let favorites = header(130, |app| {
+        app.namespace_favorites = (1..=9)
+            .map(|i| format!("favourite-namespace-{i}"))
+            .collect();
+    });
+    assert!(favorites.contains("favourite-namespace-1"), "{favorites}");
+    assert!(favorites.contains("sofka v"), "{favorites}");
 }
 
 #[tokio::test]
@@ -5736,11 +5866,8 @@ async fn enter_on_nodepool_drills_into_its_nodeclaims() {
         .register_kind("karpenter.sh", "NodePool", "nodepools", false);
     app.cluster
         .register_kind("karpenter.sh", "NodeClaim", "nodeclaims", false);
-    app.user_views = views_with_drill(
-        "karpenter.sh/v1/nodepools",
-        "nodeclaims",
-        "karpenter.sh/nodepool={name}",
-    );
+    // Built in: no `[views."karpenter.sh/v1/nodepools"].drill` needed.
+    assert!(app.user_views.is_empty());
     app.switch_kind("nodepools");
     apply(
         &mut app,
@@ -5751,6 +5878,10 @@ async fn enter_on_nodepool_drills_into_its_nodeclaims() {
 
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.kind_plural, "nodeclaims");
+    assert_eq!(
+        app.kind.as_ref().map(|k| k.ar.group.as_str()),
+        Some("karpenter.sh")
+    );
     assert_eq!(app.labels.as_deref(), Some("karpenter.sh/nodepool=default"));
     assert_eq!(app.fields, None);
     assert_eq!(app.namespace, "");
@@ -23046,6 +23177,87 @@ async fn logs_sideways_scroll_reaches_the_end_of_a_line_past_u16_columns() {
 }
 
 #[tokio::test]
+async fn logs_show_a_horizontal_scrollbar_for_long_unwrapped_lines() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.compact = true;
+    app.mode = Mode::Logs;
+    app.return_mode = Mode::Table;
+    app.handle_msg(Msg::LogLines {
+        generation: app.log_gen,
+        lines: vec![format!("{}END", "x".repeat(100))],
+    });
+    let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    let thumb = |term: &Terminal<TestBackend>| -> Vec<u16> {
+        (1..39)
+            .filter(|&x| {
+                let cell = &term.backend().buffer()[(x, 9)];
+                cell.symbol() == "─" && cell.fg == crate::theme::text()
+            })
+            .collect()
+    };
+
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(thumb(&term).is_empty(), "hidden until scrolling");
+
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let start = thumb(&term);
+    assert!(!start.is_empty(), "{:?}", term.backend().buffer());
+    assert!(start.len() < 38, "thumb is a fraction of the track");
+
+    for _ in 0..30 {
+        app.handle_key(press(KeyCode::Right)).unwrap();
+    }
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.logs.view.hscroll, app.logs.max_hscroll);
+    let end = thumb(&term);
+    assert!(end[0] > start[0], "{start:?} -> {end:?}");
+    assert_eq!(end.last(), Some(&38), "thumb reaches the right edge");
+
+    app.scrollbar_activity =
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(701));
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(thumb(&term).is_empty(), "hides when idle");
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(
+        thumb(&term).is_empty(),
+        "wrapped lines have no sideways scroll"
+    );
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    app.handle_key(press(KeyCode::Char('F'))).unwrap();
+    assert!(app.logs.fullscreen);
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(app.logs.view.hscroll > 0);
+    assert!(thumb(&term).is_empty(), "fullscreen stays borderless");
+}
+
+#[tokio::test]
+async fn logs_hide_the_horizontal_scrollbar_when_lines_fit() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.compact = true;
+    app.mode = Mode::Logs;
+    app.return_mode = Mode::Table;
+    app.handle_msg(Msg::LogLines {
+        generation: app.log_gen,
+        lines: vec!["short line".into()],
+    });
+    let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(app.scrollbars_visible());
+    assert!((1..39).all(|x| term.backend().buffer()[(x, 9)].fg != crate::theme::text()));
+}
+
+#[tokio::test]
 async fn logs_fullscreen_toggles_with_shift_f() {
     let (mut app, _rx) = test_app();
     app.mode = Mode::Logs;
@@ -23975,7 +24187,7 @@ async fn network_load_plugins_confirm_and_obey_readonly_and_guardrails() {
 #[tokio::test]
 async fn context_plugin_runs_without_selection_and_receives_request() {
     let (mut app, mut rx) = test_app();
-    let mut plugin = named_plugin("/bin/cat", &[]);
+    let mut plugin = named_plugin("cat", &[]);
     plugin.target = Some("context".into());
     plugin.output = Some("popup".into());
     plugin.package_dir = Some(std::env::temp_dir());
@@ -23994,7 +24206,7 @@ async fn context_plugin_runs_without_selection_and_receives_request() {
 async fn package_report_renders_tables_and_remains_searchable() {
     let (mut app, mut rx) = app_with_pod();
     let report = r#"{"schema_version":1,"title":"Scan","sections":[{"title":"Findings","columns":["Resource","Severity"],"rows":[["api","high"],["certificate","low"]]}]}"#;
-    let mut plugin = named_plugin("/bin/echo", &[report]);
+    let mut plugin = named_plugin("echo", &[report]);
     plugin.output = Some("report".into());
     app.plugins = vec![plugin];
     plugin_command(&mut app, "example-plugin");
@@ -24039,7 +24251,7 @@ async fn package_report_renders_tables_and_remains_searchable() {
 #[tokio::test]
 async fn invalid_report_is_a_visible_failure() {
     let (mut app, mut rx) = app_with_pod();
-    let mut plugin = named_plugin("/bin/echo", &[r#"{"schema_version":8,"title":"Future"}"#]);
+    let mut plugin = named_plugin("echo", &[r#"{"schema_version":8,"title":"Future"}"#]);
     plugin.output = Some("report".into());
     app.plugins = vec![plugin];
     plugin_command(&mut app, "example-plugin");
@@ -24056,7 +24268,7 @@ async fn invalid_report_is_a_visible_failure() {
 #[tokio::test]
 async fn cancelling_and_replacing_plugins_rejects_stale_results() {
     let (mut app, _rx) = app_with_pod();
-    let mut plugin = named_plugin("/bin/sleep", &["20"]);
+    let mut plugin = named_plugin("sleep", &["20"]);
     plugin.output = Some("popup".into());
     app.plugins = vec![plugin];
     plugin_command(&mut app, "example-plugin");
@@ -24088,7 +24300,7 @@ async fn cancelling_and_replacing_plugins_rejects_stale_results() {
 #[tokio::test]
 async fn context_switch_and_quit_cancel_plugin_tasks() {
     let (mut app, _rx) = app_with_pod();
-    let mut plugin = named_plugin("/bin/sleep", &["20"]);
+    let mut plugin = named_plugin("sleep", &["20"]);
     plugin.output = Some("popup".into());
     app.plugins = vec![plugin];
     plugin_command(&mut app, "example-plugin");
@@ -24114,7 +24326,7 @@ schema_version = 2
 [[commands]]
 name = "Read status"
 palette = "example-status"
-command = "/bin/cat"
+command = "cat"
 scopes = ["pods"]
 output = "popup"
 mutating = false
@@ -24124,7 +24336,7 @@ default = "false"
 [[commands]]
 name = "Renew"
 palette = "example-renew"
-command = "/bin/cat"
+command = "cat"
 scopes = ["services"]
 output = "popup"
 mutating = true
@@ -24237,7 +24449,7 @@ async fn plugin_package_reload_loads_valid_packages_and_isolates_invalid_ones() 
         [plugin]
         name = "Example"
         palette = "example-plugin"
-        command = "/bin/cat"
+        command = "cat"
         output = "popup"
         target = "context"
         mutating = false
@@ -24276,7 +24488,7 @@ async fn reload_loads_a_managed_install_and_keeps_the_first_of_two_palette_comma
         [plugin]
         name = "Resource summary"
         palette = "resource-summary"
-        command = "/bin/cat"
+        command = "cat"
         output = "popup"
         target = "context"
         mutating = false
@@ -24366,7 +24578,7 @@ async fn reload_keeps_a_package_published_for_a_target_this_build_does_not_know(
         [plugin]
         name = "Resource summary"
         palette = "resource-summary"
-        command = "/bin/cat"
+        command = "cat"
         output = "popup"
         target = "context"
         mutating = false
@@ -24409,7 +24621,7 @@ async fn reload_keeps_a_package_published_for_a_target_this_build_does_not_know(
 #[tokio::test]
 async fn plugin_forward_uses_selected_target_and_requires_valid_port_before_launch() {
     let (mut app, _rx) = app_with_pod();
-    let mut plugin = named_plugin("/bin/cat", &[]);
+    let mut plugin = named_plugin("cat", &[]);
     plugin.output = Some("report".into());
     plugin.package_dir = Some(std::env::temp_dir());
     plugin.port_forward = Some("8080".into());
@@ -24461,7 +24673,7 @@ async fn context_plugin_cannot_bypass_namespace_guardrails_in_all_namespaces_mod
 #[tokio::test]
 async fn package_request_uses_the_selected_snapshot_and_limits_large_objects() {
     let (mut app, mut rx) = app_with_pod();
-    let mut plugin = named_plugin("/bin/cat", &[]);
+    let mut plugin = named_plugin("cat", &[]);
     plugin.package_dir = Some(std::env::temp_dir());
     plugin.output = Some("popup".into());
     app.plugins = vec![plugin];
@@ -24497,7 +24709,7 @@ async fn package_request_uses_the_selected_snapshot_and_limits_large_objects() {
 #[tokio::test]
 async fn plugin_timeout_is_visible_through_the_command_path() {
     let (mut app, mut rx) = app_with_pod();
-    let mut plugin = named_plugin("/bin/sleep", &["30"]);
+    let mut plugin = named_plugin("sleep", &["30"]);
     plugin.output = Some("popup".into());
     plugin.timeout = Some("1s".into());
     app.plugins = vec![plugin];
@@ -25095,6 +25307,187 @@ async fn configured_ctrl_z_actions_take_precedence_over_faults() {
     app.plugins[0].scopes = vec!["services".into()];
     app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
     assert!(app.faults_only);
+}
+
+fn faults_test_event(api_version: &str, name: &str, typ: &str) -> Value {
+    json!({
+        "apiVersion": api_version, "kind": "Event",
+        "metadata": {"name": name, "namespace": "default", "uid": name},
+        "type": typ,
+        "reason": format!("{name}-reason"),
+    })
+}
+
+#[tokio::test]
+async fn ctrl_z_filters_events_that_are_not_normal() {
+    for (resource, api_version) in [
+        ("events", "v1"),
+        ("events.events.k8s.io", "events.k8s.io/v1"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind(resource);
+        let event = |name: &str, typ: &str| faults_test_event(api_version, name, typ);
+        apply(&mut app, event("pulled", "Normal"));
+        apply(&mut app, event("backoff", "Warning"));
+        apply(&mut app, event("custom", "Critical"));
+        apply(&mut app, event("scheduled", "Normal"));
+
+        app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+        assert!(app.faults_filter_active(), "{resource}");
+        let mut names = row_names(&app);
+        names.sort();
+        assert_eq!(names, ["backoff", "custom"], "{resource}");
+        assert!(
+            screen_text(&mut app, 120, 20).contains("[faults]"),
+            "{resource}"
+        );
+
+        let mut pulled = event("pulled", "Warning");
+        pulled["metadata"]["resourceVersion"] = json!("2");
+        apply(&mut app, pulled);
+        let mut backoff = event("backoff", "Normal");
+        backoff["metadata"]["resourceVersion"] = json!("2");
+        apply(&mut app, backoff);
+        let mut names = row_names(&app);
+        names.sort();
+        assert_eq!(names, ["custom", "pulled"], "{resource}");
+
+        type_filter(&mut app, "pulled");
+        assert_eq!(row_names(&app), ["pulled"], "{resource}");
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+
+        app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+        assert!(!app.faults_filter_active(), "{resource}");
+        assert_eq!(row_names(&app).len(), 4, "{resource}");
+        assert!(
+            !screen_text(&mut app, 120, 20).contains("[faults]"),
+            "{resource}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn configured_ctrl_z_actions_take_precedence_over_event_faults() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("events");
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-z".into()),
+        name: "services".into(),
+        resource: "services".into(),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_only);
+
+    app.bookmarks.clear();
+    app.switch_kind("events");
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.faults_filter_active());
+}
+
+fn open_pod_events(app: &mut App) {
+    app.switch_kind("pods");
+    apply(
+        app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "default", "uid": "pod-uid"}
+        }),
+    );
+    app.handle_key(press(KeyCode::Char('E'))).unwrap();
+    assert_eq!(app.mode, Mode::Events);
+}
+
+fn send_pod_events(app: &mut App, events: &[(&str, &str)]) {
+    let events: Vec<_> = events
+        .iter()
+        .map(|(name, typ)| obj(faults_test_event("v1", name, typ)))
+        .collect();
+    app.handle_msg(Msg::Events {
+        generation: app.event_gen,
+        title: "web — events".into(),
+        lines: event_document(&events, false),
+    });
+}
+
+fn event_view_reasons(app: &App) -> Vec<String> {
+    let mut reasons: Vec<String> = app
+        .detail
+        .lines
+        .iter()
+        .skip(1)
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find(|word| word.ends_with("-reason"))
+                .map(String::from)
+        })
+        .collect();
+    reasons.sort();
+    reasons
+}
+
+#[tokio::test]
+async fn ctrl_z_in_the_events_view_shows_only_events_that_are_not_normal() {
+    let (mut app, _rx) = test_app();
+    open_pod_events(&mut app);
+    send_pod_events(
+        &mut app,
+        &[
+            ("pulled", "Normal"),
+            ("backoff", "Warning"),
+            ("custom", "Critical"),
+        ],
+    );
+    assert_eq!(
+        event_view_reasons(&app),
+        ["backoff-reason", "custom-reason", "pulled-reason"]
+    );
+
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.mode, Mode::Events);
+    assert_eq!(app.detail.title, "web — events [faults]");
+    assert!(app.detail.lines[0].contains("LAST SEEN"));
+    assert_eq!(
+        event_view_reasons(&app),
+        ["backoff-reason", "custom-reason"]
+    );
+
+    send_pod_events(
+        &mut app,
+        &[
+            ("pulled", "Warning"),
+            ("backoff", "Normal"),
+            ("started", "Normal"),
+        ],
+    );
+    assert_eq!(app.detail.title, "web — events [faults]");
+    assert_eq!(event_view_reasons(&app), ["pulled-reason"]);
+
+    send_pod_events(&mut app, &[("started", "Normal")]);
+    assert_eq!(app.detail.lines.len(), 2);
+    assert_eq!(app.detail.lines[1], "(no events other than Normal)");
+
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.detail.title, "web — events");
+    assert_eq!(event_view_reasons(&app), ["started-reason"]);
+    app.stop_event_stream();
+}
+
+#[tokio::test]
+async fn events_view_faults_key_is_configurable() {
+    let (mut app, _rx) = test_app();
+    let cfg: crate::config::Config = toml::from_str("[keys.events]\nfaults = 'f6'\n").unwrap();
+    app.keymap = Keymap::compile(&cfg.keys).unwrap();
+    open_pod_events(&mut app);
+    send_pod_events(&mut app, &[("pulled", "Normal"), ("backoff", "Warning")]);
+
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.detail.title, "web — events");
+    app.handle_key(press(KeyCode::F(6))).unwrap();
+    assert_eq!(app.detail.title, "web — events [faults]");
+    assert_eq!(event_view_reasons(&app), ["backoff-reason"]);
+    app.stop_event_stream();
 }
 
 #[tokio::test]
@@ -39890,7 +40283,7 @@ async fn document_fullscreen_survives_plugin_and_yaml_replacement() {
     app.handle_key(press(KeyCode::Char('F'))).unwrap();
     app.handle_key(press(KeyCode::Char('q'))).unwrap();
     assert_eq!(app.mode, Mode::Table);
-    let mut plugin = named_plugin("/bin/echo", &["plugin output"]);
+    let mut plugin = named_plugin("echo", &["plugin output"]);
     plugin.output = Some("popup".into());
     app.plugins = vec![plugin];
     plugin_command(&mut app, "example-plugin");
@@ -41053,7 +41446,7 @@ async fn plugin_activity_opens_immediately_and_hides_reopens_and_scrolls_without
 async fn plugin_activity_hidden_completion_preserves_palette_and_reopens_report() {
     let (mut app, mut rx) = app_with_pod();
     let mut plugin = named_plugin(
-        "/bin/echo",
+        "echo",
         &[r#"{"schema_version":1,"title":"Finished","sections":[]}"#],
     );
     plugin.output = Some("report".into());
@@ -41169,7 +41562,7 @@ async fn plugin_activity_ctrl_c_kills_descendants_and_rejects_stale_completion_a
     assert!(app.detail.lines.is_empty());
     assert!(app.plugin_activity_visible());
     app.handle_key(press(KeyCode::Esc)).unwrap();
-    app.plugins[0].command = "/bin/sleep".into();
+    app.plugins[0].command = "sleep".into();
     app.plugins[0].args = vec!["20".into()];
     plugin_command(&mut app, "example-plugin");
     assert!(
@@ -41312,7 +41705,7 @@ async fn plugin_activity_toggle_preserves_running_job_and_typed_input_and_can_be
             KeyCode::Char(if binding.ends_with('t') { 't' } else { 'y' }),
             KeyModifiers::CONTROL | KeyModifiers::ALT,
         );
-        let mut plugin = named_plugin("/bin/sleep", &["20"]);
+        let mut plugin = named_plugin("sleep", &["20"]);
         plugin.output = Some("popup".into());
         app.plugins = vec![plugin];
         plugin_command(&mut app, "example-plugin");
@@ -41350,7 +41743,7 @@ async fn plugin_activity_toggle_restores_completed_diagnostics_and_enter_opens_r
     );
     app.handle_key(toggle).unwrap();
     assert!(app.flash.contains("no plugin activity"));
-    let mut plugin = named_plugin("/bin/echo", &["done"]);
+    let mut plugin = named_plugin("echo", &["done"]);
     plugin.output = Some("popup".into());
     app.plugins = vec![plugin];
     plugin_command(&mut app, "example-plugin");
@@ -41376,7 +41769,7 @@ async fn plugin_activity_colon_preserves_an_existing_palette_and_its_return_view
         KeyCode::Char('t'),
         KeyModifiers::CONTROL | KeyModifiers::ALT,
     );
-    let mut plugin = named_plugin("/bin/sleep", &["20"]);
+    let mut plugin = named_plugin("sleep", &["20"]);
     plugin.output = Some("popup".into());
     app.plugins = vec![plugin];
     plugin_command(&mut app, "example-plugin");
@@ -41405,7 +41798,7 @@ async fn plugin_activity_ctrl_c_preserves_completed_outcome_and_duration() {
         KeyCode::Char('t'),
         KeyModifiers::CONTROL | KeyModifiers::ALT,
     );
-    let mut plugin = named_plugin("/bin/echo", &["done"]);
+    let mut plugin = named_plugin("echo", &["done"]);
     plugin.output = Some("popup".into());
     app.plugins = vec![plugin];
     plugin_command(&mut app, "example-plugin");
@@ -42586,7 +42979,7 @@ async fn log_record_time_format_follows_config_and_reload() {
     let local = "2026-10-08T15:00:20.444Z"
         .parse::<jiff::Timestamp>()
         .unwrap()
-        .to_zoned(jiff::tz::TimeZone::system())
+        .to_zoned_datetime(jiff::tz::TimeZone::system())
         .strftime("%H:%M:%S")
         .to_string();
     assert_eq!(app.logs.display_line(0), format!("{local} INFO  ready"));
@@ -43384,7 +43777,7 @@ async fn context_namespace_policy_preserves_bookmarks_workspaces_and_launch_scop
 
 fn kubeconfig_reload_plugin() -> crate::config::Plugin {
     let mut plugin = named_plugin(
-        "/bin/echo",
+        "echo",
         &[r#"{"schema_version":1,"title":"Cluster ready","action":"reload-kubeconfig"}"#],
     );
     plugin.target = Some("context".into());

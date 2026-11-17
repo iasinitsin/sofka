@@ -32,7 +32,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::k8s::{Cluster, Kind};
 use crate::store::{
-    Msg, Pulse, RowKey, StatusClaim, Store, StoreMutation, WatchFailure, XrayItem, row_key,
+    EventLine, Msg, Pulse, RowKey, StatusClaim, Store, StoreMutation, WatchFailure, XrayItem,
+    row_key,
 };
 
 pub(crate) use guardrails::ConfirmLevel;
@@ -264,6 +265,9 @@ pub enum Suspend {
         context: String,
         switch: bool,
     },
+    /// Release the terminal and stop the process with `SIGTSTP`, so the
+    /// shell's job control can resume it. The TUI returns on `fg`.
+    Stop,
 }
 
 /// A `kubectl port-forward` running in the background (not `Suspend::Shell`
@@ -299,6 +303,12 @@ impl Drop for PortForward {
 /// so the unit suite doesn't require `kubectl` on PATH.
 type PortForwardSpawner = fn(&[String]) -> std::io::Result<tokio::process::Child>;
 
+/// Test-binds one local address before a port-forward starts. Overridable in
+/// tests: a port a test releases stays bound while a concurrently spawned
+/// child still holds its inherited copy of the socket.
+type PortBinder =
+    std::sync::Arc<dyn Fn(std::net::IpAddr, u16) -> std::io::Result<()> + Send + Sync>;
+
 /// Looks up the latest release (`force` skips the daily cache). Overridable
 /// in tests so the unit suite never reaches GitHub.
 type UpdateFetcher = fn(
@@ -323,6 +333,10 @@ fn default_update_fetcher(
     Box<dyn std::future::Future<Output = Result<crate::update::Release, String>> + Send>,
 > {
     Box::pin(crate::update::check(force))
+}
+
+fn default_port_binder(address: std::net::IpAddr, port: u16) -> std::io::Result<()> {
+    std::net::TcpListener::bind((address, port)).map(drop)
 }
 
 fn default_pf_spawner(argv: &[String]) -> std::io::Result<tokio::process::Child> {
@@ -2456,6 +2470,8 @@ pub struct App {
     /// Injectable spawner for `kubectl port-forward` children. Tests override
     /// this to avoid depending on `kubectl` being on PATH.
     pf_spawner: PortForwardSpawner,
+    /// Injectable local-port check for the port-forward preflight.
+    pf_port_binder: PortBinder,
     pub pf_state: ListState,
     /// Port-forward picker (`f`): the declared ports of the selected object,
     /// each as a `LOCAL:REMOTE` string, plus a trailing "Custom…" entry.
@@ -2676,8 +2692,16 @@ pub struct App {
     log_wake: tokio::sync::watch::Sender<u64>,
     event_gen: u64,
     event_task: Option<JoinHandle<()>>,
+    /// The latest live events document and its title, kept whole so the
+    /// faults filter can be toggled without waiting for the next update.
+    events_doc: Vec<EventLine>,
+    events_title: String,
+    /// `Ctrl+Z` in the events view: show only events that are not `Normal`.
+    events_faults_only: bool,
 
     pub pending: Option<Suspend>,
+    /// Whether the platform has shell job control for the `suspend` action.
+    pub job_control: bool,
     pub shell_target: Option<ShellTarget>,
     pub command_failure: Option<CommandFailure>,
     /// Mode to return to when leaving a transient view (logs/detail/diff).
@@ -2942,6 +2966,7 @@ impl App {
             auth_offered: None,
             port_forwards: Vec::new(),
             pf_spawner: default_pf_spawner,
+            pf_port_binder: std::sync::Arc::new(default_port_binder),
             forwards_cfg: Vec::new(),
             pf_picker_items: Vec::new(),
             pf_picker_in_use: Vec::new(),
@@ -3056,7 +3081,11 @@ impl App {
             log_wake: tokio::sync::watch::channel(0).0,
             event_gen: 0,
             event_task: None,
+            events_doc: Vec::new(),
+            events_title: String::new(),
+            events_faults_only: false,
             pending: None,
+            job_control: cfg!(unix),
             shell_target: None,
             command_failure: None,
             return_mode: Mode::Table,
